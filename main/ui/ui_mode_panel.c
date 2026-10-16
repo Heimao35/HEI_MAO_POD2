@@ -127,12 +127,24 @@ static void panel_anim_x_cb(void *obj, int32_t v)
     lv_obj_set_x((lv_obj_t *)obj, v);
 }
 
+/** @brief 遮罩透明度动画执行回调 */
+static void overlay_anim_opa_cb(void *obj, int32_t v)
+{
+    lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+
+/** @brief 遮罩淡出动画完成回调 */
+static void overlay_hide_ready(lv_anim_t *a)
+{
+    (void)a;
+    lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
 /** @brief 面板隐藏动画完成回调 */
 static void panel_hide_ready(lv_anim_t *a)
 {
     (void)a;
     lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     s_visible = false;
 }
 
@@ -144,10 +156,22 @@ void ui_mode_panel_show(void)
     if (!s_panel || s_visible) return;
 
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_opa(s_overlay, 0, 0);
     lv_obj_move_foreground(s_overlay);
     lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_panel);
 
+    /* 遮罩淡入动画（比面板滑动稍长，使渐变更平滑） */
+    lv_anim_t a_ov;
+    lv_anim_init(&a_ov);
+    lv_anim_set_var(&a_ov, s_overlay);
+    lv_anim_set_values(&a_ov, 0, 80);
+    lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
+    lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
+    lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
+    lv_anim_start(&a_ov);
+
+    /* 面板滑入动画 */
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_panel);
@@ -167,6 +191,18 @@ void ui_mode_panel_hide(void)
 {
     if (!s_panel || !s_visible) return;
 
+    /* 遮罩淡出动画 */
+    lv_anim_t a_ov;
+    lv_anim_init(&a_ov);
+    lv_anim_set_var(&a_ov, s_overlay);
+    lv_anim_set_values(&a_ov, 80, 0);
+    lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
+    lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
+    lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
+    lv_anim_set_completed_cb(&a_ov, overlay_hide_ready);
+    lv_anim_start(&a_ov);
+
+    /* 面板滑出动画 */
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_panel);

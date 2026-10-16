@@ -18,6 +18,7 @@
 #include "esp_lcd_touch_cst820.h"
 
 #include "ui_manager.h"
+#include "ui_adj_panel.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (460)
@@ -271,6 +272,11 @@ static esp_err_t app_lvgl_init(void)
     return ESP_OK;
 }
 
+static void on_brightness_change(uint8_t val)
+{
+    esp_lcd_panel_co5300_set_brightness(lcd_panel, val);
+}
+
 void app_main(void)
 {
     /* LCD HW initialization */
@@ -289,6 +295,9 @@ void app_main(void)
 
     /* 初始化自定义 UI 系统（替换原有 demo） */
     ui_manager_init();
+
+    /* 注册亮度回调，滑条拖动时实际调节屏幕亮度 */
+    ui_adj_panel_set_callbacks(on_brightness_change, NULL);
 
     lvgl_port_unlock();
 }

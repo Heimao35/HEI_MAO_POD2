@@ -256,17 +256,18 @@ static lv_obj_t *create_ctrl_btn(lv_obj_t *parent, const char *symbol,
                                   lv_event_cb_t cb)
 {
     lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_size(btn, 56, 56);
+    lv_obj_set_size(btn, 72, 72);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0x3A3A5C), 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_ext_click_area(btn, 10);
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, symbol);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
     lv_obj_center(lbl);
 
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
@@ -342,7 +343,7 @@ void ui_music_player_create(lv_obj_t *parent)
 
     /* ===== 播放控制台（与屏幕等宽，底边对齐屏幕底部） ===== */
     s_ctrl_panel = lv_obj_create(s_page);
-    lv_obj_set_size(s_ctrl_panel, CTRL_PANEL_W, 110);
+    lv_obj_set_size(s_ctrl_panel, CTRL_PANEL_W, 120);
     lv_obj_align(s_ctrl_panel, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_radius(s_ctrl_panel, 0, 0);
     lv_obj_set_style_bg_color(s_ctrl_panel, lv_color_hex(0x1A1A3E), 0);
@@ -358,7 +359,7 @@ void ui_music_player_create(lv_obj_t *parent)
 
     /* 按钮行 */
     lv_obj_t *btn_row = lv_obj_create(s_ctrl_panel);
-    lv_obj_set_size(btn_row, LV_PCT(100), 60);
+    lv_obj_set_size(btn_row, LV_PCT(100), 76);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
@@ -400,7 +401,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_label_set_text(s_time_lbl, "0:00");
     lv_obj_set_style_text_color(s_time_lbl, lv_color_hex(0xAAAAAA), 0);
     lv_obj_set_style_text_font(s_time_lbl, &lv_font_montserrat_12, 0);
-    lv_obj_align(s_time_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_align(s_time_lbl, LV_ALIGN_RIGHT_MID, -10, 0);
 
     /* ===== 歌曲列表（全屏，可上下滚动，默认隐藏） ===== */
     s_playlist = lv_obj_create(s_page);
