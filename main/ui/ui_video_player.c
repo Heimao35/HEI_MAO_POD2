@@ -23,6 +23,7 @@ void ui_video_player_create(lv_obj_t *parent)
     lv_obj_set_style_border_width(s_page, 0, 0);
     lv_obj_set_style_radius(s_page, 0, 0);
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_page, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 视频图标 */
     lv_obj_t *icon = lv_label_create(s_page);

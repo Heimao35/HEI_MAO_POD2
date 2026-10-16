@@ -34,6 +34,8 @@ void ui_lockscreen_create(lv_obj_t *parent)
     lv_obj_set_style_radius(s_lock_page, 0, 0);
     lv_obj_set_style_pad_all(s_lock_page, 0, 0);
     lv_obj_remove_flag(s_lock_page, LV_OBJ_FLAG_SCROLLABLE);
+    /* 允许触摸事件冒泡到父屏幕，以便 ui_manager 的手势检测能收到事件 */
+    lv_obj_add_flag(s_lock_page, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 大字体时间 —— 位于屏幕中上方约 35% 高度处
      * 修改 y 偏移量可调节时间显示位置 */

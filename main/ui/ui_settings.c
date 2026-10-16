@@ -56,6 +56,8 @@ void ui_settings_create(lv_obj_t *parent)
     lv_obj_set_style_radius(s_page, 0, 0);
     lv_obj_set_style_pad_all(s_page, 0, 0);
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_SCROLLABLE);
+    /* 设置页面事件冒泡，让手势检测能收到底部上滑收起手势 */
+    lv_obj_add_flag(s_page, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 标题 */
     lv_obj_t *title = lv_label_create(s_page);

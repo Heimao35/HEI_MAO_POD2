@@ -137,6 +137,8 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_radius(s_page, 0, 0);
     lv_obj_set_style_pad_all(s_page, 0, 0);
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_SCROLLABLE);
+    /* 允许触摸事件冒泡到父屏幕，以便 ui_manager 的手势检测能收到事件 */
+    lv_obj_add_flag(s_page, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* ===== 歌曲标题 ===== */
     s_title_lbl = lv_label_create(s_page);
@@ -154,6 +156,8 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_border_width(s_cover_area, 0, 0);
     lv_obj_set_style_pad_all(s_cover_area, 0, 0);
     lv_obj_remove_flag(s_cover_area, LV_OBJ_FLAG_SCROLLABLE);
+    /* 封面区域事件冒泡，让手势检测能收到 PRESSED/RELEASED */
+    lv_obj_add_flag(s_cover_area, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(s_cover_area, cover_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* 封面占位矩形（紫色渐变，后续替换为真实封面图） */
@@ -166,6 +170,8 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(s_cover_img, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_cover_img, 0, 0);
     lv_obj_remove_flag(s_cover_img, LV_OBJ_FLAG_SCROLLABLE);
+    /* 封面占位不拦截点击，让事件冒泡到 cover_area 处理封面/歌词切换 */
+    lv_obj_add_flag(s_cover_img, LV_OBJ_FLAG_EVENT_BUBBLE);
     /* 封面中间放一个音乐符号作为占位 */
     lv_obj_t *cover_icon = lv_label_create(s_cover_img);
     lv_label_set_text(cover_icon, LV_SYMBOL_AUDIO);
@@ -196,6 +202,8 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_flex_align(s_ctrl_panel, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(s_ctrl_panel, LV_OBJ_FLAG_SCROLLABLE);
+    /* 控制台事件冒泡，让边缘手势能穿透 */
+    lv_obj_add_flag(s_ctrl_panel, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 按钮行容器 */
     lv_obj_t *btn_row = lv_obj_create(s_ctrl_panel);
@@ -209,6 +217,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(btn_row, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     s_btn_prev   = create_ctrl_btn(btn_row, LV_SYMBOL_PREV,    prev_btn_cb);
     s_btn_toggle = create_ctrl_btn(btn_row, LV_SYMBOL_PAUSE,   toggle_btn_cb);
@@ -222,6 +231,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_border_width(prog_row, 0, 0);
     lv_obj_set_style_pad_all(prog_row, 0, 0);
     lv_obj_remove_flag(prog_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(prog_row, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 进度条 —— 高度 6px，修改可调节进度条粗细 */
     s_progress = lv_slider_create(prog_row);
