@@ -35,7 +35,12 @@ static void bright_slider_cb(lv_event_t *e)
 {
     (void)e;
     ui_device_state_t *st = ui_get_device_state();
-    if (st->auto_brightness) return;
+    /* 自动亮度开启时手动拖滑条 → 自动关闭自动亮度 */
+    if (st->auto_brightness) {
+        st->auto_brightness = false;
+        lv_obj_remove_state(s_bright_slider, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(s_auto_btn, lv_color_hex(0x3A3A5C), 0);
+    }
     int32_t val = lv_slider_get_value(s_bright_slider);
     st->brightness = (uint8_t)val;
     if (s_br_cb) s_br_cb((uint8_t)val);
@@ -45,6 +50,12 @@ static void vol_slider_cb(lv_event_t *e)
 {
     (void)e;
     int32_t val = lv_slider_get_value(s_vol_slider);
+    /* 静音时手动拖滑条 → 自动解除静音 */
+    if (s_muted && val > 0) {
+        s_muted = false;
+        lv_obj_set_style_bg_color(s_mute_btn, lv_color_hex(0x3A3A5C), 0);
+        lv_label_set_text(s_mute_icon, LV_SYMBOL_VOLUME_MID);
+    }
     ui_get_device_state()->volume = (uint8_t)val;
     if (s_vol_cb) s_vol_cb((uint8_t)val);
 }
@@ -135,7 +146,7 @@ static lv_obj_t *create_round_btn(lv_obj_t *parent, const char *text,
                                    lv_event_cb_t cb, lv_obj_t **out_icon)
 {
     lv_obj_t *btn = lv_obj_create(parent);
-    lv_obj_set_size(btn, 50, 50);
+    lv_obj_set_size(btn, 64, 64);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0x3A3A5C), 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
@@ -147,7 +158,7 @@ static lv_obj_t *create_round_btn(lv_obj_t *parent, const char *text,
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
     lv_obj_center(lbl);
     if (out_icon) *out_icon = lbl;
     return btn;

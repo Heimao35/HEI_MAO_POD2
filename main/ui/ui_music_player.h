@@ -78,6 +78,16 @@ void ui_music_player_set_callbacks(ui_music_ctrl_cb_t on_prev,
  */
 bool ui_music_player_is_playlist_visible(void);
 
+/**
+ * @brief 带滑动动画切换到下一首歌曲（用于手势触发）
+ */
+void ui_music_player_next_animated(void);
+
+/**
+ * @brief 带滑动动画切换到上一首歌曲（用于手势触发）
+ */
+void ui_music_player_prev_animated(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -183,6 +183,20 @@ static void gesture_released_cb(lv_event_t *e)
             ui_music_player_toggle_playlist(true);
             return;
         }
+        /* 非边缘左滑 → 下一首（封面向左滑出） */
+        if (is_horizontal && dx < -GESTURE_MIN_DIST &&
+            s_press_point.x > (int32_t)UI_EDGE_THRESHOLD &&
+            s_press_point.x < (int32_t)(UI_HOR_RES - UI_EDGE_THRESHOLD)) {
+            ui_music_player_next_animated();
+            return;
+        }
+        /* 非边缘右滑 → 上一首（封面向右滑出） */
+        if (is_horizontal && dx > GESTURE_MIN_DIST &&
+            s_press_point.x > (int32_t)UI_EDGE_THRESHOLD &&
+            s_press_point.x < (int32_t)(UI_HOR_RES - UI_EDGE_THRESHOLD)) {
+            ui_music_player_prev_animated();
+            return;
+        }
     }
 }
 

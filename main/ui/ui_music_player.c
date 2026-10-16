@@ -5,12 +5,13 @@
  * 页面结构：
  *   s_page (全屏容器)
  *     ├─ s_title_lbl   歌曲标题（与歌曲列表联动）
- *     ├─ s_cover_area  封面/歌词切换区域 (260x240)
- *     ├─ s_ctrl_panel  播放控制台 (260px宽，与封面等宽)
+ *     ├─ s_cover_area  封面/歌词切换区域 (COVER_SIZE x COVER_SIZE 正方形)
+ *     ├─ s_ctrl_panel  播放控制台 (屏幕等宽，底边对齐屏幕底部)
  *     │   ├─ 按钮行：上一首 / 暂停继续 / 下一首 / 播放模式
  *     │   └─ 进度条(只读 lv_bar) + 时长
  *     └─ s_playlist   歌曲列表（全屏覆盖，可滚动）
  *
+ * 切歌时封面有左右滑入滑出动画。
  * 播放/暂停、播放模式按钮点击后会改变颜色以反映状态。
  * 进度条使用 lv_bar（只读），无旋钮，不可手动拖拽。
  * 歌曲列表与标题联动，高亮当前播放歌曲。
@@ -20,8 +21,10 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- 封面与控制台等宽尺寸，修改此值同时影响封面和控制台宽度 ---- */
-#define PLAYER_PANEL_W  280
+/* ---- 封面正方形尺寸 ---- */
+#define COVER_SIZE      240
+/* ---- 控制台宽度（与屏幕等宽） ---- */
+#define CTRL_PANEL_W    UI_HOR_RES
 
 /* ---- 测试歌曲列表 ---- */
 static const char *s_demo_songs[] = {
@@ -59,29 +62,33 @@ static ui_music_ctrl_cb_t s_cb_next   = NULL;
 static ui_music_ctrl_cb_t s_cb_toggle = NULL;
 static ui_music_ctrl_cb_t s_cb_mode   = NULL;
 
+/* ---- 封面切歌动画状态 ---- */
+static bool s_cover_animating = false; /**< 封面动画进行中则忽略新切歌 */
+
 /* ---- 前向声明 ---- */
 static void update_playlist_highlight(void);
 static void switch_to_song(int idx);
+static void switch_to_song_animated(int idx, bool slide_left);
 
 /* ---- 按钮事件回调 ---- */
 
-/** @brief 上一首按钮点击 —— 切换到上一首歌曲 */
+/** @brief 上一首按钮点击 —— 带动画切换到上一首歌曲 */
 static void prev_btn_cb(lv_event_t *e)
 {
     (void)e;
     int idx = s_current_idx - 1;
     if (idx < 0) idx = (int)DEMO_SONG_COUNT - 1;
-    switch_to_song(idx);
+    switch_to_song_animated(idx, false);
     if (s_cb_prev) s_cb_prev();
 }
 
-/** @brief 下一首按钮点击 —— 切换到下一首歌曲 */
+/** @brief 下一首按钮点击 —— 带动画切换到下一首歌曲 */
 static void next_btn_cb(lv_event_t *e)
 {
     (void)e;
     int idx = s_current_idx + 1;
     if (idx >= (int)DEMO_SONG_COUNT) idx = 0;
-    switch_to_song(idx);
+    switch_to_song_animated(idx, true);
     if (s_cb_next) s_cb_next();
 }
 
@@ -156,6 +163,66 @@ static void switch_to_song(int idx)
     s_current_idx = idx;
     lv_label_set_text(s_title_lbl, s_demo_songs[idx]);
     update_playlist_highlight();
+}
+
+/** @brief 封面 X 坐标动画执行回调 */
+static void cover_anim_x_cb(void *obj, int32_t v)
+{
+    lv_obj_set_x((lv_obj_t *)obj, v);
+}
+
+/** @brief 封面滑出动画完成回调 —— 更新内容后从另一侧滑入 */
+static void cover_slide_out_ready(lv_anim_t *a)
+{
+    /* 取出目标索引和方向（编码在 user_data 中） */
+    int32_t packed = (int32_t)(intptr_t)a->user_data;
+    int idx = packed >> 1;
+    bool slide_left = packed & 1;
+
+    /* 更新歌曲信息 */
+    s_current_idx = idx;
+    lv_label_set_text(s_title_lbl, s_demo_songs[idx]);
+    update_playlist_highlight();
+
+    /* 封面从反方向滑入 */
+    int32_t in_start = slide_left ? (int32_t)UI_HOR_RES : -(int32_t)UI_HOR_RES;
+    lv_obj_set_x(s_cover_area, in_start);
+
+    lv_anim_t a_in;
+    lv_anim_init(&a_in);
+    lv_anim_set_var(&a_in, s_cover_area);
+    lv_anim_set_values(&a_in, in_start, ((int32_t)UI_HOR_RES - (int32_t)COVER_SIZE) / 2);
+    lv_anim_set_duration(&a_in, UI_ANIM_DURATION_MS);
+    lv_anim_set_path_cb(&a_in, UI_ANIM_PATH);
+    lv_anim_set_exec_cb(&a_in, cover_anim_x_cb);
+    lv_anim_start(&a_in);
+    s_cover_animating = false;
+}
+
+/**
+ * @brief 带滑动动画的切歌
+ * @param idx        目标歌曲索引
+ * @param slide_left true=封面向左滑出（下一首），false=向右滑出（上一首）
+ */
+static void switch_to_song_animated(int idx, bool slide_left)
+{
+    if (idx < 0 || idx >= (int)DEMO_SONG_COUNT) return;
+    if (s_cover_animating) return;
+    s_cover_animating = true;
+
+    int32_t out_target = slide_left ? -(int32_t)UI_HOR_RES : (int32_t)UI_HOR_RES;
+    int32_t packed = (idx << 1) | (slide_left ? 1 : 0);
+
+    lv_anim_t a_out;
+    lv_anim_init(&a_out);
+    lv_anim_set_var(&a_out, s_cover_area);
+    lv_anim_set_values(&a_out, ((int32_t)UI_HOR_RES - (int32_t)COVER_SIZE) / 2, out_target);
+    lv_anim_set_duration(&a_out, UI_ANIM_DURATION_MS);
+    lv_anim_set_path_cb(&a_out, UI_ANIM_PATH);
+    lv_anim_set_exec_cb(&a_out, cover_anim_x_cb);
+    lv_anim_set_user_data(&a_out, (void *)(intptr_t)packed);
+    lv_anim_set_completed_cb(&a_out, cover_slide_out_ready);
+    lv_anim_start(&a_out);
 }
 
 /**
@@ -236,10 +303,11 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(s_title_lbl, &lv_font_montserrat_16, 0);
     lv_obj_align(s_title_lbl, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_HEIGHT + 6);
 
-    /* ===== 封面/歌词切换区域 (与控制台等宽) ===== */
+    /* ===== 封面/歌词切换区域（正方形 COVER_SIZE x COVER_SIZE） ===== */
     s_cover_area = lv_obj_create(s_page);
-    lv_obj_set_size(s_cover_area, PLAYER_PANEL_W, PLAYER_PANEL_W - 40);
-    lv_obj_align(s_cover_area, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_HEIGHT + 30);
+    lv_obj_set_size(s_cover_area, COVER_SIZE, COVER_SIZE);
+    lv_obj_set_pos(s_cover_area, ((int32_t)UI_HOR_RES - (int32_t)COVER_SIZE) / 2,
+                   UI_STATUSBAR_HEIGHT + 30);
     lv_obj_set_style_bg_opa(s_cover_area, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_cover_area, 0, 0);
     lv_obj_set_style_pad_all(s_cover_area, 0, 0);
@@ -247,9 +315,9 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_add_flag(s_cover_area, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(s_cover_area, cover_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 封面占位矩形 */
+    /* 封面占位矩形（正方形，铺满 cover_area） */
     s_cover_img = lv_obj_create(s_cover_area);
-    lv_obj_set_size(s_cover_img, PLAYER_PANEL_W - 20, PLAYER_PANEL_W - 60);
+    lv_obj_set_size(s_cover_img, COVER_SIZE, COVER_SIZE);
     lv_obj_center(s_cover_img);
     lv_obj_set_style_radius(s_cover_img, 16, 0);
     lv_obj_set_style_bg_color(s_cover_img, lv_color_hex(0x4A3080), 0);
@@ -272,11 +340,11 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_center(s_lyric_label);
     lv_obj_add_flag(s_lyric_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* ===== 播放控制台 (与封面等宽) ===== */
+    /* ===== 播放控制台（与屏幕等宽，底边对齐屏幕底部） ===== */
     s_ctrl_panel = lv_obj_create(s_page);
-    lv_obj_set_size(s_ctrl_panel, PLAYER_PANEL_W, 110);
-    lv_obj_align(s_ctrl_panel, LV_ALIGN_BOTTOM_MID, 0, -20);
-    lv_obj_set_style_radius(s_ctrl_panel, 20, 0);
+    lv_obj_set_size(s_ctrl_panel, CTRL_PANEL_W, 110);
+    lv_obj_align(s_ctrl_panel, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(s_ctrl_panel, 0, 0);
     lv_obj_set_style_bg_color(s_ctrl_panel, lv_color_hex(0x1A1A3E), 0);
     lv_obj_set_style_bg_opa(s_ctrl_panel, UI_PANEL_BG_OPA, 0);
     lv_obj_set_style_border_width(s_ctrl_panel, 0, 0);
@@ -447,4 +515,20 @@ bool ui_music_player_is_playlist_visible(void)
 {
     if (!s_playlist) return false;
     return !lv_obj_has_flag(s_playlist, LV_OBJ_FLAG_HIDDEN);
+}
+
+void ui_music_player_next_animated(void)
+{
+    int idx = s_current_idx + 1;
+    if (idx >= (int)DEMO_SONG_COUNT) idx = 0;
+    switch_to_song_animated(idx, true);
+    if (s_cb_next) s_cb_next();
+}
+
+void ui_music_player_prev_animated(void)
+{
+    int idx = s_current_idx - 1;
+    if (idx < 0) idx = (int)DEMO_SONG_COUNT - 1;
+    switch_to_song_animated(idx, false);
+    if (s_cb_prev) s_cb_prev();
 }
