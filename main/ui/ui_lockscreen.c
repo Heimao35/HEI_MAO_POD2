@@ -38,20 +38,20 @@ void ui_lockscreen_create(lv_obj_t *parent)
     lv_obj_add_flag(s_lock_page, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 大字体时间 —— 位于屏幕中上方约 35% 高度处
-     * 修改 y 偏移量可调节时间显示位置 */
+     * 修改 y 偏移量可调节时间显示位置
+     * 使用 montserrat_48 最大字体显示时间 */
     s_time_label = lv_label_create(s_lock_page);
     lv_label_set_text(s_time_label, "12:00");
     lv_obj_set_style_text_color(s_time_label, lv_color_white(), 0);
-    /* 使用 montserrat_26 作为最大可用字体，后续可替换为更大字体 */
-    lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_26, 0);
-    lv_obj_align(s_time_label, LV_ALIGN_TOP_MID, 0, UI_VER_RES * 35 / 100);
+    lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
+    lv_obj_align(s_time_label, LV_ALIGN_TOP_MID, 0, UI_VER_RES * 30 / 100);
 
-    /* 小字体日期 —— 紧跟时间下方，间距 8px */
+    /* 日期 —— 紧跟时间下方，间距 10px，使用 montserrat_26 */
     s_date_label = lv_label_create(s_lock_page);
     lv_label_set_text(s_date_label, "2026-01-01");
     lv_obj_set_style_text_color(s_date_label, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_16, 0);
-    lv_obj_align_to(s_date_label, s_time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+    lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_26, 0);
+    lv_obj_align_to(s_date_label, s_time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 
     s_visible = true;
 }

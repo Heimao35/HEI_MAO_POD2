@@ -1,37 +1,57 @@
 /**
  * @file ui_music_player.c
- * @brief 音乐播放器页面实现
+ * @brief 音乐播放器页面实现（重构版）
  *
  * 页面结构：
- *   s_page (全屏容器，深色背景占位，后续替换为模糊封面)
- *     ├─ s_cover_img  清晰封面占位（圆角矩形，点击切换歌词）
- *     ├─ s_lyric_label 歌词 label（默认隐藏，点击封面区域切换）
- *     ├─ s_ctrl_panel 播放控制台（圆角矩形半透明背景）
+ *   s_page (全屏容器)
+ *     ├─ s_title_lbl   歌曲标题（与歌曲列表联动）
+ *     ├─ s_cover_area  封面/歌词切换区域 (260x240)
+ *     ├─ s_ctrl_panel  播放控制台 (260px宽，与封面等宽)
  *     │   ├─ 按钮行：上一首 / 暂停继续 / 下一首 / 播放模式
- *     │   ├─ 进度条
- *     │   └─ 时长 label
- *     └─ s_playlist   歌曲列表（全屏覆盖，默认隐藏）
+ *     │   └─ 进度条(只读 lv_bar) + 时长
+ *     └─ s_playlist   歌曲列表（全屏覆盖，可滚动）
+ *
+ * 播放/暂停、播放模式按钮点击后会改变颜色以反映状态。
+ * 进度条使用 lv_bar（只读），无旋钮，不可手动拖拽。
+ * 歌曲列表与标题联动，高亮当前播放歌曲。
  */
 
 #include "ui_music_player.h"
 #include <stdio.h>
+#include <string.h>
+
+/* ---- 封面与控制台等宽尺寸，修改此值同时影响封面和控制台宽度 ---- */
+#define PLAYER_PANEL_W  280
+
+/* ---- 测试歌曲列表 ---- */
+static const char *s_demo_songs[] = {
+    "Song 1", "Song 2", "Song 3", "Song 4", "Song 5",
+    "Song 6", "Song 7", "Song 8"
+};
+#define DEMO_SONG_COUNT (sizeof(s_demo_songs) / sizeof(s_demo_songs[0]))
 
 /* ---- 内部对象 ---- */
-static lv_obj_t *s_page        = NULL; /**< 音乐播放器页面容器 */
-static lv_obj_t *s_cover_area  = NULL; /**< 封面/歌词切换区域 */
-static lv_obj_t *s_cover_img   = NULL; /**< 封面占位 (当前用带颜色的矩形) */
-static lv_obj_t *s_lyric_label = NULL; /**< 歌词 label */
-static lv_obj_t *s_ctrl_panel  = NULL; /**< 播放控制台容器 */
-static lv_obj_t *s_btn_prev    = NULL; /**< 上一首按钮 */
-static lv_obj_t *s_btn_toggle  = NULL; /**< 暂停/继续按钮 */
-static lv_obj_t *s_btn_next    = NULL; /**< 下一首按钮 */
-static lv_obj_t *s_btn_mode    = NULL; /**< 播放模式按钮 */
-static lv_obj_t *s_progress    = NULL; /**< 进度条 */
-static lv_obj_t *s_time_lbl    = NULL; /**< 时长显示 label */
-static lv_obj_t *s_title_lbl   = NULL; /**< 歌曲标题 label */
-static lv_obj_t *s_playlist    = NULL; /**< 歌曲列表容器 */
+static lv_obj_t *s_page        = NULL;
+static lv_obj_t *s_cover_area  = NULL;
+static lv_obj_t *s_cover_img   = NULL;
+static lv_obj_t *s_lyric_label = NULL;
+static lv_obj_t *s_ctrl_panel  = NULL;
+static lv_obj_t *s_btn_prev    = NULL;
+static lv_obj_t *s_btn_toggle  = NULL;
+static lv_obj_t *s_btn_next    = NULL;
+static lv_obj_t *s_btn_mode    = NULL;
+static lv_obj_t *s_progress    = NULL; /**< lv_bar 只读进度条 */
+static lv_obj_t *s_time_lbl    = NULL;
+static lv_obj_t *s_title_lbl   = NULL;
+static lv_obj_t *s_playlist    = NULL;
 
-static bool s_show_lyric = false; /**< 当前是否显示歌词 (false=封面) */
+/* 歌曲列表中每个条目的对象指针，用于高亮当前歌曲 */
+static lv_obj_t *s_pl_items[DEMO_SONG_COUNT] = {NULL};
+
+static bool s_show_lyric  = false;
+static bool s_is_playing  = false;  /**< 当前是否播放中 */
+static bool s_single_loop = false;  /**< true=单曲循环, false=顺序播放 */
+static int  s_current_idx = 0;      /**< 当前播放歌曲索引 */
 
 /* 播放控制回调指针 */
 static ui_music_ctrl_cb_t s_cb_prev   = NULL;
@@ -39,39 +59,73 @@ static ui_music_ctrl_cb_t s_cb_next   = NULL;
 static ui_music_ctrl_cb_t s_cb_toggle = NULL;
 static ui_music_ctrl_cb_t s_cb_mode   = NULL;
 
+/* ---- 前向声明 ---- */
+static void update_playlist_highlight(void);
+static void switch_to_song(int idx);
+
 /* ---- 按钮事件回调 ---- */
 
-/** @brief 上一首按钮点击回调 */
+/** @brief 上一首按钮点击 —— 切换到上一首歌曲 */
 static void prev_btn_cb(lv_event_t *e)
 {
     (void)e;
+    int idx = s_current_idx - 1;
+    if (idx < 0) idx = (int)DEMO_SONG_COUNT - 1;
+    switch_to_song(idx);
     if (s_cb_prev) s_cb_prev();
 }
 
-/** @brief 暂停/继续按钮点击回调 */
-static void toggle_btn_cb(lv_event_t *e)
-{
-    (void)e;
-    if (s_cb_toggle) s_cb_toggle();
-}
-
-/** @brief 下一首按钮点击回调 */
+/** @brief 下一首按钮点击 —— 切换到下一首歌曲 */
 static void next_btn_cb(lv_event_t *e)
 {
     (void)e;
+    int idx = s_current_idx + 1;
+    if (idx >= (int)DEMO_SONG_COUNT) idx = 0;
+    switch_to_song(idx);
     if (s_cb_next) s_cb_next();
 }
 
-/** @brief 播放模式按钮点击回调 */
-static void mode_btn_cb(lv_event_t *e)
+/**
+ * @brief 暂停/继续按钮点击 —— 切换播放状态并更新按钮样式
+ *
+ * 播放中：按钮背景变为高亮色(UI_COLOR_ACCENT)，图标为 PAUSE
+ * 暂停中：按钮背景恢复为默认深色，图标为 PLAY
+ */
+static void toggle_btn_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_cb_mode) s_cb_mode();
+    s_is_playing = !s_is_playing;
+    lv_obj_t *icon = lv_obj_get_child(s_btn_toggle, 0);
+    if (icon) {
+        lv_label_set_text(icon, s_is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+    /* 播放中按钮高亮，暂停时恢复 */
+    lv_obj_set_style_bg_color(s_btn_toggle,
+        s_is_playing ? UI_COLOR_ACCENT : lv_color_hex(0x3A3A5C), 0);
+    if (s_cb_toggle) s_cb_toggle();
 }
 
 /**
- * @brief 封面区域点击回调 —— 切换封面/歌词显示
+ * @brief 播放模式按钮点击 —— 在单曲循环和顺序播放间切换
+ *
+ * 单曲循环：图标 LOOP，按钮高亮
+ * 顺序播放：图标 SHUFFLE(此处借用表示顺序)，按钮恢复
  */
+static void mode_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    s_single_loop = !s_single_loop;
+    lv_obj_t *icon = lv_obj_get_child(s_btn_mode, 0);
+    if (icon) {
+        lv_label_set_text(icon, s_single_loop ? LV_SYMBOL_LOOP : LV_SYMBOL_NEXT);
+    }
+    /* 单曲循环时高亮，顺序播放时恢复 */
+    lv_obj_set_style_bg_color(s_btn_mode,
+        s_single_loop ? UI_COLOR_ACCENT : lv_color_hex(0x3A3A5C), 0);
+    if (s_cb_mode) s_cb_mode();
+}
+
+/** @brief 封面区域点击 —— 切换封面/歌词 */
 static void cover_click_cb(lv_event_t *e)
 {
     (void)e;
@@ -85,31 +139,67 @@ static void cover_click_cb(lv_event_t *e)
     }
 }
 
+/** @brief 歌曲列表条目点击 —— 切换到对应歌曲 */
+static void playlist_item_cb(lv_event_t *e)
+{
+    int idx = (int)(uintptr_t)lv_event_get_user_data(e);
+    switch_to_song(idx);
+}
+
 /**
- * @brief 创建一个控制台圆形按钮（统一样式）
+ * @brief 切换到指定索引的歌曲，更新标题和列表高亮
+ * @param idx 歌曲索引 (0-based)
+ */
+static void switch_to_song(int idx)
+{
+    if (idx < 0 || idx >= (int)DEMO_SONG_COUNT) return;
+    s_current_idx = idx;
+    lv_label_set_text(s_title_lbl, s_demo_songs[idx]);
+    update_playlist_highlight();
+}
+
+/**
+ * @brief 刷新歌曲列表中的高亮状态
+ * 当前播放歌曲背景变为 UI_COLOR_ACCENT，其余恢复默认色。
+ */
+static void update_playlist_highlight(void)
+{
+    for (int i = 0; i < (int)DEMO_SONG_COUNT; i++) {
+        if (!s_pl_items[i]) continue;
+        if (i == s_current_idx) {
+            lv_obj_set_style_bg_color(s_pl_items[i], UI_COLOR_ACCENT, 0);
+            lv_obj_set_style_bg_opa(s_pl_items[i], LV_OPA_COVER, 0);
+        } else {
+            lv_obj_set_style_bg_color(s_pl_items[i], lv_color_hex(0x1A1A3E), 0);
+            lv_obj_set_style_bg_opa(s_pl_items[i], LV_OPA_80, 0);
+        }
+    }
+}
+
+/**
+ * @brief 创建控制台按钮（统一样式）
  * @param parent  父容器
- * @param symbol  按钮上显示的 LVGL 符号
- * @param cb      点击回调函数
- * @return 创建的按钮对象
+ * @param symbol  LVGL 符号
+ * @param cb      点击回调
+ * @return 按钮对象
  *
- * 按钮尺寸 48x48，修改此值会影响控制台按钮大小。
+ * 按钮尺寸 56x56，增大此值使按钮更大更易点击
  */
 static lv_obj_t *create_ctrl_btn(lv_obj_t *parent, const char *symbol,
                                   lv_event_cb_t cb)
 {
     lv_obj_t *btn = lv_button_create(parent);
-    /* 按钮尺寸 48x48 像素，调整此值改变按钮大小 */
-    lv_obj_set_size(btn, 48, 48);
+    lv_obj_set_size(btn, 56, 56);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(0x3A3A5C), 0);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_80, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, symbol);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
     lv_obj_center(lbl);
 
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
@@ -119,9 +209,9 @@ static lv_obj_t *create_ctrl_btn(lv_obj_t *parent, const char *symbol,
 /**
  * @brief 创建音乐播放器页面
  *
- * 页面全屏，深色渐变背景（后续替换为模糊封面图）。
- * 封面占位 180x180 圆角矩形，位于屏幕中上方。
- * 控制台位于封面下方，含按钮行 + 进度条 + 时长。
+ * 封面区域和控制台等宽 (PLAYER_PANEL_W=280px)。
+ * 进度条使用 lv_bar（只读，无旋钮，不可拖拽）。
+ * 歌曲列表可上下滚动，高亮当前播放歌曲。
  *
  * @param parent 父对象
  */
@@ -137,49 +227,43 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_radius(s_page, 0, 0);
     lv_obj_set_style_pad_all(s_page, 0, 0);
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_SCROLLABLE);
-    /* 允许触摸事件冒泡到父屏幕，以便 ui_manager 的手势检测能收到事件 */
     lv_obj_add_flag(s_page, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    /* ===== 歌曲标题 ===== */
+    /* ===== 歌曲标题 —— 默认显示第一首测试歌曲 ===== */
     s_title_lbl = lv_label_create(s_page);
-    lv_label_set_text(s_title_lbl, "No Song");
+    lv_label_set_text(s_title_lbl, s_demo_songs[0]);
     lv_obj_set_style_text_color(s_title_lbl, lv_color_white(), 0);
     lv_obj_set_style_text_font(s_title_lbl, &lv_font_montserrat_16, 0);
-    lv_obj_align(s_title_lbl, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_HEIGHT + 8);
+    lv_obj_align(s_title_lbl, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_HEIGHT + 6);
 
-    /* ===== 封面/歌词切换区域 ===== */
+    /* ===== 封面/歌词切换区域 (与控制台等宽) ===== */
     s_cover_area = lv_obj_create(s_page);
-    /* 封面区域尺寸 200x200，修改此值会改变封面显示大小 */
-    lv_obj_set_size(s_cover_area, 200, 200);
-    lv_obj_align(s_cover_area, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_HEIGHT + 40);
+    lv_obj_set_size(s_cover_area, PLAYER_PANEL_W, PLAYER_PANEL_W - 40);
+    lv_obj_align(s_cover_area, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_HEIGHT + 30);
     lv_obj_set_style_bg_opa(s_cover_area, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_cover_area, 0, 0);
     lv_obj_set_style_pad_all(s_cover_area, 0, 0);
     lv_obj_remove_flag(s_cover_area, LV_OBJ_FLAG_SCROLLABLE);
-    /* 封面区域事件冒泡，让手势检测能收到 PRESSED/RELEASED */
     lv_obj_add_flag(s_cover_area, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(s_cover_area, cover_click_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 封面占位矩形（紫色渐变，后续替换为真实封面图） */
+    /* 封面占位矩形 */
     s_cover_img = lv_obj_create(s_cover_area);
-    lv_obj_set_size(s_cover_img, 180, 180);
+    lv_obj_set_size(s_cover_img, PLAYER_PANEL_W - 20, PLAYER_PANEL_W - 60);
     lv_obj_center(s_cover_img);
-    /* 圆角半径 16px，增大使封面更圆润 */
     lv_obj_set_style_radius(s_cover_img, 16, 0);
     lv_obj_set_style_bg_color(s_cover_img, lv_color_hex(0x4A3080), 0);
     lv_obj_set_style_bg_opa(s_cover_img, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_cover_img, 0, 0);
     lv_obj_remove_flag(s_cover_img, LV_OBJ_FLAG_SCROLLABLE);
-    /* 封面占位不拦截点击，让事件冒泡到 cover_area 处理封面/歌词切换 */
     lv_obj_add_flag(s_cover_img, LV_OBJ_FLAG_EVENT_BUBBLE);
-    /* 封面中间放一个音乐符号作为占位 */
     lv_obj_t *cover_icon = lv_label_create(s_cover_img);
     lv_label_set_text(cover_icon, LV_SYMBOL_AUDIO);
     lv_obj_set_style_text_color(cover_icon, lv_color_white(), 0);
     lv_obj_set_style_text_font(cover_icon, &lv_font_montserrat_26, 0);
     lv_obj_center(cover_icon);
 
-    /* 歌词 label（默认隐藏，点击封面区域切换显示） */
+    /* 歌词 label（默认隐藏） */
     s_lyric_label = lv_label_create(s_cover_area);
     lv_label_set_text(s_lyric_label, "Lyrics will\nappear here");
     lv_obj_set_style_text_color(s_lyric_label, lv_color_hex(0xCCCCCC), 0);
@@ -188,61 +272,59 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_center(s_lyric_label);
     lv_obj_add_flag(s_lyric_label, LV_OBJ_FLAG_HIDDEN);
 
-    /* ===== 播放控制台 ===== */
+    /* ===== 播放控制台 (与封面等宽) ===== */
     s_ctrl_panel = lv_obj_create(s_page);
-    /* 控制台宽度占屏幕 85%，高度 140px，修改此值改变控制台尺寸 */
-    lv_obj_set_size(s_ctrl_panel, UI_HOR_RES * 85 / 100, 140);
-    lv_obj_align(s_ctrl_panel, LV_ALIGN_BOTTOM_MID, 0, -30);
+    lv_obj_set_size(s_ctrl_panel, PLAYER_PANEL_W, 110);
+    lv_obj_align(s_ctrl_panel, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_obj_set_style_radius(s_ctrl_panel, 20, 0);
     lv_obj_set_style_bg_color(s_ctrl_panel, lv_color_hex(0x1A1A3E), 0);
     lv_obj_set_style_bg_opa(s_ctrl_panel, UI_PANEL_BG_OPA, 0);
     lv_obj_set_style_border_width(s_ctrl_panel, 0, 0);
-    lv_obj_set_style_pad_all(s_ctrl_panel, 10, 0);
+    lv_obj_set_style_pad_all(s_ctrl_panel, 8, 0);
     lv_obj_set_flex_flow(s_ctrl_panel, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_ctrl_panel, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_ctrl_panel, 6, 0);
     lv_obj_remove_flag(s_ctrl_panel, LV_OBJ_FLAG_SCROLLABLE);
-    /* 控制台事件冒泡，让边缘手势能穿透 */
     lv_obj_add_flag(s_ctrl_panel, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    /* 按钮行容器 */
+    /* 按钮行 */
     lv_obj_t *btn_row = lv_obj_create(s_ctrl_panel);
-    lv_obj_set_size(btn_row, LV_PCT(100), 56);
+    lv_obj_set_size(btn_row, LV_PCT(100), 60);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    /* 按钮间距 20px，增大使按钮间距更宽 */
-    lv_obj_set_style_pad_column(btn_row, 20, 0);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(btn_row, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    s_btn_prev   = create_ctrl_btn(btn_row, LV_SYMBOL_PREV,    prev_btn_cb);
-    s_btn_toggle = create_ctrl_btn(btn_row, LV_SYMBOL_PAUSE,   toggle_btn_cb);
-    s_btn_next   = create_ctrl_btn(btn_row, LV_SYMBOL_NEXT,    next_btn_cb);
-    s_btn_mode   = create_ctrl_btn(btn_row, LV_SYMBOL_LOOP,    mode_btn_cb);
+    s_btn_prev   = create_ctrl_btn(btn_row, LV_SYMBOL_PREV,  prev_btn_cb);
+    s_btn_toggle = create_ctrl_btn(btn_row, LV_SYMBOL_PLAY,  toggle_btn_cb);
+    s_btn_next   = create_ctrl_btn(btn_row, LV_SYMBOL_NEXT,  next_btn_cb);
+    s_btn_mode   = create_ctrl_btn(btn_row, LV_SYMBOL_NEXT,  mode_btn_cb);
 
     /* 进度条行 */
     lv_obj_t *prog_row = lv_obj_create(s_ctrl_panel);
-    lv_obj_set_size(prog_row, LV_PCT(100), 30);
+    lv_obj_set_size(prog_row, LV_PCT(100), 24);
     lv_obj_set_style_bg_opa(prog_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(prog_row, 0, 0);
     lv_obj_set_style_pad_all(prog_row, 0, 0);
     lv_obj_remove_flag(prog_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(prog_row, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    /* 进度条 —— 高度 6px，修改可调节进度条粗细 */
-    s_progress = lv_slider_create(prog_row);
-    lv_obj_set_width(s_progress, LV_PCT(75));
+    /* 进度条 —— 使用 lv_bar（只读，无旋钮，不可手动拖拽） */
+    s_progress = lv_bar_create(prog_row);
+    lv_obj_set_size(s_progress, LV_PCT(78), 6);
     lv_obj_set_style_bg_color(s_progress, UI_COLOR_SLIDER_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_progress, UI_COLOR_SLIDER_ACTIVE, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_progress, lv_color_white(), LV_PART_KNOB);
-    /* 滑块高度 6px */
     lv_obj_set_style_bg_opa(s_progress, LV_OPA_COVER, LV_PART_MAIN);
-    lv_slider_set_range(s_progress, 0, 1000);
-    lv_slider_set_value(s_progress, 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(s_progress, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_progress, 3, LV_PART_INDICATOR);
+    lv_bar_set_range(s_progress, 0, 1000);
+    lv_bar_set_value(s_progress, 0, LV_ANIM_OFF);
     lv_obj_align(s_progress, LV_ALIGN_LEFT_MID, 0, 0);
 
     /* 时长 label */
@@ -252,7 +334,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(s_time_lbl, &lv_font_montserrat_12, 0);
     lv_obj_align(s_time_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
 
-    /* ===== 歌曲列表（全屏覆盖，默认隐藏，上滑展开） ===== */
+    /* ===== 歌曲列表（全屏，可上下滚动，默认隐藏） ===== */
     s_playlist = lv_obj_create(s_page);
     lv_obj_set_size(s_playlist, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_playlist, LV_ALIGN_CENTER, 0, 0);
@@ -266,70 +348,57 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_pad_right(s_playlist, 16, 0);
     lv_obj_set_flex_flow(s_playlist, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_playlist, 6, 0);
-    /* 歌曲列表事件冒泡，让 ui_manager 能检测到下滑收起手势 */
+    /* 允许上下滚动查看歌曲列表 */
+    lv_obj_add_flag(s_playlist, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_playlist, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_playlist, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(s_playlist, LV_OBJ_FLAG_EVENT_BUBBLE);
-    /* 添加几个示例歌曲条目 */
-    const char *demo_songs[] = {"Song 1", "Song 2", "Song 3", "Song 4", "Song 5"};
-    for (int i = 0; i < 5; i++) {
+
+    for (int i = 0; i < (int)DEMO_SONG_COUNT; i++) {
         lv_obj_t *item = lv_obj_create(s_playlist);
-        lv_obj_set_size(item, LV_PCT(100), 44);
+        lv_obj_set_size(item, LV_PCT(100), 48);
         lv_obj_set_style_bg_color(item, lv_color_hex(0x1A1A3E), 0);
         lv_obj_set_style_bg_opa(item, LV_OPA_80, 0);
         lv_obj_set_style_radius(item, 10, 0);
         lv_obj_set_style_border_width(item, 0, 0);
         lv_obj_remove_flag(item, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(item, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_event_cb(item, playlist_item_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)i);
 
         lv_obj_t *lbl = lv_label_create(item);
-        lv_label_set_text(lbl, demo_songs[i]);
+        lv_label_set_text(lbl, s_demo_songs[i]);
         lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
+
+        s_pl_items[i] = item;
     }
+    /* 高亮第一首歌曲 */
+    update_playlist_highlight();
     lv_obj_add_flag(s_playlist, LV_OBJ_FLAG_HIDDEN);
 }
 
-/**
- * @brief 获取音乐播放器页面容器
- * @return lv_obj_t* 页面容器
- */
-lv_obj_t *ui_music_player_get_page(void)
-{
-    return s_page;
-}
+lv_obj_t *ui_music_player_get_page(void) { return s_page; }
 
-/**
- * @brief 歌曲列表滑入/滑出动画的 Y 坐标执行回调
- */
-static void playlist_anim_y_cb(void *obj, int32_t v)
-{
-    lv_obj_set_y((lv_obj_t *)obj, v);
-}
+static void playlist_anim_y_cb(void *obj, int32_t v) { lv_obj_set_y((lv_obj_t *)obj, v); }
 
-/**
- * @brief 歌曲列表隐藏动画完成回调
- */
 static void playlist_hide_ready(lv_anim_t *a)
 {
     (void)a;
     lv_obj_add_flag(s_playlist, LV_OBJ_FLAG_HIDDEN);
 }
 
-/**
- * @brief 显示/隐藏歌曲列表（带滑入滑出动画）
- * @param show true=从底部滑入展开, false=向底部滑出收起
- */
 void ui_music_player_toggle_playlist(bool show)
 {
     if (!s_playlist) return;
-
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_playlist);
     lv_anim_set_duration(&a, UI_ANIM_DURATION_MS);
     lv_anim_set_path_cb(&a, UI_ANIM_PATH);
     lv_anim_set_exec_cb(&a, playlist_anim_y_cb);
-
     if (show) {
         lv_obj_remove_flag(s_playlist, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_playlist);
@@ -341,70 +410,39 @@ void ui_music_player_toggle_playlist(bool show)
     lv_anim_start(&a);
 }
 
-/**
- * @brief 刷新播放进度、时间显示和播放/暂停图标
- * @param current_sec 当前播放秒数
- * @param total_sec   总时长秒数
- * @param is_playing  是否正在播放
- */
-void ui_music_player_update_progress(uint32_t current_sec, uint32_t total_sec,
-                                     bool is_playing)
+void ui_music_player_update_progress(uint32_t current_sec, uint32_t total_sec, bool is_playing)
 {
     if (!s_progress || !s_time_lbl) return;
-
-    /* 更新进度条 (范围 0-1000) */
     int32_t val = 0;
-    if (total_sec > 0) {
-        val = (int32_t)(current_sec * 1000 / total_sec);
-    }
-    lv_slider_set_value(s_progress, val, LV_ANIM_ON);
-
-    /* 更新时长文字 MM:SS */
+    if (total_sec > 0) val = (int32_t)(current_sec * 1000 / total_sec);
+    lv_bar_set_value(s_progress, val, LV_ANIM_ON);
     char buf[16];
     snprintf(buf, sizeof(buf), "%lu:%02lu",
              (unsigned long)(total_sec / 60), (unsigned long)(total_sec % 60));
     lv_label_set_text(s_time_lbl, buf);
 
-    /* 更新播放/暂停图标 */
-    lv_obj_t *icon = lv_obj_get_child(s_btn_toggle, 0);
-    if (icon) {
-        lv_label_set_text(icon, is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    /* 同步播放状态到按钮样式 */
+    if (is_playing != s_is_playing) {
+        s_is_playing = is_playing;
+        lv_obj_t *icon = lv_obj_get_child(s_btn_toggle, 0);
+        if (icon) lv_label_set_text(icon, s_is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        lv_obj_set_style_bg_color(s_btn_toggle,
+            s_is_playing ? UI_COLOR_ACCENT : lv_color_hex(0x3A3A5C), 0);
     }
 }
 
-/**
- * @brief 设置歌曲标题
- * @param title 歌曲标题字符串
- */
 void ui_music_player_set_song(const char *title)
 {
-    if (s_title_lbl && title) {
-        lv_label_set_text(s_title_lbl, title);
-    }
+    if (s_title_lbl && title) lv_label_set_text(s_title_lbl, title);
 }
 
-/**
- * @brief 注册播放控制回调函数
- * @param on_prev  上一首
- * @param on_next  下一首
- * @param on_toggle 暂停/继续
- * @param on_mode  播放模式切换
- */
-void ui_music_player_set_callbacks(ui_music_ctrl_cb_t on_prev,
-                                   ui_music_ctrl_cb_t on_next,
-                                   ui_music_ctrl_cb_t on_toggle,
-                                   ui_music_ctrl_cb_t on_mode)
+void ui_music_player_set_callbacks(ui_music_ctrl_cb_t on_prev, ui_music_ctrl_cb_t on_next,
+                                   ui_music_ctrl_cb_t on_toggle, ui_music_ctrl_cb_t on_mode)
 {
-    s_cb_prev   = on_prev;
-    s_cb_next   = on_next;
-    s_cb_toggle = on_toggle;
-    s_cb_mode   = on_mode;
+    s_cb_prev = on_prev; s_cb_next = on_next;
+    s_cb_toggle = on_toggle; s_cb_mode = on_mode;
 }
 
-/**
- * @brief 查询歌曲列表是否当前展开
- * @return true=歌曲列表可见
- */
 bool ui_music_player_is_playlist_visible(void)
 {
     if (!s_playlist) return false;

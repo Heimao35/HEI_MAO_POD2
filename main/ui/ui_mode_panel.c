@@ -91,6 +91,7 @@ void ui_mode_panel_create(lv_obj_t *parent)
     lv_obj_set_style_pad_row(s_panel, 12, 0);
     /* 允许上下滚动（模式较多时） */
     lv_obj_add_flag(s_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(s_panel, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_panel, LV_SCROLLBAR_MODE_OFF);
 
     /* ---- 创建模式按钮 ---- */
