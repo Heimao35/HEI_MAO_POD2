@@ -104,9 +104,10 @@ static void gesture_released_cb(lv_event_t *e)
 
     bool is_horizontal = abs_dx > abs_dy;
 
-    /* ---- 设置页面展开时：任意位置上滑收起 ---- */
+    /* ---- 设置页面展开时：从底部边缘上滑收起（不能用任意位置上滑，否则无法滚动页面） ---- */
     if (ui_settings_is_visible()) {
-        if (!is_horizontal && dy < -GESTURE_MIN_DIST) {
+        if (!is_horizontal && dy < -GESTURE_MIN_DIST &&
+            s_press_point.y > (int32_t)(UI_VER_RES - UI_EDGE_THRESHOLD)) {
             ui_settings_hide();
         }
         return;
