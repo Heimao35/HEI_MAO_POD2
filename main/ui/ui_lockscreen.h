@@ -49,6 +49,11 @@ void ui_lockscreen_hide(void);
  */
 bool ui_lockscreen_is_visible(void);
 
+/**
+ * @brief 启动锁屏 MJPEG 开机动画（SD 卡挂载后调用）
+ */
+void ui_lockscreen_start_boot_anim(void);
+
 #ifdef __cplusplus
 }
 #endif

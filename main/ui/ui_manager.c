@@ -115,6 +115,12 @@ static void gesture_released_cb(lv_event_t *e)
 
     /* ---- 锁屏页面下：上滑解锁，右边缘左滑开声光调节栏 ---- */
     if (ui_lockscreen_is_visible()) {
+        if (ui_adj_panel_is_visible()) {
+            if (is_horizontal && dx > GESTURE_MIN_DIST) {
+                ui_adj_panel_hide();
+            }
+            return;
+        }
         if (!is_horizontal && dy < -GESTURE_MIN_DIST) {
             ui_lockscreen_hide();
             return;
@@ -124,7 +130,7 @@ static void gesture_released_cb(lv_event_t *e)
             ui_adj_panel_show();
             return;
         }
-        return; /* 锁屏下不允许其他手势 */
+        return;
     }
 
     /* ---- 歌曲列表展开时：上边缘下滑收起，边缘手势仍可展开面板 ---- */

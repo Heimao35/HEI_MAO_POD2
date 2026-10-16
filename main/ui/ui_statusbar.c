@@ -68,21 +68,25 @@ void ui_statusbar_create(lv_obj_t *parent)
     lv_label_set_text(s_icon_wifi, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_color(s_icon_wifi, UI_COLOR_STATUS_TEXT, 0);
     lv_obj_set_style_text_font(s_icon_wifi, SB_ICON_FONT, 0);
+    lv_obj_add_flag(s_icon_wifi, LV_OBJ_FLAG_HIDDEN);
 
     s_icon_bt = lv_label_create(left);
     lv_label_set_text(s_icon_bt, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_color(s_icon_bt, UI_COLOR_STATUS_TEXT, 0);
     lv_obj_set_style_text_font(s_icon_bt, SB_ICON_FONT, 0);
+    lv_obj_add_flag(s_icon_bt, LV_OBJ_FLAG_HIDDEN);
 
     s_icon_hp = lv_label_create(left);
     lv_label_set_text(s_icon_hp, LV_SYMBOL_AUDIO);
     lv_obj_set_style_text_color(s_icon_hp, UI_COLOR_STATUS_TEXT, 0);
     lv_obj_set_style_text_font(s_icon_hp, SB_ICON_FONT, 0);
+    lv_obj_add_flag(s_icon_hp, LV_OBJ_FLAG_HIDDEN);
 
     s_icon_sd = lv_label_create(left);
     lv_label_set_text(s_icon_sd, LV_SYMBOL_SD_CARD);
     lv_obj_set_style_text_color(s_icon_sd, UI_COLOR_STATUS_TEXT, 0);
     lv_obj_set_style_text_font(s_icon_sd, SB_ICON_FONT, 0);
+    lv_obj_add_flag(s_icon_sd, LV_OBJ_FLAG_HIDDEN);
 
     /* ========== 中间时间 ========== */
     s_time_lbl = lv_label_create(s_bar);

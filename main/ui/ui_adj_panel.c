@@ -13,6 +13,7 @@
  */
 
 #include "ui_adj_panel.h"
+#include "ui_lockscreen.h"
 #include <stdio.h>
 
 static lv_obj_t *s_overlay       = NULL;
@@ -271,24 +272,30 @@ static void panel_hide_ready(lv_anim_t *a)
 void ui_adj_panel_show(void)
 {
     if (!s_panel || s_visible) return;
+    bool on_lockscreen = ui_lockscreen_is_visible();
+
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_bg_opa(s_overlay, 0, 0);
     lv_obj_move_foreground(s_overlay);
+
+    if (on_lockscreen) {
+        lv_obj_set_style_bg_opa(s_overlay, LV_OPA_TRANSP, 0);
+    } else {
+        lv_obj_set_style_bg_opa(s_overlay, 0, 0);
+
+        lv_anim_t a_ov;
+        lv_anim_init(&a_ov);
+        lv_anim_set_var(&a_ov, s_overlay);
+        lv_anim_set_values(&a_ov, 0, 80);
+        lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
+        lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
+        lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
+        lv_anim_start(&a_ov);
+    }
+
     lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_panel);
     ui_adj_panel_update();
 
-    /* 遮罩淡入动画（比面板滑动稍长，使渐变更平滑） */
-    lv_anim_t a_ov;
-    lv_anim_init(&a_ov);
-    lv_anim_set_var(&a_ov, s_overlay);
-    lv_anim_set_values(&a_ov, 0, 80);
-    lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
-    lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
-    lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
-    lv_anim_start(&a_ov);
-
-    /* 面板滑入动画 */
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_panel);
@@ -304,19 +311,22 @@ void ui_adj_panel_show(void)
 void ui_adj_panel_hide(void)
 {
     if (!s_panel || !s_visible) return;
+    bool on_lockscreen = ui_lockscreen_is_visible();
 
-    /* 遮罩淡出动画 */
-    lv_anim_t a_ov;
-    lv_anim_init(&a_ov);
-    lv_anim_set_var(&a_ov, s_overlay);
-    lv_anim_set_values(&a_ov, 80, 0);
-    lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
-    lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
-    lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
-    lv_anim_set_completed_cb(&a_ov, overlay_hide_ready);
-    lv_anim_start(&a_ov);
+    if (on_lockscreen) {
+        lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_anim_t a_ov;
+        lv_anim_init(&a_ov);
+        lv_anim_set_var(&a_ov, s_overlay);
+        lv_anim_set_values(&a_ov, 80, 0);
+        lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
+        lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
+        lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
+        lv_anim_set_completed_cb(&a_ov, overlay_hide_ready);
+        lv_anim_start(&a_ov);
+    }
 
-    /* 面板滑出动画 */
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_panel);

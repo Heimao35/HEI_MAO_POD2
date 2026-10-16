@@ -19,6 +19,8 @@
 
 #include "ui_manager.h"
 #include "ui_adj_panel.h"
+#include "ui_lockscreen.h"
+#include "sd_card.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (460)
@@ -301,4 +303,13 @@ void app_main(void)
     ui_adj_panel_set_callbacks(on_brightness_change, NULL);
 
     lvgl_port_unlock();
+
+    /* SD card initialization (interrupt-based hot-plug, non-blocking) */
+    /* 放在 UI 初始化之后，确保 lockscreen 等 UI 对象已创建 */
+    sd_card_init();
+
+    /* 如果 SD 卡已挂载且锁屏可见，启动开机动画 */
+    if (sd_card_is_mounted()) {
+        ui_lockscreen_start_boot_anim();
+    }
 }
