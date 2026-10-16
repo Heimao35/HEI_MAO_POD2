@@ -274,6 +274,7 @@ static esp_err_t app_lvgl_init(void)
 
 static void on_brightness_change(uint8_t val)
 {
+    if (val < 5) val = 5;
     esp_lcd_panel_co5300_set_brightness(lcd_panel, val);
 }
 
