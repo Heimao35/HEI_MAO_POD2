@@ -48,10 +48,10 @@ static void page_hide_ready(lv_anim_t *a)
     lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
 
-/** @brief 页面 X 坐标动画执行回调 */
-static void page_anim_x_cb(void *obj, int32_t v)
+/** @brief 页面 Y 坐标动画执行回调（模式切换用上下滑动） */
+static void page_anim_y_cb(void *obj, int32_t v)
 {
-    lv_obj_set_x((lv_obj_t *)obj, v);
+    lv_obj_set_y((lv_obj_t *)obj, v);
 }
 
 /**
@@ -125,6 +125,29 @@ static void gesture_released_cb(lv_event_t *e)
             return;
         }
         return; /* 锁屏下不允许其他手势 */
+    }
+
+    /* ---- 歌曲列表展开时：上边缘下滑收起，边缘手势仍可展开面板 ---- */
+    if (s_current_mode == UI_MODE_MUSIC && ui_music_player_is_playlist_visible()) {
+        /* 从上边缘下滑 → 收起歌曲列表 */
+        if (!is_horizontal && dy > GESTURE_MIN_DIST &&
+            s_press_point.y < (int32_t)UI_EDGE_THRESHOLD) {
+            ui_music_player_toggle_playlist(false);
+            return;
+        }
+        /* 左边缘右滑 → 展开模式切换栏 */
+        if (is_horizontal && dx > GESTURE_MIN_DIST &&
+            s_press_point.x < (int32_t)UI_EDGE_THRESHOLD) {
+            ui_mode_panel_show();
+            return;
+        }
+        /* 右边缘左滑 → 展开声光调节栏 */
+        if (is_horizontal && dx < -GESTURE_MIN_DIST &&
+            s_press_point.x > (int32_t)(UI_HOR_RES - UI_EDGE_THRESHOLD)) {
+            ui_adj_panel_show();
+            return;
+        }
+        return; /* 歌曲列表展开时不处理其他手势 */
     }
 
     /* ---- 面板展开时不处理新手势 ---- */
@@ -256,10 +279,10 @@ void ui_manager_switch_mode(ui_mode_t mode)
     lv_obj_t *new_page = s_mode_pages[mode];
     if (!old_page || !new_page) return;
 
-    /* 判断滑动方向：目标模式序号大于当前 → 向左滑 */
-    bool slide_left = (mode > s_current_mode);
-    int32_t out_target = slide_left ? -(int32_t)UI_HOR_RES : (int32_t)UI_HOR_RES;
-    int32_t in_start   = slide_left ? (int32_t)UI_HOR_RES : -(int32_t)UI_HOR_RES;
+    /* 判断滑动方向：目标模式序号大于当前 → 向上滑出（新页面从下方滑入） */
+    bool slide_up = (mode > s_current_mode);
+    int32_t out_target = slide_up ? -(int32_t)UI_VER_RES : (int32_t)UI_VER_RES;
+    int32_t in_start   = slide_up ? (int32_t)UI_VER_RES : -(int32_t)UI_VER_RES;
 
     /* 旧页面滑出动画 */
     lv_anim_t a_out;
@@ -268,13 +291,13 @@ void ui_manager_switch_mode(ui_mode_t mode)
     lv_anim_set_values(&a_out, 0, out_target);
     lv_anim_set_duration(&a_out, UI_ANIM_DURATION_MS);
     lv_anim_set_path_cb(&a_out, UI_ANIM_PATH);
-    lv_anim_set_exec_cb(&a_out, page_anim_x_cb);
+    lv_anim_set_exec_cb(&a_out, page_anim_y_cb);
     lv_anim_set_completed_cb(&a_out, page_hide_ready);
     lv_anim_start(&a_out);
 
     /* 新页面滑入动画 */
     lv_obj_remove_flag(new_page, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_x(new_page, in_start);
+    lv_obj_set_y(new_page, in_start);
 
     lv_anim_t a_in;
     lv_anim_init(&a_in);
@@ -282,7 +305,7 @@ void ui_manager_switch_mode(ui_mode_t mode)
     lv_anim_set_values(&a_in, in_start, 0);
     lv_anim_set_duration(&a_in, UI_ANIM_DURATION_MS);
     lv_anim_set_path_cb(&a_in, UI_ANIM_PATH);
-    lv_anim_set_exec_cb(&a_in, page_anim_x_cb);
+    lv_anim_set_exec_cb(&a_in, page_anim_y_cb);
     lv_anim_start(&a_in);
 
     s_current_mode = mode;

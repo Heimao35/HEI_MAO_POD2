@@ -266,6 +266,8 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_pad_right(s_playlist, 16, 0);
     lv_obj_set_flex_flow(s_playlist, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(s_playlist, 6, 0);
+    /* 歌曲列表事件冒泡，让 ui_manager 能检测到下滑收起手势 */
+    lv_obj_add_flag(s_playlist, LV_OBJ_FLAG_EVENT_BUBBLE);
     /* 添加几个示例歌曲条目 */
     const char *demo_songs[] = {"Song 1", "Song 2", "Song 3", "Song 4", "Song 5"};
     for (int i = 0; i < 5; i++) {
@@ -276,6 +278,7 @@ void ui_music_player_create(lv_obj_t *parent)
         lv_obj_set_style_radius(item, 10, 0);
         lv_obj_set_style_border_width(item, 0, 0);
         lv_obj_remove_flag(item, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(item, LV_OBJ_FLAG_EVENT_BUBBLE);
 
         lv_obj_t *lbl = lv_label_create(item);
         lv_label_set_text(lbl, demo_songs[i]);
@@ -396,4 +399,14 @@ void ui_music_player_set_callbacks(ui_music_ctrl_cb_t on_prev,
     s_cb_next   = on_next;
     s_cb_toggle = on_toggle;
     s_cb_mode   = on_mode;
+}
+
+/**
+ * @brief 查询歌曲列表是否当前展开
+ * @return true=歌曲列表可见
+ */
+bool ui_music_player_is_playlist_visible(void)
+{
+    if (!s_playlist) return false;
+    return !lv_obj_has_flag(s_playlist, LV_OBJ_FLAG_HIDDEN);
 }

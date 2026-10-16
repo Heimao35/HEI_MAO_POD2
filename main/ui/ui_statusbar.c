@@ -58,6 +58,8 @@ void ui_statusbar_create(lv_obj_t *parent)
     lv_obj_set_style_pad_left(s_bar, 6, 0);
     lv_obj_set_style_pad_right(s_bar, 6, 0);
     lv_obj_remove_flag(s_bar, LV_OBJ_FLAG_SCROLLABLE);
+    /* 让触摸事件冒泡到父屏幕，以便 ui_manager 检测从状态栏下滑的手势 */
+    lv_obj_add_flag(s_bar, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* ========== 左侧图标区 ========== */
     lv_obj_t *left = lv_obj_create(s_bar);
@@ -72,6 +74,7 @@ void ui_statusbar_create(lv_obj_t *parent)
     lv_obj_set_flex_align(left, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(left, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(left, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* WiFi 图标 —— 使用 LV_SYMBOL_WIFI */
     s_icon_wifi = lv_label_create(left);
@@ -116,6 +119,7 @@ void ui_statusbar_create(lv_obj_t *parent)
     lv_obj_set_flex_align(right, LV_FLEX_ALIGN_END,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(right, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(right, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 电量百分比文字 */
     s_batt_pct = lv_label_create(right);

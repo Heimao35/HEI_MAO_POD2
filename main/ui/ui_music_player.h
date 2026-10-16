@@ -72,6 +72,12 @@ void ui_music_player_set_callbacks(ui_music_ctrl_cb_t on_prev,
                                    ui_music_ctrl_cb_t on_toggle,
                                    ui_music_ctrl_cb_t on_mode);
 
+/**
+ * @brief 查询歌曲列表是否当前展开
+ * @return true=歌曲列表可见
+ */
+bool ui_music_player_is_playlist_visible(void);
+
 #ifdef __cplusplus
 }
 #endif
