@@ -363,7 +363,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_border_width(btn_row, 0, 0);
     lv_obj_set_style_pad_all(btn_row, 0, 0);
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_style_pad_column(btn_row, 12, 0);
+    lv_obj_set_style_pad_column(btn_row, 24, 0);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
@@ -393,7 +393,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_radius(s_progress, 3, LV_PART_INDICATOR);
     lv_bar_set_range(s_progress, 0, 1000);
     lv_bar_set_value(s_progress, 0, LV_ANIM_OFF);
-    lv_obj_align(s_progress, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_align(s_progress, LV_ALIGN_LEFT_MID, 10, 0);
 
     /* 时长 label */
     s_time_lbl = lv_label_create(prog_row);

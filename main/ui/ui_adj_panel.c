@@ -38,7 +38,6 @@ static void bright_slider_cb(lv_event_t *e)
     /* 自动亮度开启时手动拖滑条 → 自动关闭自动亮度 */
     if (st->auto_brightness) {
         st->auto_brightness = false;
-        lv_obj_remove_state(s_bright_slider, LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(s_auto_btn, lv_color_hex(0x3A3A5C), 0);
     }
     int32_t val = lv_slider_get_value(s_bright_slider);
@@ -67,10 +66,8 @@ static void auto_bright_cb(lv_event_t *e)
     ui_device_state_t *st = ui_get_device_state();
     st->auto_brightness = !st->auto_brightness;
     if (st->auto_brightness) {
-        lv_obj_add_state(s_bright_slider, LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(s_auto_btn, UI_COLOR_ACCENT, 0);
     } else {
-        lv_obj_remove_state(s_bright_slider, LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(s_auto_btn, lv_color_hex(0x3A3A5C), 0);
     }
 }
