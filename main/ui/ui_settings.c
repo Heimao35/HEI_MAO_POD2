@@ -79,6 +79,8 @@ void ui_settings_create(lv_obj_t *parent)
     /* 行间距 20px，列间距 20px */
     lv_obj_set_style_pad_row(grid, 20, 0);
     lv_obj_set_style_pad_column(grid, 20, 0);
+    /* 事件冒泡，让上滑收起手势能传到 scr */
+    lv_obj_add_flag(grid, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     /* 创建按钮 */
     for (size_t i = 0; i < ITEM_COUNT; i++) {
@@ -89,6 +91,7 @@ void ui_settings_create(lv_obj_t *parent)
         lv_obj_set_style_border_width(item, 0, 0);
         lv_obj_set_style_pad_all(item, 0, 0);
         lv_obj_remove_flag(item, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(item, LV_OBJ_FLAG_EVENT_BUBBLE);
 
         /* 圆形按钮 80x80 */
         lv_obj_t *btn = lv_obj_create(item);
@@ -100,6 +103,8 @@ void ui_settings_create(lv_obj_t *parent)
         lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 0);
         lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        /* 按钮也需要事件冒泡，点击事件由自身 CLICKED 处理，滑动事件冒泡到 scr */
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);
         lv_obj_add_event_cb(btn, item_click_cb, LV_EVENT_CLICKED,
                             (void *)(uintptr_t)i);
 
