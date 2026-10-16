@@ -12,11 +12,12 @@
 #include "driver/gpio.h"
 #include "esp_ldo_regulator.h"
 #include "esp_lvgl_port.h"
-#include "lv_demos.h"
 
 #include "esp_lcd_co5300.h"
 #include "co5300_init_cmds.h"
 #include "esp_lcd_touch_cst820.h"
+
+#include "ui_manager.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (460)
@@ -49,8 +50,8 @@
 /* LCD touch pins */
 #define EXAMPLE_TOUCH_I2C_SCL       (GPIO_NUM_8)
 #define EXAMPLE_TOUCH_I2C_SDA       (GPIO_NUM_7)
-#define EXAMPLE_TOUCH_RST           (GPIO_NUM_NC)
-#define EXAMPLE_TOUCH_INT           (GPIO_NUM_NC)
+#define EXAMPLE_TOUCH_RST           (GPIO_NUM_5)
+#define EXAMPLE_TOUCH_INT           (GPIO_NUM_6)
 
 static const char *TAG = "EXAMPLE";
 
@@ -286,8 +287,8 @@ void app_main(void)
     /* Show LVGL objects */
     lvgl_port_lock(0);
 
-    // lv_demo_music();
-    lv_demo_widgets();
+    /* 初始化自定义 UI 系统（替换原有 demo） */
+    ui_manager_init();
 
     lvgl_port_unlock();
 }

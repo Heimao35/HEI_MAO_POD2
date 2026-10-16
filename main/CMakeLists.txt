@@ -1,2 +1,13 @@
 idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+                              "ui/ui_common.c"
+                              "ui/ui_statusbar.c"
+                              "ui/ui_lockscreen.c"
+                              "ui/ui_music_player.c"
+                              "ui/ui_video_player.c"
+                              "ui/ui_image_viewer.c"
+                              "ui/ui_ebook.c"
+                              "ui/ui_mode_panel.c"
+                              "ui/ui_adj_panel.c"
+                              "ui/ui_settings.c"
+                              "ui/ui_manager.c"
+                    INCLUDE_DIRS "." "ui")
