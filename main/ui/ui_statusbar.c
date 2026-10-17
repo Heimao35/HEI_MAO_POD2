@@ -2,7 +2,7 @@
  * @file ui_statusbar.c
  * @brief 状态栏实现 —— 透明背景，显示连接状态、时间、电量
  *
- * 布局：高度 UI_STATUSBAR_HEIGHT(38px)，宽度铺满屏幕，背景透明。
+ * 布局：高度 UI_STATUSBAR_HEIGHT(38px)，宽度铺满屏幕，背景为低不透明度黑色。
  * 左侧 flex 容器放 WiFi/BT/耳机/SD 图标(20px字体)，中间放时间，
  * 右侧放电量百分比 + 电池图标(22px字体) + 充电闪电。
  * 右侧容器使用固定宽度避免百分比文字被裁切。
@@ -42,7 +42,11 @@ void ui_statusbar_create(lv_obj_t *parent)
     s_bar = lv_obj_create(parent);
     lv_obj_set_size(s_bar, UI_HOR_RES, UI_STATUSBAR_HEIGHT);
     lv_obj_align(s_bar, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_opa(s_bar, LV_OPA_TRANSP, 0);
+    /* 为不同封面/页面上的浅色状态图标增加轻微衬底，只混合背景。
+     * 左右子容器继续透明，避免叠加变暗；状态栏尺寸与手势冒泡不变。 */
+    lv_obj_set_style_bg_color(s_bar, UI_STATUSBAR_BG_COLOR, 0);
+    lv_obj_set_style_bg_opa(s_bar, UI_STATUSBAR_BG_OPA, 0);
+    lv_obj_set_style_radius(s_bar, 0, 0);
     lv_obj_set_style_border_width(s_bar, 0, 0);
     lv_obj_set_style_pad_all(s_bar, 0, 0);
     lv_obj_set_style_pad_left(s_bar, 8, 0);

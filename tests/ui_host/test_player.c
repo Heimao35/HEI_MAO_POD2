@@ -32,8 +32,48 @@ void ui_settings_create(lv_obj_t *p) { (void)p; }
 void ui_statusbar_create(lv_obj_t *p) { (void)p; }
 void ui_statusbar_show_time(bool show) { (void)show; }
 
+/* Track display references independently of the JPEG cache tested by media_host. */
+static uint8_t test_covers[2][240*240*2];
+static unsigned cover_refs[2];
+void cover_loader_retain(const uint8_t *pixels)
+{
+    if (!pixels) return;
+    for (unsigned i=0;i<2;i++) if (pixels==test_covers[i]) { ++cover_refs[i]; return; }
+    assert(!"unexpected cover");
+}
+void cover_loader_release(const uint8_t *pixels)
+{
+    if (!pixels) return;
+    for (unsigned i=0;i<2;i++) if (pixels==test_covers[i]) {
+        assert(cover_refs[i]); --cover_refs[i]; return;
+    }
+    assert(!"unexpected cover");
+}
+/* Background ownership is independent of clear cover ownership. Real RGB565
+ * buffers let the actual LVGL renderer exercise the two full-screen canvases. */
+static uint8_t test_backgrounds[3][460*460*2];
+static unsigned background_refs[3];
+void music_background_retain(const uint8_t *pixels)
+{
+    if (!pixels) return;
+    for (unsigned i=0;i<3;i++) if (pixels==test_backgrounds[i]) { ++background_refs[i]; return; }
+    assert(!"unexpected background");
+}
+void music_background_release(const uint8_t *pixels)
+{
+    if (!pixels) return;
+    for (unsigned i=0;i<3;i++) if (pixels==test_backgrounds[i]) {
+        assert(background_refs[i]); --background_refs[i]; return;
+    }
+    assert(!"unexpected background");
+}
 static uint32_t selected = UINT32_MAX, requests, clock_ms, lyric_line;
-static void select_test(uint32_t index) { selected = index; ++requests; }
+static bool cached_cover;
+static void select_test(uint32_t index)
+{
+    selected = index; ++requests;
+    if (cached_cover) ui_music_player_set_cover(index,test_covers[1]);
+}
 static uint32_t get_clock(void) { return clock_ms; }
 static uint32_t get_duration(void) { return 300; }
 static uint32_t get_line(uint32_t ms) { (void)ms; return lyric_line; }
@@ -41,8 +81,15 @@ static lv_point_t input_point;
 static lv_indev_state_t input_state;
 static void read_pointer(lv_indev_t *indev, lv_indev_data_t *data)
 { (void)indev; data->point = input_point; data->state = input_state; }
+/* Sample a background-only screen coordinate to verify actual compositing,
+ * in addition to object flags and reference counts. */
+static uint16_t rendered_background;
 static void flush(lv_display_t *d, const lv_area_t *a, uint8_t *p)
-{ (void)a; (void)p; lv_display_flush_ready(d); }
+{
+    if (a->x1<=20 && a->x2>=20 && a->y1<=200 && a->y2>=200)
+        rendered_background=((const uint16_t *)p)[(200-a->y1)*(a->x2-a->x1+1)+20-a->x1];
+    lv_display_flush_ready(d);
+}
 static void advance(uint32_t ms)
 {
     for (uint32_t i = 0; i < ms; i += 10) {
@@ -88,6 +135,18 @@ int main(void)
     ui_music_player_set_library(12,"test");
     ui_music_player_show_song(0,"Short",NULL,300);
     advance(40);
+    /* Real click bounds include each button's 10px extension: moving the
+     * content must not make a bottom-edge lyric gesture hit a control button. */
+    lv_area_t cover_bounds, button_click, progress_bounds, time_bounds;
+    lv_obj_get_coords(s_cover_area,&cover_bounds);
+    lv_obj_t *controls[]={s_btn_prev,s_btn_toggle,s_btn_next,s_btn_mode};
+    for (unsigned i=0;i<4;i++) {
+        lv_obj_get_click_area(controls[i],&button_click);
+        assert(cover_bounds.y2<button_click.y1);
+    }
+    lv_obj_get_coords(s_progress,&progress_bounds);
+    lv_obj_get_coords(s_time_lbl,&time_bounds);
+    assert(progress_bounds.x2<time_bounds.x1);
     assert(s_pl_item_count==12);
     assert(lv_obj_get_style_text_align(s_title_lbl,0)==LV_TEXT_ALIGN_CENTER);
     lv_point_t first;
@@ -100,31 +159,172 @@ int main(void)
     assert(lv_obj_get_height(row_title)==lv_font_get_line_height(lv_obj_get_style_text_font(row_title,0)));
     puts("PASS centered short title and normal SD rows with single-line marquee");
 
+    assert(lv_obj_get_child(s_page,0)==s_background_base);
+    assert(lv_obj_get_child(s_page,1)==s_background_overlay);
+    assert(!lv_obj_has_flag(s_background_base,LV_OBJ_FLAG_CLICKABLE));
+    assert(!lv_obj_has_flag(s_background_overlay,LV_OBJ_FLAG_SCROLLABLE));
+    memset(test_backgrounds[1],0xff,sizeof(test_backgrounds[1]));
+    memset(test_backgrounds[2],0x88,sizeof(test_backgrounds[2]));
+    ui_music_player_set_background(0,test_backgrounds[0]);
+    assert(!s_background_current && s_background_incoming==test_backgrounds[0]);
+    advance(80);
+    int32_t background_opa=lv_obj_get_style_image_opa(s_background_overlay,0);
+    assert(background_opa>0 && background_opa<LV_OPA_COVER);
+    advance(160);
+    assert(s_background_current==test_backgrounds[0] && !s_background_incoming);
+    assert(rendered_background==0);
+    assert(background_refs[0]==1 && lv_obj_has_flag(s_background_overlay,LV_OBJ_FLAG_HIDDEN));
+    ui_music_player_set_background(0,test_backgrounds[0]); /* Same image does not restart a fade. */
+    assert(!lv_anim_get(s_background_overlay,background_opa_cb));
+    ui_music_player_set_background(0,test_backgrounds[1]); advance(80);
+    background_opa=lv_obj_get_style_image_opa(s_background_overlay,0);
+    assert(background_opa>0 && background_opa<LV_OPA_COVER);
+    assert(lv_obj_get_style_image_opa(s_background_base,0)==LV_OPA_COVER);
+    assert(rendered_background>0 && rendered_background<0xffff);
+    ui_music_player_set_background(0,test_backgrounds[2]);
+    assert(s_background_pending==test_backgrounds[2] && background_refs[2]==1);
+    ui_music_player_set_background(0,test_backgrounds[0]);
+    assert(!background_refs[2] && background_refs[0]==2);
+    assert(lv_obj_get_style_image_opa(s_background_overlay,0)==background_opa);
+    ui_music_player_set_background(0,NULL); /* Latest uncached selection releases pending only. */
+    assert(!s_background_pending && background_refs[0]==1 && s_background_current==test_backgrounds[0]);
+    ui_music_player_set_background(0,test_backgrounds[2]);
+    advance(160);
+    assert(s_background_current==test_backgrounds[1] && s_background_incoming==test_backgrounds[2]);
+    assert(!background_refs[0] && background_refs[1]==1 && background_refs[2]==1);
+    advance(240);
+    assert(s_background_current==test_backgrounds[2] && !s_background_incoming);
+    assert(rendered_background==0x8888);
+    assert(!background_refs[1] && background_refs[2]==1);
+    ui_music_player_set_background(1,test_backgrounds[0]); /* stale result */
+    assert(!background_refs[0]);
+    ui_music_player_set_background(0,test_backgrounds[1]);
+    ui_music_player_set_background(0,test_backgrounds[0]);
+    ui_music_player_set_library(12,"test"); /* Reset while base + incoming + pending are held. */
+    for (unsigned i=0;i<3;i++) assert(!background_refs[i]);
+    assert(!lv_anim_get(s_background_overlay,background_opa_cb));
+    assert(!s_background_current && !s_background_incoming && !s_background_pending);
+    advance(240);
+    assert(lv_obj_has_flag(s_background_base,LV_OBJ_FLAG_HIDDEN));
+    puts("PASS background crossfade, bounded latest pending, stale result rejection and reset ownership");
+
+    /* Exercise actual LVGL animation ticks, not just the mode flag. Only one
+     * content subtree is shown, and the existing cover reference is reused. */
+    ui_music_player_set_cover(0,test_covers[0]);
+    ui_music_player_set_lyrics("first\nsecond\nthird\nfourth\nfifth\nsixth",6,false);
+    advance(40);
+    cover_click_cb(NULL);
+    assert(s_show_lyric && !s_content_lyric && cover_refs[0]==1);
+    assert(lv_obj_has_flag(s_lyric_scroll,LV_OBJ_FLAG_HIDDEN));
+    advance(40);
+    assert(s_content_opa>0 && s_content_opa<LV_OPA_COVER);
+    assert(lv_obj_get_style_image_opa(s_cover_canvas,0)==s_content_opa);
+    advance(100);
+    assert(s_content_lyric && s_content_opa>0 && s_content_opa<LV_OPA_COVER);
+    assert(lv_obj_has_flag(s_cover_img,LV_OBJ_FLAG_HIDDEN));
+    assert(!lv_obj_has_flag(s_lyric_scroll,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_get_style_text_opa(s_lyric_label,0)==s_content_opa);
+    advance(120);
+    assert(s_content_opa==LV_OPA_COVER && !lv_anim_get(s_cover_area,content_fade_exec));
+    assert(cover_refs[0]==1 && !s_outgoing_pixels);
+
+    /* Reverse during fade-out: remain on the same content and fade back in
+     * from the sampled opacity, without a jump or queued second transition. */
+    cover_click_cb(NULL); advance(40);
+    int32_t partial_opa=s_content_opa;
+    assert(!s_show_lyric && s_content_lyric && partial_opa>0 && partial_opa<LV_OPA_COVER);
+    assert(ui_music_player_is_lyric_point(230,170));
+    cover_click_cb(NULL);
+    assert(s_content_opa==partial_opa && s_show_lyric);
+    advance(200);
+    assert(s_content_lyric && s_content_opa==LV_OPA_COVER);
+
+    /* Reverse during fade-in after the midpoint; the latest target wins. */
+    cover_click_cb(NULL); advance(130);
+    partial_opa=s_content_opa;
+    assert(!s_content_lyric && partial_opa>0 && partial_opa<LV_OPA_COVER);
+    cover_click_cb(NULL);
+    assert(s_content_opa==partial_opa);
+    advance(220);
+    assert(s_show_lyric && s_content_lyric && s_content_opa==LV_OPA_COVER);
+
+    lyric_press_cb(NULL);
+    lv_obj_scroll_to_y(s_lyric_scroll,60,LV_ANIM_OFF);
+    int32_t saved_scroll=lv_obj_get_scroll_y(s_lyric_scroll);
+    assert(saved_scroll>0);
+    cover_click_cb(NULL); advance(240);
+    cover_click_cb(NULL); advance(240);
+    assert(lv_obj_get_scroll_y(s_lyric_scroll)==saved_scroll);
+    lyric_release_cb(NULL);
+
+    /* Missing pixels never hold the mode switch. A late publication changes
+     * the canvas buffer, preserving the opacity of an in-progress fade-in. */
+    ui_music_player_set_cover(0,NULL);
+    cover_click_cb(NULL); advance(240);
+    assert(!s_content_lyric && s_content_opa==LV_OPA_COVER);
+    assert(lv_obj_has_flag(s_cover_canvas,LV_OBJ_FLAG_HIDDEN));
+    cover_click_cb(NULL); advance(240);
+    cover_click_cb(NULL); advance(130);
+    partial_opa=s_content_opa;
+    ui_music_player_set_cover(0,test_covers[0]);
+    assert(s_content_opa==partial_opa && lv_obj_get_style_image_opa(s_cover_canvas,0)==partial_opa);
+    advance(120);
+    assert(!s_show_lyric && !s_content_lyric && s_content_opa==LV_OPA_COVER);
+    puts("PASS sequential opacity fades, reversal in both phases, scroll retention and late cover");
+
+    /* A song switch cancels a fade before taking the outgoing snapshot.
+     * Request cover while lyrics are fading in; the latest target is cover. */
+    cover_click_cb(NULL); advance(130);
+    assert(s_content_lyric && s_content_opa<LV_OPA_COVER);
+    cover_click_cb(NULL);
+    cached_cover=true;
     ui_music_player_next_animated();
-    advance(170);
-    assert(requests==0 && !ui_music_player_can_show_song(1));
-    assert(lv_obj_get_x(s_cover_area)>-UI_HOR_RES);
-    ui_music_player_next_animated(); /* ignored during outgoing animation */
-    advance(210);
-    assert(requests==1 && selected==1 && s_cover_waiting_song);
-    assert(lv_obj_get_x(s_cover_area)<=-COVER_SIZE);
-    advance(1000); /* slow SD cannot bring the old cover back */
-    assert(lv_obj_get_x(s_cover_area)<=-COVER_SIZE);
-    ui_music_player_song_ready(2); assert(s_cover_waiting_song);
-    ui_music_player_show_song(1,"Next",NULL,300);
-    ui_music_player_song_ready(1); advance(400);
+    assert(requests==1 && selected==1 && s_current_idx==1);
+    assert(!lv_anim_get(s_cover_area,content_fade_exec));
+    assert(!s_show_lyric && !s_content_lyric && s_content_opa==LV_OPA_COVER);
+    assert(lv_obj_get_style_text_opa(s_lyric_label,0)==LV_OPA_COVER);
+    assert(lv_obj_get_style_image_opa(s_cover_canvas,0)==LV_OPA_COVER);
+    assert(!ui_music_player_can_show_song(0) && ui_music_player_can_show_song(1));
+    assert(s_cover_pixels==test_covers[1] && s_outgoing_pixels==test_covers[0]);
+    assert(cover_refs[0]==1 && cover_refs[1]==1);
+    advance(80);
+    assert(lv_obj_get_x(s_outgoing_area)<110 && lv_obj_get_x(s_outgoing_area)>-COVER_SIZE);
+    assert(lv_obj_get_x(s_cover_area)<UI_HOR_RES && lv_obj_get_x(s_cover_area)>110);
+    assert(!lv_obj_has_flag(s_outgoing_canvas,LV_OBJ_FLAG_HIDDEN));
+    assert(!lv_obj_has_flag(s_cover_canvas,LV_OBJ_FLAG_HIDDEN));
+    /* A stale completion must never replace the old snapshot or incoming cover. */
+    ui_music_player_show_song(0,"Stale",test_covers[0],123);
+    assert(s_cover_pixels==test_covers[1] && s_outgoing_pixels==test_covers[0]);
+    ui_music_player_next_animated(); assert(requests==1); /* ignored only during animation */
+    advance(320);
     assert(!s_cover_animating && lv_obj_get_x(s_cover_area)==110);
-    ui_music_player_prev_animated(); advance(400);
+    assert(cover_refs[0]==0 && cover_refs[1]==1);
+    assert(lv_obj_has_flag(s_outgoing_area,LV_OBJ_FLAG_HIDDEN));
+    puts("PASS simultaneous cached-cover slides, separate image ownership and stale result rejection");
+
+    cached_cover=false;
+    ui_music_player_next_animated();
+    assert(selected==2 && s_current_idx==2 && !s_cover_pixels);
+    assert(lv_obj_has_flag(s_cover_canvas,LV_OBJ_FLAG_HIDDEN));
+    advance(400); /* No ready notification; animation must finish anyway. */
+    assert(!s_cover_animating && lv_obj_get_x(s_cover_area)==110);
+    ui_music_player_next_animated(); assert(selected==3 && s_current_idx==3);
+    ui_music_player_set_cover(2,test_covers[0]); assert(!s_cover_pixels);
+    advance(400);
+    ui_music_player_set_cover(3,test_covers[0]); /* Late cover appears in place. */
+    assert(s_cover_pixels==test_covers[0] && lv_obj_get_x(s_cover_area)==110);
+    ui_music_player_prev_animated(); advance(80);
     ui_music_player_set_library(1,"reinserted");
     assert(!s_cover_animating && lv_obj_get_x(s_cover_area)==110);
-    ui_music_player_next_animated(); advance(400);
-    assert(selected==0 && s_cover_waiting_song); /* same-song transition */
-    ui_music_player_song_ready(0); advance(400);
-    puts("PASS offscreen async handoff, stale completion, repeated switch and rescan cancellation");
+    assert(cover_refs[0]==0 && cover_refs[1]==0);
+    ui_music_player_next_animated(); assert(selected==0);
+    advance(400); assert(!s_cover_animating);
+    puts("PASS immediate uncached switch, late cover, repeated slow loads, rescan cleanup and single-song transition");
 
     ui_music_player_set_lyrics("first\na long second lyric that wraps into multiple visual lines in this small viewport\nthird\nfourth\nfifth\nsixth\nlast",7,false);
-    cover_click_cb(NULL); advance(40);
-    assert(s_show_lyric && line_y(0)==COVER_SIZE/2);
+    cover_click_cb(NULL); advance(240);
+    /* Odd font line heights can place the center between pixels; allow rounding. */
+    assert(s_show_lyric && abs(line_y(0)-COVER_SIZE/2)<=1);
     lyric_line=6; advance(2600);
     assert(abs(line_y(6)-COVER_SIZE/2)<=1);
     lyric_line=1; advance(800);
@@ -137,9 +337,24 @@ int main(void)
     advance(1100); assert(abs(line_y(1)-COVER_SIZE/2)<=1);
     puts("PASS first/last centered lyrics, wrapping, no follow while held and two-second return");
 
+    ui_music_player_next_animated();
+    assert(!strcmp(lv_label_get_text(s_outgoing_lyrics),"first\na long second lyric that wraps into multiple visual lines in this small viewport\nthird\nfourth\nfifth\nsixth\nlast"));
+    ui_music_player_set_lyrics("new lyrics",1,false);
+    assert(strstr(lv_label_get_text(s_outgoing_lyrics),"first")!=NULL);
+    assert(lv_obj_get_style_text_font(s_outgoing_lyrics,0)==lv_obj_get_style_text_font(s_lyric_label,0));
+    assert(lv_obj_get_style_text_line_space(s_outgoing_lyrics,0)==lv_obj_get_style_text_line_space(s_lyric_label,0));
+    advance(400);
+    puts("PASS outgoing lyric snapshot retains previous text and styling while new lyrics load");
+
+    cover_click_cb(NULL); advance(40);
+    assert(lv_anim_get(s_cover_area,content_fade_exec));
     ui_music_player_set_library(12,"test");
+    assert(!lv_anim_get(s_cover_area,content_fade_exec));
+    assert(s_content_lyric==s_show_lyric && s_content_opa==LV_OPA_COVER);
     ui_music_player_show_song(0,"Gesture",NULL,300);
+    ui_music_player_set_background(0,test_backgrounds[0]);
     if(s_show_lyric) cover_click_cb(NULL);
+    advance(200);
     lv_indev_t *indev=lv_indev_create();
     lv_indev_set_type(indev,LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev,read_pointer);
@@ -147,19 +362,29 @@ int main(void)
     advance(40);
     drag(indev,300,170,-100,0);
     assert(!s_show_lyric && s_cover_animating);
-    advance(400); ui_music_player_song_ready(selected); advance(400);
-    input(indev,230,170,LV_INDEV_STATE_PRESSED);
-    input(indev,230,170,LV_INDEV_STATE_RELEASED);
+    advance(400);
+    /* The strip above the moved cover must no longer toggle its mode. The
+     * newly occupied bottom strip must both toggle and scroll as normal. */
+    int old_top=UI_STATUSBAR_HEIGHT+30;
+    int new_bottom_strip=old_top+COVER_SIZE+8;
+    input(indev,230,old_top+8,LV_INDEV_STATE_PRESSED);
+    input(indev,230,old_top+8,LV_INDEV_STATE_RELEASED);
+    assert(!s_show_lyric && !s_cover_animating);
+    input(indev,230,new_bottom_strip,LV_INDEV_STATE_PRESSED);
+    input(indev,230,new_bottom_strip,LV_INDEV_STATE_RELEASED);
     assert(s_show_lyric);
+    advance(200);
     ui_music_player_set_lyrics("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten",10,false);
-    drag(indev,230,220,0,-90);
+    drag(indev,230,new_bottom_strip,0,-90);
     assert(s_show_lyric && !ui_music_player_is_playlist_visible());
     assert(!s_lyric_touch_active);
-    drag(indev,350,320,0,-80); advance(400);
+    drag(indev,230,330,0,-80); advance(400);
     assert(ui_music_player_is_playlist_visible());
     drag(indev,230,10,0,100); advance(400);
     assert(!ui_music_player_is_playlist_visible());
     puts("PASS real pointer gestures: swipe does not click, lyrics scroll, playlist opens outside and closes from top");
+    ui_music_player_set_library(0,"end");
+    for (unsigned i=0;i<3;i++) assert(!background_refs[i]);
     puts("ALL PLAYER UI TESTS PASSED");
     return 0;
 }

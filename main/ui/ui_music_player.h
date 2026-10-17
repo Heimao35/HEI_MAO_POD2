@@ -3,9 +3,9 @@
  * @brief 音乐播放器模式页面
  *
  * 页面布局（从上到下）：
- *   - 背景：歌曲封面模糊图铺满全屏（当前用纯色占位，见实现说明）
+ *   - 背景：歌曲封面模糊并混合白色后铺满全屏，切歌时交叉淡变
  *   - 中上：清晰封面图（点击可切换歌词/封面）
- *   - 下方：圆角矩形播放控制台
+ *   - 下方：透明播放控制台，按键使用独立的半透明白色背景
  *     - 上一首 / 暂停继续 / 下一首 / 播放模式
  *     - 进度条 + 歌曲总时长
  *
@@ -48,10 +48,13 @@ void ui_music_player_set_library(uint32_t count, const char *status);
 void ui_music_player_set_page(const music_page_t *page);
 void ui_music_player_show_song(uint32_t index, const char *title,
                                const uint8_t *cover, uint32_t duration_sec);
-/** 后台发布前检查动画阶段；以下接口均须持有 LVGL 锁。 */
+/** 以下接口均须持有 LVGL 锁；仅允许当前选中歌曲发布数据。
+ * set_cover / show_song 借用封面参数，内部为显示对象独立持有引用。 */
 bool ui_music_player_can_show_song(uint32_t index);
-/** 歌名/封面/歌词发布完成（失败时发布占位也须通知），释放离屏等待。 */
-void ui_music_player_song_ready(uint32_t index);
+void ui_music_player_set_cover(uint32_t index, const uint8_t *cover);
+/** 须持有 LVGL 锁，借用后台生成的 460×460 RGB565 图像并独立持有显示引用。
+ * NULL 取消旧的待显示图，继续显示已有背景；重建曲库时统一清空。 */
+void ui_music_player_set_background(uint32_t index, const uint8_t *pixels);
 void ui_music_player_set_lyrics(const char *text, uint32_t line_count, bool truncated);
 
 /**

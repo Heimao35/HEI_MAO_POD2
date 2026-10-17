@@ -2,6 +2,7 @@
 #include "music_library.h"
 #include "audio_player.h"
 #include "cover_loader.h"
+#include "music_background.h"
 #include "lyric_parser.h"
 #include "sd_card.h"
 #include "ui/ui_music_player.h"
@@ -35,11 +36,27 @@ static void notify_worker(void)
     if (s_worker) xTaskNotifyGive(s_worker);
 }
 
+static bool media_available(void);
+
 static void select_song(uint32_t index)
 {
     /* UI callbacks post one scalar index; the media task performs all file I/O. */
     ++s_request_serial;
     atomic_store(&s_requested_index, index);
+    atomic_store(&s_lyrics_ready, false);
+    atomic_store(&s_duration_sec, 0);
+    atomic_store(&s_time_ms, 0);
+    atomic_store(&s_playing, false);
+    /* 调用方持有 LVGL 锁：仅查内存缓存，不等待 SD 或 JPEG。
+     * 命中则本帧开始滑入真实封面，未命中则保持 UI 已清空的区域。 */
+    const uint8_t *cover = cover_loader_acquire(sd_card_get_generation(), index);
+    if (media_available()) ui_music_player_set_cover(index, cover);
+    cover_loader_release(cover);
+    /* 背景命中也只查内存；NULL 释放上一选择的待显示图，给 worker 留出
+     * 可写槽。已显示背景继续保留，新图后台生成后再平滑过渡。 */
+    const uint8_t *background = music_background_acquire(sd_card_get_generation(), index);
+    if (media_available()) ui_music_player_set_background(index, background);
+    music_background_release(background);
     notify_worker();
 }
 
@@ -93,9 +110,15 @@ static void publish_all_names(uint32_t count, uint32_t generation)
     }
 }
 
-static void load_selected_song(uint32_t index, uint32_t generation, uint32_t serial)
+/* 只在 LVGL 锁内检查请求快照，避免快速选歌/拔卡后的迟到结果发布。 */
+static bool request_current(uint32_t index, uint32_t generation, uint32_t serial)
 {
-    /* 解析器会被本次加载替换；发布前禁止 UI 用新时间索引定位旧歌词。 */
+    return generation == sd_card_get_generation() && media_available() &&
+           serial == s_request_serial && ui_music_player_can_show_song(index);
+}
+
+static bool load_selected_song(uint32_t index, uint32_t generation, uint32_t serial)
+{
     atomic_store(&s_lyrics_ready, false);
     if (s_lyrics_text) s_lyrics_text[0] = '\0';
     music_item_t item = {0};
@@ -107,20 +130,29 @@ static void load_selected_song(uint32_t index, uint32_t generation, uint32_t ser
     esp_err_t cover_ret = ESP_ERR_NOT_FOUND;
     esp_err_t lyric_ret = ESP_ERR_NOT_FOUND;
 
+    /* 封面先独立发布，不等待音频头/LRC；缓存命中时也不会重复解码。
+     * 所有 SD I/O 在 worker 完成，发布前先释放 SD 锁，再获取 LVGL 锁。 */
     if (lock_media(generation) == ESP_OK) {
         item_ret = music_library_get_item(index, &item);
-        if (item_ret == ESP_OK) {
-            if (music_library_make_path(&item, item.audio, path, sizeof(path)) == ESP_OK)
-                audio_ret = audio_player_probe(path, &info);
-            if (item.cover[0] && music_library_make_path(&item, item.cover, path, sizeof(path)) == ESP_OK)
-                cover_ret = cover_loader_load(path, &cover);
+        if (item_ret == ESP_OK && item.cover[0] &&
+            music_library_make_path(&item, item.cover, path, sizeof(path)) == ESP_OK)
+            cover_ret = cover_loader_load(path, generation, index, &cover);
+        sd_card_io_unlock();
+    }
+    lvgl_port_lock(0);
+    bool current = request_current(index, generation, serial);
+    if (current) ui_music_player_set_cover(index, cover);
+    lvgl_port_unlock();
+    if (!current) { cover_loader_release(cover); return false; }
 
-            if (s_parser_mutex && xSemaphoreTake(s_parser_mutex, portMAX_DELAY) == pdTRUE) {
-                lyric_parser_destroy();
-                if (item.lyric[0] && music_library_make_path(&item, item.lyric, path, sizeof(path)) == ESP_OK)
-                    lyric_ret = lyric_parser_load(path);
-                xSemaphoreGive(s_parser_mutex);
-            }
+    if (item_ret == ESP_OK && lock_media(generation) == ESP_OK) {
+        if (music_library_make_path(&item, item.audio, path, sizeof(path)) == ESP_OK)
+            audio_ret = audio_player_probe(path, &info);
+        if (s_parser_mutex && xSemaphoreTake(s_parser_mutex, portMAX_DELAY) == pdTRUE) {
+            lyric_parser_destroy();
+            if (item.lyric[0] && music_library_make_path(&item, item.lyric, path, sizeof(path)) == ESP_OK)
+                lyric_ret = lyric_parser_load(path);
+            xSemaphoreGive(s_parser_mutex);
         }
         sd_card_io_unlock();
     }
@@ -135,30 +167,68 @@ static void load_selected_song(uint32_t index, uint32_t generation, uint32_t ser
     }
 
     lvgl_port_lock(0);
-    /* 拔卡、重挂载或新选择发生后，丢弃旧结果。动画滑出期间也不能覆盖旧图。
-     * 未 commit 的 JPEG 缓冲可被下一请求复用，不会覆盖正在显示的缓冲。 */
-    if (generation == sd_card_get_generation() && media_available() &&
-        serial == s_request_serial && ui_music_player_can_show_song(index)) {
+    current = request_current(index, generation, serial);
+    if (current) {
         uint32_t duration = audio_ret == ESP_OK && info.metadata_known ?
                             (uint32_t)(info.duration_ms / 1000) : 0;
         atomic_store(&s_duration_sec, duration);
         atomic_store(&s_time_ms, 0);
         atomic_store(&s_playing, false);
         ui_music_player_show_song(index, item_ret == ESP_OK ? item.name : "Song unavailable",
-                                  cover_ret == ESP_OK ? cover : NULL, duration);
+                                  cover, duration);
         ui_music_player_set_lyrics(lyric_ret == ESP_OK && s_lyrics_text ? s_lyrics_text : "",
                                   lyric_ret == ESP_OK ? lyric_count : 0, lyric_truncated);
-        if (cover_ret == ESP_OK) cover_loader_commit(cover);
         atomic_store(&s_lyrics_ready, lyric_ret == ESP_OK);
-        /* 失败时也用占位结束等待，避免封面永远留在屏幕外。 */
-        ui_music_player_song_ready(index);
     }
     lvgl_port_unlock();
+    /* 当前封面、音频信息和歌词已经发布，再生成装饰背景，优先保障选歌。
+     * 借用 worker 的封面引用，不再解码 JPG；计算期间不持有 SD/LVGL 锁。
+     * 生成后再次验证请求，切歌/拔卡期间产生的旧结果不得覆盖新背景。 */
+    const uint8_t *background = NULL;
+    if (current && cover) {
+        esp_err_t ret = music_background_generate(cover, generation, index, &background);
+        if (ret != ESP_OK) ESP_LOGW(TAG, "Background: %s", esp_err_to_name(ret));
+        lvgl_port_lock(0);
+        current = request_current(index, generation, serial);
+        if (current && background) ui_music_player_set_background(index, background);
+        lvgl_port_unlock();
+    }
+    music_background_release(background);
+    cover_loader_release(cover); /* UI 的显示引用独立于本次加载引用。 */
 
     ESP_LOGI(TAG, "song=%lu audio=%s cover=%s lrc=%s duration=%lu",
              (unsigned long)index, esp_err_to_name(audio_ret),
              esp_err_to_name(cover_ret), esp_err_to_name(lyric_ret),
              (unsigned long)atomic_load(&s_duration_sec));
+    return current;
+}
+
+static void prefetch_neighbors(uint32_t index, uint32_t generation, uint32_t serial)
+{
+    uint32_t count = music_library_get_count();
+    if (count < 2) return;
+    uint32_t neighbors[] = {(index + 1) % count, (index + count - 1) % count};
+    for (unsigned i = 0; i < 2; ++i) {
+        if (i && neighbors[i] == neighbors[0]) continue; /* 两首歌仅预读一次。 */
+        /* 每张封面前检查选择是否变化；一张已开始的 JPEG 解码正常结束，
+         * 不再启动后续预读。通知保留在任务槽中，下一轮立即处理新选歌。 */
+        lvgl_port_lock(0);
+        bool current = request_current(index, generation, serial) &&
+                       atomic_load(&s_requested_index) == UINT32_MAX;
+        lvgl_port_unlock();
+        if (!current) return;
+        const uint8_t *cover = cover_loader_acquire(generation, neighbors[i]);
+        if (cover) { cover_loader_release(cover); continue; }
+        if (lock_media(generation) != ESP_OK) return;
+        music_item_t item;
+        char path[MUSIC_PATH_MAX];
+        if (music_library_get_item(neighbors[i], &item) == ESP_OK && item.cover[0] &&
+            music_library_make_path(&item, item.cover, path, sizeof(path)) == ESP_OK) {
+            cover_loader_load(path, generation, neighbors[i], &cover);
+            cover_loader_release(cover); /* 缓存保留像素，预读不长期持有引用。 */
+        }
+        sd_card_io_unlock();
+    }
 }
 
 static void media_worker(void *arg)
@@ -172,6 +242,8 @@ static void media_worker(void *arg)
         if (available && generation != s_seen_generation) {
             s_seen_generation = generation;
             music_library_reset();
+            cover_loader_invalidate();
+            music_background_invalidate();
             lvgl_port_lock(0);
             ++s_request_serial;
             atomic_store(&s_requested_index, UINT32_MAX);
@@ -210,6 +282,8 @@ static void media_worker(void *arg)
         if (!available) {
             if (s_seen_generation != UINT32_MAX) {
                 s_seen_generation = UINT32_MAX;
+                cover_loader_invalidate();
+                music_background_invalidate();
                 lvgl_port_lock(0);
                 ++s_request_serial;
                 atomic_store(&s_requested_index, UINT32_MAX);
@@ -229,7 +303,8 @@ static void media_worker(void *arg)
         uint32_t index = atomic_exchange(&s_requested_index, UINT32_MAX);
         uint32_t serial = s_request_serial;
         lvgl_port_unlock();
-        if (index < music_library_get_count()) load_selected_song(index, generation, serial);
+        if (index < music_library_get_count() && load_selected_song(index, generation, serial))
+            prefetch_neighbors(index, generation, serial);
     }
 }
 
@@ -243,6 +318,8 @@ esp_err_t music_player_adapter_init(void)
     if (!s_lyrics_text) return ESP_ERR_NO_MEM;
     esp_err_t ret = cover_loader_init();
     if (ret != ESP_OK) return ret;
+    ret = music_background_init();
+    if (ret != ESP_OK) return ret;
 
     const ui_music_backend_t backend = {
         .select = select_song,
@@ -253,10 +330,10 @@ esp_err_t music_player_adapter_init(void)
         .get_lyric_line = get_lyric_line,
         .is_playing = is_playing,
     };
+    atomic_store(&s_requested_index, UINT32_MAX);
     lvgl_port_lock(0);
     ui_music_player_bind(&backend);
     lvgl_port_unlock();
-    atomic_store(&s_requested_index, UINT32_MAX);
     if (xTaskCreate(media_worker, "sd_music", 12288, NULL, 2, &s_worker) != pdPASS)
         return ESP_ERR_NO_MEM;
     return ESP_OK;

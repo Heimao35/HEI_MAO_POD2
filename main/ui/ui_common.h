@@ -28,7 +28,7 @@ extern "C" {
 #define UI_ANIM_PATH            lv_anim_path_ease_out
 
 /* ======================== 颜色主题 ======================== */
-/** 状态栏文字颜色 (白色，适合透明背景上显示) */
+/** 状态栏文字颜色 (白色，适合半透明黑色背景上显示) */
 #define UI_COLOR_STATUS_TEXT    lv_color_white()
 /** 面板半透明背景色的不透明度 (0-255)，增大使背景更不透明 */
 #define UI_PANEL_BG_OPA         (LV_OPA_70)
@@ -44,6 +44,9 @@ extern "C" {
 /* ======================== 状态栏参数 ======================== */
 /** 状态栏高度 (像素)，同时也是下拉手势的检测区域高度，增大使状态栏更高 */
 #define UI_STATUSBAR_HEIGHT     38
+/** 状态栏仅背景混合黑色，20% 不透明度；文字、图标不随背景一起变淡。 */
+#define UI_STATUSBAR_BG_COLOR   lv_color_black()
+#define UI_STATUSBAR_BG_OPA     LV_OPA_20
 
 /* ======================== 面板参数 ======================== */
 /** 模式切换栏宽度 = 屏幕宽度的 1/4 */

@@ -125,38 +125,64 @@ def tests(lib):
     print("PASS 300-MiB sparse FLAC, 32-bit/192-kHz metadata, 36-bit sample count, MP3 unknown duration")
 
     # Real cover_loader.c with a fake JPEG engine: no claim of hardware decode validation.
-    lib.cover_loader_load.argtypes = [C.c_char_p, C.POINTER(C.c_void_p)]
-    lib.cover_loader_commit.argtypes = [C.c_void_p]
+    lib.cover_loader_load.argtypes = [C.c_char_p, C.c_uint32, C.c_uint32, C.POINTER(C.c_void_p)]
+    lib.cover_loader_acquire.argtypes = [C.c_uint32, C.c_uint32]
+    lib.cover_loader_acquire.restype = C.c_void_p
+    lib.cover_loader_retain.argtypes = [C.c_void_p]
+    lib.cover_loader_release.argtypes = [C.c_void_p]
     ptr = C.c_void_p()
-    def cover(w, h, value):
+    def cover(w, h, value, index=0, generation=1):
         Path("cover.jpg").write_bytes(b"JPGT"+w.to_bytes(2,"big")+h.to_bytes(2,"big")+bytes([value]))
-        return lib.cover_loader_load(b"cover.jpg", C.byref(ptr))
+        return lib.cover_loader_load(b"cover.jpg", generation, index, C.byref(ptr))
     assert cover(240, 240, 11) == 0
     first = ptr.value
-    lib.cover_loader_commit(ptr)
-    assert cover(240, 240, 22) == 0 and ptr.value != first
+    # Independent UI and loader references: the old cover survives the whole slide.
+    lib.cover_loader_retain(first)
+    lib.cover_loader_release(first)
+    assert cover(240, 240, 22, 1) == 0
     second = ptr.value
-    assert C.string_at(first, 1) == b"\x0b"
-    # Cancel this result: without commit the same inactive slot is reused.
-    assert cover(240, 240, 33) == 0 and ptr.value == second
-    assert C.string_at(first, 1) == b"\x0b"
-    lib.cover_loader_commit(ptr)
-    assert cover(240, 240, 44) == 0 and ptr.value == first
-    assert C.string_at(second, 1) == b"!"
-    assert cover(241, 240, 55) == 0x104 and not ptr.value
-    assert cover(240, 239, 55) == 0x104 and not ptr.value
+    lib.cover_loader_retain(second)
+    lib.cover_loader_release(second)
+    for i in range(2, 1002):
+        assert cover(240, 240, 33, i) == 0
+        lib.cover_loader_release(ptr)
+        assert C.string_at(first, 1) == b"\x0b" and C.string_at(second, 1) == b"\x16"
+    assert lib.test_live_bytes() == 4*240*240*2
+    # A cache hit requires neither file access nor a fresh decode.
+    Path("cover.jpg").unlink()
+    assert lib.cover_loader_load(b"cover.jpg", 1, 0, C.byref(ptr)) == 0 and ptr.value == first
+    lib.cover_loader_release(ptr)
+    assert not lib.cover_loader_acquire(2, 0)
+    lib.cover_loader_invalidate()
+    assert not lib.cover_loader_acquire(1, 0)
+    assert C.string_at(first, 1) == b"\x0b" # invalidation must not damage displayed pixels
+    assert cover(240, 240, 44, 0, 2) == 0 and ptr.value not in (first, second)
+    lib.cover_loader_release(ptr)
+    lib.cover_loader_release(first)
+    lib.cover_loader_release(second)
+    # Filling all four references must never cause an in-use buffer to be overwritten.
+    pinned = []
+    for i in range(4):
+        assert cover(240, 240, 50+i, i+10, 3) == 0
+        pinned.append(ptr.value)
+    assert len(set(pinned)) == 4
+    assert cover(240, 240, 99, 20, 3) == 0x103 and not ptr.value
+    for i, pixel in enumerate(pinned):
+        assert C.string_at(pixel, 1) == bytes([50+i])
+        lib.cover_loader_release(pixel)
+    assert cover(241, 240, 55, 30) == 0x104 and not ptr.value
+    assert cover(240, 239, 55, 30) == 0x104 and not ptr.value
     Path("cover.jpg").write_bytes(b"x"*(256*1024+1))
-    assert lib.cover_loader_load(b"cover.jpg", C.byref(ptr)) == 0x104
-    lib.cover_loader_commit(None)
+    assert lib.cover_loader_load(b"cover.jpg", 1, 30, C.byref(ptr)) == 0x104
     lib.cover_loader_destroy()
     assert lib.test_live_bytes() == 0
-    for fail in (0, 1, 2):
+    for fail in range(5):
         lib.test_fail_after(fail)
         assert cover(240, 240, 1) == 0x101
         lib.cover_loader_destroy()
         assert lib.test_live_bytes() == 0
     lib.test_fail_after(-1)
-    print("PASS cover mock: 240x240/size limits, double-buffer ownership, cancelled loads, allocation failure cleanup")
+    print("PASS cover cache: fixed memory over 1000 loads, cache hits, pinned slides, eviction, generation invalidation and allocation cleanup")
 
     sysdir = Path("test_sd/HEI_MAO_POD_SYS")
     music = sysdir / "MUSIC"

@@ -27,6 +27,13 @@ void *test_heap_malloc(size_t size, unsigned caps)
     if (live_bytes > peak_bytes) peak_bytes = live_bytes;
     return data;
 }
+void *test_heap_calloc(size_t count, size_t size, unsigned caps)
+{
+    if (size && count > SIZE_MAX / size) return NULL;
+    void *ptr = test_heap_malloc(count * size, caps);
+    if (ptr) memset(ptr, 0, count * size);
+    return ptr;
+}
 void test_heap_free(void *ptr)
 {
     if (!ptr) return;
