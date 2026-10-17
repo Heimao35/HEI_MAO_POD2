@@ -6,6 +6,7 @@ idf_component_register(SRCS "main.c"
                               "cover_loader.c"
                               "music_background.c"
                               "music_player_adapter.c"
+                              "ui/ui_fonts.c"
                               "ui/ui_common.c"
                               "ui/ui_statusbar.c"
                               "ui/ui_lockscreen.c"
@@ -22,4 +23,8 @@ idf_component_register(SRCS "main.c"
                                   esp_lcd esp_lcd_touch_cst820
                                   esp_hw_support driver
                                   esp_lvgl_port
-                                  esp_audio_codec)
+                                  esp_audio_codec spiffs)
+
+# Font assets are packaged into a separate read-only-at-runtime SPIFFS image.
+# The image is flashed by `idf.py flash` together with the application.
+spiffs_create_partition_image(fontfs "${CMAKE_CURRENT_LIST_DIR}/../font" FLASH_IN_PROJECT)

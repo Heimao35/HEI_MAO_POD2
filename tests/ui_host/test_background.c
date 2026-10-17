@@ -26,7 +26,7 @@ static void uniform(const uint8_t *pixels, uint16_t expected)
 }
 int main(void)
 {
-    for (int fail=0;fail<4;fail++) {
+    for (int fail=0;fail<MUSIC_BACKGROUND_SLOTS+1;fail++) {
         test_fail_after(fail);
         assert(music_background_init()==ESP_ERR_NO_MEM && test_live_bytes()==0);
     }
@@ -50,8 +50,9 @@ int main(void)
         for (unsigned x=0;x<COVER_WIDTH;x++) cover[y*COVER_WIDTH+x]=((x+y)&1)?0xffff:0;
     assert(music_background_generate((const uint8_t *)cover,1,1,&image)==ESP_OK);
     unsigned middle=((const uint16_t *)image)[230*460+230];
-    assert(((middle>>11)&31)>=17 && ((middle>>11)&31)<=19);
-    assert((middle&31)>=17 && (middle&31)<=19); /* High-frequency checker becomes smooth gray. */
+    unsigned gray5=(tint(128,128,128)>>11)&31;
+    assert(((middle>>11)&31)+1>=gray5 && ((middle>>11)&31)<=gray5+1);
+    assert((middle&31)+1>=gray5 && (middle&31)<=gray5+1); /* Match the configured tint, not a hard-coded white opacity. */
     music_background_release(image);
 
     for (unsigned y=0;y<COVER_HEIGHT;y++)
@@ -67,17 +68,27 @@ int main(void)
         assert(((const uint16_t *)ramp)[x]==row[x]); /* Clamped top edge has no dark border. */
     }
     uint16_t held_middle=row[230];
+    /* With two slots, holding red and ramp fills the cache. Confirm pinned
+     * slots cannot be reused, then release red to allow the generation loop.
+     * With three slots keep both pinned, as the original stress test did. */
+    if (MUSIC_BACKGROUND_SLOTS==2) {
+        const uint8_t *blocked=(void *)1;
+        assert(music_background_generate((const uint8_t *)cover,1,3,&blocked)==ESP_ERR_INVALID_STATE && !blocked);
+        music_background_release(red);
+        red=NULL;
+    }
     for (unsigned i=0;i<100;i++) {
         fill((i&1)?0xffff:0x07e0);
         assert(music_background_generate((const uint8_t *)cover,1,10+i,&image)==ESP_OK);
         uniform(image,(i&1)?tint(255,255,255):tint(0,255,0));
         music_background_release(image);
         assert(test_live_bytes()==fixed_bytes);
-        assert(((const uint16_t *)red)[0]==tint(255,0,0) && row[230]==held_middle);
+        if (red) assert(((const uint16_t *)red)[0]==tint(255,0,0));
+        assert(row[230]==held_middle);
     }
     music_background_invalidate();
     assert(!music_background_acquire(1,0));
-    assert(((const uint16_t *)red)[0]==tint(255,0,0));
+    if (red) assert(((const uint16_t *)red)[0]==tint(255,0,0));
     fill(0);
     assert(music_background_generate((const uint8_t *)cover,2,0,&image)==ESP_OK && image!=red);
     uniform(image,tint(0,0,0));

@@ -15,6 +15,7 @@
 #include "ui_adj_panel.h"
 #include "ui_lockscreen.h"
 #include <stdio.h>
+#include "ui_fonts.h"
 
 static lv_obj_t *s_overlay       = NULL;
 static lv_obj_t *s_panel         = NULL;
@@ -164,7 +165,7 @@ static lv_obj_t *create_round_btn(lv_obj_t *parent, const char *text,
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(lbl, ui_font_22(), 0);
     lv_obj_center(lbl);
     if (out_icon) *out_icon = lbl;
     return btn;

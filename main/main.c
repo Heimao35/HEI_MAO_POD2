@@ -22,6 +22,7 @@
 #include "ui_lockscreen.h"
 #include "sd_card.h"
 #include "music_player_adapter.h"
+#include "ui_fonts.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (460)
@@ -296,6 +297,10 @@ void app_main(void)
 
     /* Show LVGL objects */
     lvgl_port_lock(0);
+
+    /* Mount and load the build-time font assets before any label is created. */
+    esp_err_t font_ret = ui_fonts_init();
+    if (font_ret != ESP_OK) ESP_LOGW(TAG, "Custom fonts unavailable: %s", esp_err_to_name(font_ret));
 
     /* 初始化自定义 UI 系统（替换原有 demo） */
     ui_manager_init();

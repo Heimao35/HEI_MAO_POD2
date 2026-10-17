@@ -7,6 +7,13 @@
 #include "../../main/ui/ui_music_player.c"
 #include "../../main/ui/ui_manager.c"
 
+/* Fonts are mounted by the ESP-IDF startup, outside this host UI harness.
+ * Keep the same sizes here so row bounds and gesture tests remain realistic. */
+const lv_font_t *ui_font_14(void) { return &lv_font_montserrat_14; }
+const lv_font_t *ui_font_16(void) { return &lv_font_montserrat_16; }
+const lv_font_t *ui_font_18(void) { return &lv_font_montserrat_18; }
+const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
+
 bool ui_settings_is_visible(void) { return false; }
 bool ui_lockscreen_is_visible(void) { return false; }
 bool ui_mode_panel_is_visible(void) { return false; }
@@ -127,6 +134,12 @@ int main(void)
     lv_obj_t *root=lv_screen_active();
     lv_obj_remove_flag(root,LV_OBJ_FLAG_SCROLLABLE);
     ui_music_player_create(root);
+    assert(s_playlist_empty_lbl);
+    assert(!lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));
+    assert(!strcmp(lv_label_get_text(s_playlist_empty_lbl),"请插入 SD 卡"));
+    assert(lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_IGNORE_LAYOUT));
+    assert(!lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_CLICKABLE));
+    puts("PASS initial no-SD playlist message before backend publication");
     lv_obj_add_event_cb(root,gesture_pressed_cb,LV_EVENT_PRESSED,NULL);
     lv_obj_add_event_cb(root,gesture_released_cb,LV_EVENT_RELEASED,NULL);
     ui_music_backend_t backend={.select=select_test,.get_time_ms=get_clock,
@@ -152,7 +165,42 @@ int main(void)
     lv_point_t first;
     lv_label_get_letter_pos(s_title_lbl,0,&first);
     assert(first.x>100); /* A short title really gets a centered letter position. */
-    lv_obj_t *row_title=lv_obj_get_child(s_pl_items[0],0);
+    assert(lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));
+    for (unsigned i=0;i<s_pl_item_count;i++) {
+        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[i])),
+                       i==0 ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE));
+    }
+    /* The active row must use the exact same action icon as the console. */
+    for (unsigned i=0;i<4;i++) {
+        toggle_btn_cb(NULL);
+        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),
+                       lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),LV_SYMBOL_PAUSE));
+        advance(240); /* No backend play-state: the UI action remains stable. */
+        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),
+                       lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+    }
+    ui_music_player_update_progress(0,300,true);
+    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),LV_SYMBOL_PAUSE));
+    ui_music_player_update_progress(0,300,false);
+    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),LV_SYMBOL_PLAY));
+    switch_to_song(1);
+    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),LV_SYMBOL_PAUSE));
+    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),
+                   lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+    ui_music_player_update_progress(0,300,true);
+    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),LV_SYMBOL_PAUSE));
+    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),
+                   lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+    switch_to_song(0);
+    ui_music_player_show_song(0,"Short",NULL,300);
+    puts("PASS playlist icons match console on backend updates, toggles, timer ticks and song changes");
+    lv_obj_t *row_title=playlist_item_title(s_pl_items[0]);
+    lv_obj_update_layout(s_playlist);
+    lv_area_t icon_bounds, title_bounds;
+    lv_obj_get_coords(playlist_item_icon(s_pl_items[0]),&icon_bounds);
+    lv_obj_get_coords(row_title,&title_bounds);
+    assert(icon_bounds.x2<title_bounds.x1);
     assert(lv_label_get_long_mode(row_title)==LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_label_set_text(row_title,"A long song name with many words that must stay on one line and scroll horizontally across the row instead of wrapping");
     advance(40);
@@ -383,7 +431,24 @@ int main(void)
     drag(indev,230,10,0,100); advance(400);
     assert(!ui_music_player_is_playlist_visible());
     puts("PASS real pointer gestures: swipe does not click, lyrics scroll, playlist opens outside and closes from top");
-    ui_music_player_set_library(0,"end");
+    ui_music_player_set_library(0,"请插入 SD 卡");
+    assert(s_pl_item_count==0 && s_library_count==0);
+    assert(!lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));
+    assert(!strcmp(lv_label_get_text(s_playlist_empty_lbl),"请插入 SD 卡"));
+    ui_music_player_toggle_playlist(true);
+    advance(400);
+    assert(lv_obj_is_visible(s_playlist_empty_lbl));
+    ui_music_player_set_library(0,"未找到歌曲");
+    assert(!strcmp(lv_label_get_text(s_playlist_empty_lbl),"未找到歌曲"));
+    ui_music_player_set_library(0,"正在扫描 SD 卡...");
+    assert(!strcmp(lv_label_get_text(s_playlist_empty_lbl),"正在扫描 SD 卡..."));
+    ui_music_player_set_library(2,"reinserted");
+    assert(lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));
+    assert(s_pl_item_count==2);
+    ui_music_player_set_library(0,NULL);
+    assert(!lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));
+    assert(!strcmp(lv_label_get_text(s_playlist_empty_lbl),"未找到歌曲"));
+    puts("PASS empty playlist status, no SD, scan results and reinserted card");
     for (unsigned i=0;i<3;i++) assert(!background_refs[i]);
     puts("ALL PLAYER UI TESTS PASSED");
     return 0;

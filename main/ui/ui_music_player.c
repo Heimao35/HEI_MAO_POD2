@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ui_fonts.h"
 
 /* ---- 封面正方形尺寸 ---- */
 #define COVER_SIZE      240
@@ -82,6 +83,7 @@ static lv_obj_t *s_progress    = NULL; /**< lv_bar 只读进度条 */
 static lv_obj_t *s_time_lbl    = NULL;
 static lv_obj_t *s_title_lbl   = NULL;
 static lv_obj_t *s_playlist    = NULL;
+static lv_obj_t *s_playlist_empty_lbl = NULL;
 
 /* 歌曲列表中每个条目的对象指针，用于高亮当前歌曲 */
 /*
@@ -121,22 +123,37 @@ static bool s_cover_swipe_suppressed = false;
 static lv_point_t s_cover_press_point; /**< 按下坐标：在 CLICKED 前识别拖动，避免一次操作触发两种动作。 */
 
 /* ---- 前向声明 ---- */
-static void update_playlist_highlight(void);
+static void background_opa_cb(void *obj, int32_t opa);
+static uint32_t ui_song_count(void);
+static void content_fade_start(void);
 static void switch_to_song(int idx);
 static bool switch_to_song_animated(int idx, bool slide_left);
-static bool request_song(uint32_t index);
-static uint32_t ui_song_count(void) { return s_library_count; }
+static void update_playlist_highlight(void);
+static void playlist_create_empty_label(void);
 static void lyric_press_cb(lv_event_t *e);
 static void lyric_release_cb(lv_event_t *e);
 static void lyric_scroll_cb(lv_event_t *e);
-static void player_timer_cb(lv_timer_t *timer);
 static int32_t lyric_center_padding(void);
-static void content_fade_start(void);
-static void content_transition_finish(void);
+static void player_timer_cb(lv_timer_t *timer);
+static bool request_song(uint32_t index);
+static lv_obj_t *playlist_item_title(lv_obj_t *item);
+static lv_obj_t *playlist_item_icon(lv_obj_t *item);
+
+/* 主控制台和当前歌曲条目共用同一图标规则，避免两处各自取反。
+ * 图标表示可执行的操作：播放中可以暂停，暂停中可以继续播放。 */
+static const char *playback_action_symbol(void)
+{
+    return s_is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY;
+}
 
 static void background_opa_cb(void *obj, int32_t opa)
 {
     lv_obj_set_style_image_opa((lv_obj_t *)obj, (lv_opa_t)opa, 0);
+}
+
+static uint32_t ui_song_count(void)
+{
+    return s_library_count;
 }
 
 static void background_clear_pending(void)
@@ -262,9 +279,12 @@ static void toggle_btn_cb(lv_event_t *e)
     s_is_playing = !s_is_playing;
     lv_obj_t *icon = lv_obj_get_child(s_btn_toggle, 0);
     if (icon) {
-        lv_label_set_text(icon, s_is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        lv_label_set_text(icon, playback_action_symbol());
     }
     set_ctrl_btn_active(s_btn_toggle, s_is_playing);
+    /* 当前条目与控制台共用播放/暂停图标。局部点击也要立即刷新，
+     * 不能等待后端定时器，因为此时 s_is_playing 已更新。 */
+    update_playlist_highlight();
     if (s_cb_toggle) s_cb_toggle();
 }
 
@@ -388,7 +408,19 @@ static void cover_click_cb(lv_event_t *e)
     content_fade_start();
 }
 
-/** @brief 歌曲列表条目点击 —— 切换到对应歌曲 */
+/* 条目子对象固定为 [图标, 歌名]。所有读取集中在这两个辅助函数，
+ * 避免新增图标后仍把 child(0) 当成歌名，导致标题或选歌内容错乱。 */
+static lv_obj_t *playlist_item_icon(lv_obj_t *item)
+{
+    return item ? lv_obj_get_child(item, 0) : NULL;
+}
+
+static lv_obj_t *playlist_item_title(lv_obj_t *item)
+{
+    return item ? lv_obj_get_child(item, 1) : NULL;
+}
+
+/** @brief 歌曲列表条目点击 —— 沿用原有选歌和后台读取逻辑。 */
 static void playlist_item_cb(lv_event_t *e)
 {
     int idx = (int)(uintptr_t)lv_event_get_user_data(e);
@@ -408,9 +440,11 @@ static void switch_to_song(int idx)
     s_current_idx = idx;
     /* 选歌立即生效：歌名来自已显示的列表，无需等待 SD。先清空上一首的
      * 歌词/时间/封面；缓存命中会在 select 回调内立即补上新封面。 */
-    const char *title = "Loading...";
-    if ((uint32_t)idx < s_pl_item_count)
-        title = lv_label_get_text(lv_obj_get_child(s_pl_items[idx], 0));
+    const char *title = "加载中...";
+    if ((uint32_t)idx < s_pl_item_count) {
+        lv_obj_t *title_obj = playlist_item_title(s_pl_items[idx]);
+        if (title_obj) title = lv_label_get_text(title_obj);
+    }
     lv_label_set_text(s_title_lbl, title);
     ui_music_player_set_cover((uint32_t)idx, NULL);
     ui_music_player_set_lyrics("", 0, false);
@@ -515,13 +549,23 @@ static void update_playlist_highlight(void)
 {
     for (uint32_t i = 0; i < s_pl_item_count; i++) {
         if (!s_pl_items[i]) continue;
-        if (i == s_current_idx) {
-            /* 高亮底色已改为白色，标题同步反色；只改颜色，不动列表行和滚动。 */
-            lv_obj_set_style_text_color(lv_obj_get_child(s_pl_items[i], 0), UI_COLOR_ON_ACCENT, 0);
+        lv_obj_t *icon = playlist_item_icon(s_pl_items[i]);
+        lv_obj_t *title = playlist_item_title(s_pl_items[i]);
+        /* 当前条目的图标始终与主页面控制台一致；未选中的条目仍使用
+         * PAUSE。与文字一起在选中行反色，保持原有白底黑字主题。 */
+        if (icon) {
+            lv_label_set_text(icon, i == (uint32_t)s_current_idx ?
+                                   playback_action_symbol() : LV_SYMBOL_PAUSE);
+            lv_obj_set_style_text_color(icon,
+                i == (uint32_t)s_current_idx ? UI_COLOR_ON_ACCENT : UI_COLOR_TEXT, 0);
+        }
+        if (i == (uint32_t)s_current_idx) {
+            if (title) lv_obj_set_style_text_color(title, UI_COLOR_ON_ACCENT, 0);
             lv_obj_set_style_bg_color(s_pl_items[i], UI_COLOR_ACCENT, 0);
             lv_obj_set_style_bg_opa(s_pl_items[i], LV_OPA_COVER, 0);
-        } else {
-            lv_obj_set_style_text_color(lv_obj_get_child(s_pl_items[i], 0), UI_COLOR_TEXT, 0);
+        }
+        else {
+            if (title) lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
             lv_obj_set_style_bg_color(s_pl_items[i], UI_COLOR_LIST_ROW_BG, 0);
             lv_obj_set_style_bg_opa(s_pl_items[i], LV_OPA_80, 0);
         }
@@ -600,9 +644,11 @@ void ui_music_player_create(lv_obj_t *parent)
 
     /* ===== 歌曲标题 —— 默认显示第一首测试歌曲 ===== */
     s_title_lbl = lv_label_create(s_page);
-    lv_label_set_text(s_title_lbl, "Waiting for SD card");
+    lv_label_set_text(s_title_lbl, "等待插入 SD 卡");
     lv_obj_set_style_text_color(s_title_lbl, UI_COLOR_TEXT, 0);
-    lv_obj_set_style_text_font(s_title_lbl, &lv_font_montserrat_16, 0);
+    /* 顶部动态歌曲名与歌词统一使用 18 号字库，避免为歌曲名再维护
+     * 一套完整的 16 号中文字库；位置、宽度、居中和横向滚动规则不变。 */
+    lv_obj_set_style_text_font(s_title_lbl, ui_font_18(), 0);
     /* 保持原标题宽度与横向滚动规则，通过统一偏移与封面/歌词同步下移。 */
     lv_obj_set_width(s_title_lbl, UI_HOR_RES - 32);
     /* 固定的是标题视口宽度：短歌名按视口居中，溢出时 LVGL 自动从左侧滚动。
@@ -670,13 +716,13 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_add_event_cb(s_lyric_scroll, lyric_release_cb, LV_EVENT_RELEASED, NULL);
 
     s_lyric_label = lv_label_create(s_lyric_scroll);
-    lv_label_set_text(s_lyric_label, "Lyrics will\nappear here");
+    lv_label_set_text(s_lyric_label, "歌词将在这里显示");
     lv_obj_set_width(s_lyric_label, COVER_SIZE - 16);
     lv_obj_set_style_text_color(s_lyric_label, UI_COLOR_TEXT_SECONDARY, 0);
     /* 歌词单独使用 18 号字体，并增加 4 像素行间距，改善阅读体验。
      * 必须在计算上下居中留白前设置字体；自动回跟通过实际字形坐标定位，
      * 会同时考虑新字号、行间距及长句换行，无需维护固定的歌词行高。 */
-    lv_obj_set_style_text_font(s_lyric_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(s_lyric_label, ui_font_18(), 0);
     lv_obj_set_style_text_line_space(s_lyric_label, 4, 0);
     lv_obj_set_style_text_align(s_lyric_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_lyric_label, LV_LABEL_LONG_WRAP);
@@ -776,7 +822,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(s_time_lbl, UI_COLOR_TEXT, 0);
     /* 时长由 12 号增至 16 号，提高背景上的可读性；仍在原来的
      * 24px 高进度行中垂直居中、右侧对齐，保留与左侧进度条的间距。 */
-    lv_obj_set_style_text_font(s_time_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_time_lbl, ui_font_16(), 0);
     lv_obj_align(s_time_lbl, LV_ALIGN_RIGHT_MID, -10, 0);
 
     /* ===== 歌曲列表（全屏，可上下滚动，默认隐藏） ===== */
@@ -798,6 +844,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_scroll_dir(s_playlist, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_playlist, LV_SCROLLBAR_MODE_OFF);
     lv_obj_add_flag(s_playlist, LV_OBJ_FLAG_EVENT_BUBBLE);
+    playlist_create_empty_label();
 
     /*
      * Do not create demo rows here. The media worker calls
@@ -812,6 +859,22 @@ void ui_music_player_create(lv_obj_t *parent)
 }
 
 lv_obj_t *ui_music_player_get_page(void) { return s_page; }
+
+static void playlist_create_empty_label(void)
+{
+    /* 空状态不参加列表 flex 排版，也不接收点击/滚动，防止占用歌曲行
+     * 空间或截获原有收起手势。开机尚未挂载 SD 时也必须立即可见；
+     * 后续重扫由 set_library 更新文案，并在有真实条目时隐藏它。 */
+    s_playlist_empty_lbl = lv_label_create(s_playlist);
+    lv_obj_add_flag(s_playlist_empty_lbl, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_width(s_playlist_empty_lbl, UI_HOR_RES - 32);
+    lv_label_set_text(s_playlist_empty_lbl, "请插入 SD 卡");
+    lv_obj_set_style_text_color(s_playlist_empty_lbl, UI_COLOR_TEXT_SECONDARY, 0);
+    lv_obj_set_style_text_font(s_playlist_empty_lbl, ui_font_18(), 0);
+    lv_obj_set_style_text_align(s_playlist_empty_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_playlist_empty_lbl, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_remove_flag(s_playlist_empty_lbl, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+}
 
 static void playlist_anim_y_cb(void *obj, int32_t v) { lv_obj_set_y((lv_obj_t *)obj, v); }
 
@@ -856,8 +919,9 @@ void ui_music_player_update_progress(uint32_t current_sec, uint32_t total_sec, b
     if (is_playing != s_is_playing) {
         s_is_playing = is_playing;
         lv_obj_t *icon = lv_obj_get_child(s_btn_toggle, 0);
-        if (icon) lv_label_set_text(icon, s_is_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        if (icon) lv_label_set_text(icon, playback_action_symbol());
         set_ctrl_btn_active(s_btn_toggle, s_is_playing);
+        update_playlist_highlight();
     }
 }
 
@@ -953,6 +1017,8 @@ void ui_music_player_set_library(uint32_t count, const char *status)
     ui_music_player_set_lyrics("", 0, false);
     ui_music_player_update_progress(0, 0, false);
     lv_obj_clean(s_playlist);
+    s_playlist_empty_lbl = NULL;
+    playlist_create_empty_label();
     free(s_pl_items);
     s_pl_items = NULL;
     s_pl_item_count = 0;
@@ -963,7 +1029,7 @@ void ui_music_player_set_library(uint32_t count, const char *status)
         s_pl_items = calloc(count, sizeof(*s_pl_items));
         if (!s_pl_items) {
             s_library_count = 0;
-            lv_label_set_text(s_title_lbl, "Music list memory error");
+            lv_label_set_text(s_title_lbl, "歌曲列表内存错误");
         } else {
             for (uint32_t i = 0; i < count; ++i) {
                 lv_obj_t *item = lv_obj_create(s_playlist);
@@ -979,15 +1045,24 @@ void ui_music_player_set_library(uint32_t count, const char *status)
                 lv_obj_add_event_cb(item, playlist_item_cb, LV_EVENT_CLICKED,
                                     (void *)(uintptr_t)i);
 
+                /* 图标和歌名都不接受点击，由原有 48px 高条目处理选歌。
+                 * 图标固定留出 28px，歌名右移后仍保持单行横向滚动；
+                 * 不改变列表父容器的滚动和展开/收起动画参数。 */
+                lv_obj_t *icon = lv_label_create(item);
+                lv_label_set_text(icon, LV_SYMBOL_PAUSE);
+                lv_obj_set_style_text_color(icon, UI_COLOR_TEXT, 0);
+                lv_obj_set_style_text_font(icon, ui_font_22(), 0);
+                lv_obj_set_width(icon, 28);
+                lv_obj_align(icon, LV_ALIGN_LEFT_MID, 8, 0);
+                lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
                 lv_obj_t *title = lv_label_create(item);
-                lv_label_set_text(title, "Loading...");
-                lv_obj_set_width(title, UI_HOR_RES - 56);
-                /* 条目仍是原来的 48px 高、左侧对齐；限制文本宽度并使用横向
-                 * 循环滚动，长歌名不换行，不改变列表的滚动和点击选歌逻辑。 */
+                lv_label_set_text(title, "加载中...");
+                lv_obj_set_width(title, UI_HOR_RES - 72);
                 lv_label_set_long_mode(title, LV_LABEL_LONG_SCROLL_CIRCULAR);
                 lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
-                lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-                lv_obj_align(title, LV_ALIGN_LEFT_MID, 8, 0);
+                lv_obj_set_style_text_font(title, ui_font_18(), 0);
+                lv_obj_align(title, LV_ALIGN_LEFT_MID, 40, 0);
                 s_pl_items[i] = item;
                 s_pl_item_count++;
             }
@@ -997,7 +1072,18 @@ void ui_music_player_set_library(uint32_t count, const char *status)
     }
 
     lv_obj_scroll_to_y(s_playlist, 0, LV_ANIM_OFF);
-    lv_label_set_text(s_title_lbl, count ? "Loading..." : (status ? status : "No songs"));
+    lv_label_set_text(s_title_lbl, count ? "加载中..." : (status ? status : "未找到歌曲"));
+    if (s_playlist_empty_lbl) {
+        if (s_pl_item_count == 0) {
+            const char *empty_text = count ? "歌曲列表内存错误" :
+                                     (status && status[0] ? status : "未找到歌曲");
+            lv_label_set_text(s_playlist_empty_lbl, empty_text);
+            lv_obj_remove_flag(s_playlist_empty_lbl, LV_OBJ_FLAG_HIDDEN);
+        }
+        else {
+            lv_obj_add_flag(s_playlist_empty_lbl, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     if (s_backend.page && s_library_count) s_backend.page(0);
 }
 
@@ -1009,7 +1095,7 @@ void ui_music_player_set_page(const music_page_t *page)
     for (uint32_t i = 0; i < page->count; ++i) {
         uint32_t index = page->first + i;
         if (index >= s_pl_item_count || !s_pl_items[index]) continue;
-        lv_obj_t *title = lv_obj_get_child(s_pl_items[index], 0);
+        lv_obj_t *title = playlist_item_title(s_pl_items[index]);
         if (title) lv_label_set_text(title, page->names[i]);
     }
     update_playlist_highlight();
@@ -1057,7 +1143,7 @@ void ui_music_player_set_lyrics(const char *text, uint32_t line_count, bool trun
         for (const char *p = text; *p; ++p) if (*p == '\n') ++visible_lines;
     }
     s_lyric_line_count = line_count < visible_lines ? line_count : visible_lines;
-    lv_label_set_text(s_lyric_label, text && text[0] ? text : "Lyrics will\nappear here");
+    lv_label_set_text(s_lyric_label, text && text[0] ? text : "歌词将在这里显示");
     lv_obj_update_layout(s_lyric_label);
     s_lyric_user_scrolling = false;
     s_lyric_last_input = lv_tick_get();

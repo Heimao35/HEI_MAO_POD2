@@ -174,7 +174,7 @@ static bool load_selected_song(uint32_t index, uint32_t generation, uint32_t ser
         atomic_store(&s_duration_sec, duration);
         atomic_store(&s_time_ms, 0);
         atomic_store(&s_playing, false);
-        ui_music_player_show_song(index, item_ret == ESP_OK ? item.name : "Song unavailable",
+        ui_music_player_show_song(index, item_ret == ESP_OK ? item.name : "歌曲不可用",
                                   cover, duration);
         ui_music_player_set_lyrics(lyric_ret == ESP_OK && s_lyrics_text ? s_lyrics_text : "",
                                   lyric_ret == ESP_OK ? lyric_count : 0, lyric_truncated);
@@ -251,7 +251,7 @@ static void media_worker(void *arg)
             atomic_store(&s_duration_sec, 0);
             atomic_store(&s_time_ms, 0);
             atomic_store(&s_playing, false);
-            ui_music_player_set_library(0, "Scanning SD card...");
+            ui_music_player_set_library(0, "正在扫描 SD 卡...");
             lvgl_port_unlock();
 
             if (lock_media(generation) == ESP_OK) {
@@ -261,7 +261,7 @@ static void media_worker(void *arg)
                 sd_card_io_unlock();
                 if (ret == ESP_OK && count) {
                     lvgl_port_lock(0);
-                    ui_music_player_set_library(count, capped ? "Song list capped" : "Loading songs...");
+                    ui_music_player_set_library(count, capped ? "歌曲列表已达上限" : "正在加载歌曲...");
                     lvgl_port_unlock();
                     publish_all_names(count, generation);
                     /* Let the normal request path load the first song once;
@@ -272,7 +272,7 @@ static void media_worker(void *arg)
                     lvgl_port_unlock();
                 } else {
                     lvgl_port_lock(0);
-                    ui_music_player_set_library(0, ret == ESP_OK ? "No songs found" : "SD scan failed");
+                    ui_music_player_set_library(0, ret == ESP_OK ? "未找到歌曲" : "SD 卡扫描失败");
                     lvgl_port_unlock();
                 }
             }
@@ -291,7 +291,7 @@ static void media_worker(void *arg)
                 atomic_store(&s_duration_sec, 0);
                 atomic_store(&s_time_ms, 0);
                 atomic_store(&s_playing, false);
-                ui_music_player_set_library(0, "Insert SD card");
+                ui_music_player_set_library(0, "请插入 SD 卡");
                 lvgl_port_unlock();
             }
             continue;

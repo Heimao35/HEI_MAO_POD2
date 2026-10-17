@@ -10,6 +10,7 @@
 
 #include "ui_statusbar.h"
 #include <stdio.h>
+#include "ui_fonts.h"
 
 static lv_obj_t *s_bar       = NULL;
 static lv_obj_t *s_icon_wifi = NULL;
@@ -35,7 +36,7 @@ static const char *battery_symbol(uint8_t pct)
 /** 状态栏电池图标字体，需要比普通图标更大以清晰显示电池形状 */
 #define SB_BATT_FONT  (&lv_font_montserrat_22)
 /** 状态栏文字字体 */
-#define SB_TEXT_FONT  (&lv_font_montserrat_16)
+#define SB_TEXT_FONT  (ui_font_16())
 
 void ui_statusbar_create(lv_obj_t *parent)
 {
@@ -130,7 +131,7 @@ void ui_statusbar_create(lv_obj_t *parent)
     s_charge = lv_label_create(right);
     lv_label_set_text(s_charge, LV_SYMBOL_CHARGE);
     lv_obj_set_style_text_color(s_charge, UI_COLOR_CHARGE, 0);
-    lv_obj_set_style_text_font(s_charge, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s_charge, ui_font_14(), 0);
     lv_obj_add_flag(s_charge, LV_OBJ_FLAG_HIDDEN);
 }
 

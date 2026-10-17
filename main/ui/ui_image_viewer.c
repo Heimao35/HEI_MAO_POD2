@@ -6,6 +6,7 @@
  */
 
 #include "ui_image_viewer.h"
+#include "ui_fonts.h"
 
 static lv_obj_t *s_page = NULL; /**< 图片查看器页面容器 */
 
@@ -32,9 +33,9 @@ void ui_image_viewer_create(lv_obj_t *parent)
     lv_obj_align(icon, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_t *tip = lv_label_create(s_page);
-    lv_label_set_text(tip, "Image Viewer");
+    lv_label_set_text(tip, "图片查看器");
     lv_obj_set_style_text_color(tip, UI_COLOR_TEXT_MUTED, 0);
-    lv_obj_set_style_text_font(tip, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(tip, ui_font_16(), 0);
     lv_obj_align(tip, LV_ALIGN_CENTER, 0, 20);
 }
 

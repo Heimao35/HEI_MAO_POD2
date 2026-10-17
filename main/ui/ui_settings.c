@@ -8,6 +8,7 @@
 
 #include "ui_settings.h"
 #include "ui_statusbar.h"
+#include "ui_fonts.h"
 
 static lv_obj_t *s_page = NULL; /**< 设置页面容器 */
 static bool s_visible = false;
@@ -17,11 +18,14 @@ static const struct {
     const char *symbol;  /**< 按钮图标符号 */
     const char *label;   /**< 按钮下方文字 */
 } s_items[] = {
-    { LV_SYMBOL_WIFI,     "WiFi"     },
-    { LV_SYMBOL_BLUETOOTH,"Bluetooth"},
-    { LV_SYMBOL_GPS,      "Gyro"     },  /* 姿态感应用 GPS/指南针图标代替 */
-    { LV_SYMBOL_SETTINGS, "Clock"    },  /* 时钟设置 */
-    { LV_SYMBOL_IMAGE,    "Lock Scr" },  /* 锁屏页面设置 */
+    /* 固定文字使用已经挂载的 14 号中文字库；仅替换文案，不改变
+     * 原有图标、按钮尺寸、网格位置和点击逻辑，后续新增设置项也应
+     * 在这里集中维护中文显示名称。 */
+    { LV_SYMBOL_WIFI,     "无线网络"   },
+    { LV_SYMBOL_BLUETOOTH,"蓝牙"       },
+    { LV_SYMBOL_GPS,      "姿态感应"   },  /* 姿态感应用 GPS/指南针图标代替 */
+    { LV_SYMBOL_SETTINGS, "时钟"       },  /* 时钟设置 */
+    { LV_SYMBOL_IMAGE,    "锁屏设置"   },  /* 锁屏页面设置 */
 };
 #define ITEM_COUNT (sizeof(s_items) / sizeof(s_items[0]))
 
@@ -59,9 +63,9 @@ void ui_settings_create(lv_obj_t *parent)
 
     /* 标题 */
     lv_obj_t *title = lv_label_create(s_page);
-    lv_label_set_text(title, "Settings");
+    lv_label_set_text(title, "设置");
     lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(title, ui_font_22(), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
 
     /* 可上下滚动的按钮网格容器 */
@@ -121,7 +125,7 @@ void ui_settings_create(lv_obj_t *parent)
         lv_obj_t *lbl = lv_label_create(item);
         lv_label_set_text(lbl, s_items[i].label);
         lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT_CAPTION, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(lbl, ui_font_14(), 0);
         lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
     }
 

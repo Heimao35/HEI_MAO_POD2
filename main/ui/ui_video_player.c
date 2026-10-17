@@ -6,6 +6,7 @@
  */
 
 #include "ui_video_player.h"
+#include "ui_fonts.h"
 
 static lv_obj_t *s_page = NULL; /**< 视频播放器页面容器 */
 
@@ -34,9 +35,9 @@ void ui_video_player_create(lv_obj_t *parent)
 
     /* 提示文字 */
     lv_obj_t *tip = lv_label_create(s_page);
-    lv_label_set_text(tip, "Video Player");
+    lv_label_set_text(tip, "视频播放器");
     lv_obj_set_style_text_color(tip, UI_COLOR_TEXT_MUTED, 0);
-    lv_obj_set_style_text_font(tip, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(tip, ui_font_16(), 0);
     lv_obj_align(tip, LV_ALIGN_CENTER, 0, 20);
 }
 
