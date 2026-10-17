@@ -177,7 +177,7 @@ void ui_lockscreen_create(lv_obj_t *parent)
     s_lock_page = lv_obj_create(parent);
     lv_obj_set_size(s_lock_page, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_lock_page, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_lock_page, lv_color_hex(0x0D0D1A), 0);
+    lv_obj_set_style_bg_color(s_lock_page, UI_COLOR_PAGE_BG_DARK, 0);
     lv_obj_set_style_bg_opa(s_lock_page, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_lock_page, 0, 0);
     lv_obj_set_style_radius(s_lock_page, 0, 0);
@@ -205,13 +205,13 @@ void ui_lockscreen_create(lv_obj_t *parent)
 
     s_time_label = lv_label_create(s_lock_page);
     lv_label_set_text(s_time_label, "12:00");
-    lv_obj_set_style_text_color(s_time_label, lv_color_white(), 0);
+    lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
     lv_obj_align(s_time_label, LV_ALIGN_TOP_MID, 0, UI_VER_RES * 30 / 100);
 
     s_date_label = lv_label_create(s_lock_page);
     lv_label_set_text(s_date_label, "2026-01-01");
-    lv_obj_set_style_text_color(s_date_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(s_date_label, UI_COLOR_TEXT_SECONDARY, 0);
     lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_26, 0);
     lv_obj_align_to(s_date_label, s_time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 

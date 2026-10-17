@@ -101,7 +101,7 @@ void ui_mode_panel_create(lv_obj_t *parent)
         lv_obj_set_size(btn, 80, 80);
         /* 圆角 16px，增大使按钮更圆润 */
         lv_obj_set_style_radius(btn, 16, 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A4A), 0);
+        lv_obj_set_style_bg_color(btn, UI_COLOR_CONTROL_BG, 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
@@ -109,7 +109,7 @@ void ui_mode_panel_create(lv_obj_t *parent)
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, s_modes[i].symbol);
-        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
         lv_obj_center(lbl);
 

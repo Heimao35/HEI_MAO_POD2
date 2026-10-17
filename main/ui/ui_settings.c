@@ -49,7 +49,7 @@ void ui_settings_create(lv_obj_t *parent)
     s_page = lv_obj_create(parent);
     lv_obj_set_size(s_page, UI_HOR_RES, UI_VER_RES);
     lv_obj_set_pos(s_page, 0, -(int32_t)UI_VER_RES);
-    lv_obj_set_style_bg_color(s_page, lv_color_hex(0x0D0D1A), 0);
+    lv_obj_set_style_bg_color(s_page, UI_COLOR_PAGE_BG_DARK, 0);
     lv_obj_set_style_bg_opa(s_page, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_page, 0, 0);
     lv_obj_set_style_radius(s_page, 0, 0);
@@ -60,7 +60,7 @@ void ui_settings_create(lv_obj_t *parent)
     /* 标题 */
     lv_obj_t *title = lv_label_create(s_page);
     lv_label_set_text(title, "Settings");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
 
@@ -100,7 +100,7 @@ void ui_settings_create(lv_obj_t *parent)
         lv_obj_t *btn = lv_obj_create(item);
         lv_obj_set_size(btn, 100, 100);
         lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A4A), 0);
+        lv_obj_set_style_bg_color(btn, UI_COLOR_CONTROL_BG, 0);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 0);
@@ -113,14 +113,14 @@ void ui_settings_create(lv_obj_t *parent)
         /* 图标字体 26px，增大使图标更醒目 */
         lv_obj_t *ico = lv_label_create(btn);
         lv_label_set_text(ico, s_items[i].symbol);
-        lv_obj_set_style_text_color(ico, lv_color_white(), 0);
+        lv_obj_set_style_text_color(ico, UI_COLOR_TEXT, 0);
         lv_obj_set_style_text_font(ico, &lv_font_montserrat_26, 0);
         lv_obj_center(ico);
 
         /* 按钮下方文字 */
         lv_obj_t *lbl = lv_label_create(item);
         lv_label_set_text(lbl, s_items[i].label);
-        lv_obj_set_style_text_color(lbl, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT_CAPTION, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
         lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
     }

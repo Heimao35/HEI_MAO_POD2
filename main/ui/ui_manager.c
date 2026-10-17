@@ -241,6 +241,18 @@ void ui_manager_init(void)
 {
     lv_obj_t *scr = lv_screen_active();
 
+#if LV_USE_THEME_DEFAULT
+    /* 沿用当前显示器、字体及原主题明暗配置，仅替换主/辅颜色。
+     * 默认主题也必须同步，否则未显式设色的旋钮/焦点框仍会继承蓝绿色。
+     * 不替换成另一套主题，避免引入新的尺寸、间距或状态动画。 */
+    lv_display_t *display = lv_obj_get_display(scr);
+    lv_theme_t *theme = lv_theme_default_init(display, UI_COLOR_ACCENT,
+                                              UI_COLOR_TEXT_SECONDARY,
+                                              LV_THEME_DEFAULT_DARK,
+                                              lv_theme_get_font_normal(scr));
+    lv_display_set_theme(display, theme);
+#endif
+
     /* 主屏幕样式：黑色背景，无滚动 */
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);

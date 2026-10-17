@@ -509,17 +509,20 @@ static bool switch_to_song_animated(int idx, bool slide_left)
 
 /**
  * @brief 刷新歌曲列表中的高亮状态
- * 当前播放歌曲背景变为 UI_COLOR_ACCENT，其余恢复默认色。
+ * 当前播放歌曲使用白色主色背景和黑色文字，其余恢复灰底白字。
  */
 static void update_playlist_highlight(void)
 {
     for (uint32_t i = 0; i < s_pl_item_count; i++) {
         if (!s_pl_items[i]) continue;
         if (i == s_current_idx) {
+            /* 高亮底色已改为白色，标题同步反色；只改颜色，不动列表行和滚动。 */
+            lv_obj_set_style_text_color(lv_obj_get_child(s_pl_items[i], 0), UI_COLOR_ON_ACCENT, 0);
             lv_obj_set_style_bg_color(s_pl_items[i], UI_COLOR_ACCENT, 0);
             lv_obj_set_style_bg_opa(s_pl_items[i], LV_OPA_COVER, 0);
         } else {
-            lv_obj_set_style_bg_color(s_pl_items[i], lv_color_hex(0x1A1A3E), 0);
+            lv_obj_set_style_text_color(lv_obj_get_child(s_pl_items[i], 0), UI_COLOR_TEXT, 0);
+            lv_obj_set_style_bg_color(s_pl_items[i], UI_COLOR_LIST_ROW_BG, 0);
             lv_obj_set_style_bg_opa(s_pl_items[i], LV_OPA_80, 0);
         }
     }
@@ -540,7 +543,7 @@ static lv_obj_t *create_ctrl_btn(lv_obj_t *parent, const char *symbol,
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, 72, 72);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(btn, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(btn, UI_COLOR_TEXT, 0);
     /* 覆盖主题按压时的黑色重着色，改用白色背景加深来保留触摸反馈。
      * 保留主题原有的状态过渡，不修改按钮尺寸、点击范围或事件逻辑。 */
     lv_obj_set_style_recolor_opa(btn, LV_OPA_TRANSP, LV_STATE_PRESSED);
@@ -551,7 +554,7 @@ static lv_obj_t *create_ctrl_btn(lv_obj_t *parent, const char *symbol,
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, symbol);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
     lv_obj_center(lbl);
 
@@ -574,7 +577,7 @@ void ui_music_player_create(lv_obj_t *parent)
     s_page = lv_obj_create(parent);
     lv_obj_set_size(s_page, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_page, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_page, lv_color_hex(0x0D0D2B), 0);
+    lv_obj_set_style_bg_color(s_page, UI_COLOR_PAGE_BG, 0);
     lv_obj_set_style_bg_opa(s_page, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_page, 0, 0);
     lv_obj_set_style_radius(s_page, 0, 0);
@@ -598,7 +601,7 @@ void ui_music_player_create(lv_obj_t *parent)
     /* ===== 歌曲标题 —— 默认显示第一首测试歌曲 ===== */
     s_title_lbl = lv_label_create(s_page);
     lv_label_set_text(s_title_lbl, "Waiting for SD card");
-    lv_obj_set_style_text_color(s_title_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_color(s_title_lbl, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(s_title_lbl, &lv_font_montserrat_16, 0);
     /* 保持原标题宽度与横向滚动规则，通过统一偏移与封面/歌词同步下移。 */
     lv_obj_set_width(s_title_lbl, UI_HOR_RES - 32);
@@ -628,7 +631,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_size(s_cover_img, COVER_SIZE, COVER_SIZE);
     lv_obj_center(s_cover_img);
     lv_obj_set_style_radius(s_cover_img, 16, 0);
-    lv_obj_set_style_bg_color(s_cover_img, lv_color_hex(0x4A3080), 0);
+    lv_obj_set_style_bg_color(s_cover_img, UI_COLOR_CONTROL_BG, 0);
     lv_obj_set_style_bg_opa(s_cover_img, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_cover_img, 0, 0);
     lv_obj_remove_flag(s_cover_img, LV_OBJ_FLAG_SCROLLABLE);
@@ -642,7 +645,7 @@ void ui_music_player_create(lv_obj_t *parent)
 
     lv_obj_t *cover_icon = lv_label_create(s_cover_img);
     lv_label_set_text(cover_icon, LV_SYMBOL_AUDIO);
-    lv_obj_set_style_text_color(cover_icon, lv_color_white(), 0);
+    lv_obj_set_style_text_color(cover_icon, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(cover_icon, &lv_font_montserrat_26, 0);
     lv_obj_center(cover_icon);
 
@@ -669,7 +672,7 @@ void ui_music_player_create(lv_obj_t *parent)
     s_lyric_label = lv_label_create(s_lyric_scroll);
     lv_label_set_text(s_lyric_label, "Lyrics will\nappear here");
     lv_obj_set_width(s_lyric_label, COVER_SIZE - 16);
-    lv_obj_set_style_text_color(s_lyric_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(s_lyric_label, UI_COLOR_TEXT_SECONDARY, 0);
     /* 歌词单独使用 18 号字体，并增加 4 像素行间距，改善阅读体验。
      * 必须在计算上下居中留白前设置字体；自动回跟通过实际字形坐标定位，
      * 会同时考虑新字号、行间距及长句换行，无需维护固定的歌词行高。 */
@@ -702,7 +705,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_label_set_text(s_outgoing_lyrics, "");
     lv_obj_set_width(s_outgoing_lyrics, COVER_SIZE - 16);
     lv_label_set_long_mode(s_outgoing_lyrics, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(s_outgoing_lyrics, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(s_outgoing_lyrics, UI_COLOR_TEXT_SECONDARY, 0);
     lv_obj_set_style_text_align(s_outgoing_lyrics, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_remove_flag(s_outgoing_lyrics, LV_OBJ_FLAG_CLICKABLE);
 
@@ -713,7 +716,7 @@ void ui_music_player_create(lv_obj_t *parent)
     lv_obj_set_style_radius(s_ctrl_panel, 0, 0);
     /* 取消控制台底板，只保留原容器尺寸、Flex 排列和手势冒泡。
      * 子按键的白色背景仍独立绘制，页面模糊背景可直接透出。 */
-    lv_obj_set_style_bg_color(s_ctrl_panel, lv_color_white(), 0);
+    lv_obj_set_style_bg_color(s_ctrl_panel, UI_COLOR_TEXT, 0);
     lv_obj_set_style_bg_opa(s_ctrl_panel, CTRL_PANEL_BG_OPA, 0);
     lv_obj_set_style_border_width(s_ctrl_panel, 0, 0);
     lv_obj_set_style_pad_all(s_ctrl_panel, 8, 0);
@@ -757,8 +760,8 @@ void ui_music_player_create(lv_obj_t *parent)
      * 长度和右侧时间位置保持不变，二者之间仍保留间隔。 */
     lv_obj_set_size(s_progress, LV_PCT(78), MUSIC_PROGRESS_HEIGHT);
     /* 进度条也沿用控制台的白色配色，通过轨道/已播放段的明暗区分。 */
-    lv_obj_set_style_bg_color(s_progress, lv_color_white(), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_progress, lv_color_white(), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_progress, UI_COLOR_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_progress, UI_COLOR_TEXT, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(s_progress, LV_OPA_80, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(s_progress, LV_OPA_20, LV_PART_MAIN);
     lv_obj_set_style_radius(s_progress, MUSIC_PROGRESS_HEIGHT / 2, LV_PART_MAIN);
@@ -770,7 +773,7 @@ void ui_music_player_create(lv_obj_t *parent)
     /* 时长 label */
     s_time_lbl = lv_label_create(prog_row);
     lv_label_set_text(s_time_lbl, "0:00");
-    lv_obj_set_style_text_color(s_time_lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_color(s_time_lbl, UI_COLOR_TEXT, 0);
     /* 时长由 12 号增至 16 号，提高背景上的可读性；仍在原来的
      * 24px 高进度行中垂直居中、右侧对齐，保留与左侧进度条的间距。 */
     lv_obj_set_style_text_font(s_time_lbl, &lv_font_montserrat_16, 0);
@@ -780,7 +783,7 @@ void ui_music_player_create(lv_obj_t *parent)
     s_playlist = lv_obj_create(s_page);
     lv_obj_set_size(s_playlist, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_playlist, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_playlist, lv_color_hex(0x0D0D2B), 0);
+    lv_obj_set_style_bg_color(s_playlist, UI_COLOR_PAGE_BG, 0);
     lv_obj_set_style_bg_opa(s_playlist, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_playlist, 0, 0);
     lv_obj_set_style_radius(s_playlist, 0, 0);
@@ -966,7 +969,7 @@ void ui_music_player_set_library(uint32_t count, const char *status)
                 lv_obj_t *item = lv_obj_create(s_playlist);
                 if (!item) break;
                 lv_obj_set_size(item, LV_PCT(100), 48);
-                lv_obj_set_style_bg_color(item, lv_color_hex(0x1A1A3E), 0);
+                lv_obj_set_style_bg_color(item, UI_COLOR_LIST_ROW_BG, 0);
                 lv_obj_set_style_bg_opa(item, LV_OPA_80, 0);
                 lv_obj_set_style_radius(item, 10, 0);
                 lv_obj_set_style_border_width(item, 0, 0);
@@ -982,7 +985,7 @@ void ui_music_player_set_library(uint32_t count, const char *status)
                 /* 条目仍是原来的 48px 高、左侧对齐；限制文本宽度并使用横向
                  * 循环滚动，长歌名不换行，不改变列表的滚动和点击选歌逻辑。 */
                 lv_label_set_long_mode(title, LV_LABEL_LONG_SCROLL_CIRCULAR);
-                lv_obj_set_style_text_color(title, lv_color_white(), 0);
+                lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
                 lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
                 lv_obj_align(title, LV_ALIGN_LEFT_MID, 8, 0);
                 s_pl_items[i] = item;

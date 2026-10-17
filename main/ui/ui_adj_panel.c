@@ -30,6 +30,14 @@ static bool s_muted   = false;            /**< 是否静音 */
 static ui_brightness_cb_t s_br_cb  = NULL;
 static ui_volume_cb_t     s_vol_cb = NULL;
 
+/* 白色选中态必须反转图标颜色；所有点击和拖动取消路径统一配对恢复。
+ * 此函数只设颜色，不修改自动亮度、静音、滑条数值或回调执行顺序。 */
+static void set_toggle_colors(lv_obj_t *btn, lv_obj_t *icon, bool active)
+{
+    lv_obj_set_style_bg_color(btn, active ? UI_COLOR_ACCENT : UI_COLOR_CONTROL_BG, 0);
+    lv_obj_set_style_text_color(icon, active ? UI_COLOR_ON_ACCENT : UI_COLOR_TEXT, 0);
+}
+
 static void overlay_click_cb(lv_event_t *e) { (void)e; ui_adj_panel_hide(); }
 
 static void bright_slider_cb(lv_event_t *e)
@@ -39,7 +47,7 @@ static void bright_slider_cb(lv_event_t *e)
     /* 自动亮度开启时手动拖滑条 → 自动关闭自动亮度 */
     if (st->auto_brightness) {
         st->auto_brightness = false;
-        lv_obj_set_style_bg_color(s_auto_btn, lv_color_hex(0x3A3A5C), 0);
+        set_toggle_colors(s_auto_btn, s_auto_icon, false);
     }
     int32_t val = lv_slider_get_value(s_bright_slider);
     st->brightness = (uint8_t)val;
@@ -53,7 +61,7 @@ static void vol_slider_cb(lv_event_t *e)
     /* 静音时手动拖滑条 → 自动解除静音 */
     if (s_muted && val > 0) {
         s_muted = false;
-        lv_obj_set_style_bg_color(s_mute_btn, lv_color_hex(0x3A3A5C), 0);
+        set_toggle_colors(s_mute_btn, s_mute_icon, false);
         lv_label_set_text(s_mute_icon, LV_SYMBOL_VOLUME_MID);
     }
     ui_get_device_state()->volume = (uint8_t)val;
@@ -67,9 +75,9 @@ static void auto_bright_cb(lv_event_t *e)
     ui_device_state_t *st = ui_get_device_state();
     st->auto_brightness = !st->auto_brightness;
     if (st->auto_brightness) {
-        lv_obj_set_style_bg_color(s_auto_btn, UI_COLOR_ACCENT, 0);
+        set_toggle_colors(s_auto_btn, s_auto_icon, true);
     } else {
-        lv_obj_set_style_bg_color(s_auto_btn, lv_color_hex(0x3A3A5C), 0);
+        set_toggle_colors(s_auto_btn, s_auto_icon, false);
     }
 }
 
@@ -79,14 +87,14 @@ static void mute_btn_cb(lv_event_t *e)
     (void)e;
     s_muted = !s_muted;
     if (s_muted) {
-        lv_obj_set_style_bg_color(s_mute_btn, UI_COLOR_ACCENT, 0);
+        set_toggle_colors(s_mute_btn, s_mute_icon, true);
         lv_label_set_text(s_mute_icon, LV_SYMBOL_MUTE);
         /* 静音时将音量设为 0 */
         lv_slider_set_value(s_vol_slider, 0, LV_ANIM_ON);
         ui_get_device_state()->volume = 0;
         if (s_vol_cb) s_vol_cb(0);
     } else {
-        lv_obj_set_style_bg_color(s_mute_btn, lv_color_hex(0x3A3A5C), 0);
+        set_toggle_colors(s_mute_btn, s_mute_icon, false);
         lv_label_set_text(s_mute_icon, LV_SYMBOL_VOLUME_MID);
         /* 取消静音恢复到 50 */
         lv_slider_set_value(s_vol_slider, 50, LV_ANIM_ON);
@@ -146,7 +154,7 @@ static lv_obj_t *create_round_btn(lv_obj_t *parent, const char *text,
     lv_obj_t *btn = lv_obj_create(parent);
     lv_obj_set_size(btn, 64, 64);
     lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0x3A3A5C), 0);
+    lv_obj_set_style_bg_color(btn, UI_COLOR_CONTROL_BG, 0);
     lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
@@ -155,7 +163,7 @@ static lv_obj_t *create_round_btn(lv_obj_t *parent, const char *text,
 
     lv_obj_t *lbl = lv_label_create(btn);
     lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+    lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
     lv_obj_center(lbl);
     if (out_icon) *out_icon = lbl;
@@ -213,7 +221,7 @@ void ui_adj_panel_create(lv_obj_t *parent)
     /* 亮度图标 —— EYE_OPEN 代表亮度/可见度（LVGL 无太阳图标） */
     lv_obj_t *br_icon = lv_label_create(br_col);
     lv_label_set_text(br_icon, LV_SYMBOL_EYE_OPEN);
-    lv_obj_set_style_text_color(br_icon, lv_color_white(), 0);
+    lv_obj_set_style_text_color(br_icon, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(br_icon, &lv_font_montserrat_22, 0);
 
     s_bright_slider = create_vertical_slider(br_col, bright_slider_cb);
@@ -237,7 +245,7 @@ void ui_adj_panel_create(lv_obj_t *parent)
     /* 音量图标 */
     lv_obj_t *vol_icon = lv_label_create(vol_col);
     lv_label_set_text(vol_icon, LV_SYMBOL_VOLUME_MAX);
-    lv_obj_set_style_text_color(vol_icon, lv_color_white(), 0);
+    lv_obj_set_style_text_color(vol_icon, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(vol_icon, &lv_font_montserrat_22, 0);
 
     s_vol_slider = create_vertical_slider(vol_col, vol_slider_cb);

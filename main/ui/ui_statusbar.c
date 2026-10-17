@@ -129,7 +129,7 @@ void ui_statusbar_create(lv_obj_t *parent)
     /* 充电闪电符号，默认隐藏 */
     s_charge = lv_label_create(right);
     lv_label_set_text(s_charge, LV_SYMBOL_CHARGE);
-    lv_obj_set_style_text_color(s_charge, lv_color_hex(0xFFD700), 0);
+    lv_obj_set_style_text_color(s_charge, UI_COLOR_CHARGE, 0);
     lv_obj_set_style_text_font(s_charge, &lv_font_montserrat_14, 0);
     lv_obj_add_flag(s_charge, LV_OBJ_FLAG_HIDDEN);
 }

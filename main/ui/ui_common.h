@@ -28,18 +28,31 @@ extern "C" {
 #define UI_ANIM_PATH            lv_anim_path_ease_out
 
 /* ======================== 颜色主题 ======================== */
-/** 状态栏文字颜色 (白色，适合半透明黑色背景上显示) */
-#define UI_COLOR_STATUS_TEXT    lv_color_white()
-/** 面板半透明背景色的不透明度 (0-255)，增大使背景更不透明 */
+/* 全系统使用白色主色与中性黑灰，颜色只在此定义，避免页面/交互状态
+ * 各自残留蓝紫色。只调整 RGB，不改变尺寸、透明度或动画。
+ * 白色实心选中背景必须搭配 ON_ACCENT 黑字；浅色阅读页使用独立深色前景。
+ * 歌曲封面、模糊封面、图片/视频内容不属于 UI 调色板，不做去色。 */
+#define UI_COLOR_TEXT           lv_color_white()
+#define UI_COLOR_TEXT_SECONDARY lv_color_hex(0xCCCCCC)
+#define UI_COLOR_TEXT_MUTED     lv_color_hex(0x888888)
+#define UI_COLOR_TEXT_CAPTION   lv_color_hex(0xAAAAAA)
+#define UI_COLOR_PAGE_BG        lv_color_hex(0x141414)
+#define UI_COLOR_PAGE_BG_DARK   lv_color_hex(0x101010)
+#define UI_COLOR_CONTROL_BG     lv_color_hex(0x303030)
+#define UI_COLOR_LIST_ROW_BG    lv_color_hex(0x262626)
+#define UI_COLOR_ACCENT         lv_color_white()
+#define UI_COLOR_ON_ACCENT      lv_color_black()
+#define UI_COLOR_READING_BG     lv_color_white()
+#define UI_COLOR_READING_INK    lv_color_hex(0x333333)
+/** 状态栏白色文字，搭配原有半透明黑色背景。 */
+#define UI_COLOR_STATUS_TEXT    UI_COLOR_TEXT
+/** 充电状态保留金色，作为唯一的设备状态提示色。 */
+#define UI_COLOR_CHARGE        lv_color_hex(0xFFD700)
+/** 面板保持原有不透明度，仅将偏蓝背景改为中性深灰。 */
 #define UI_PANEL_BG_OPA         (LV_OPA_70)
-/** 面板背景颜色 (深灰) */
-#define UI_PANEL_BG_COLOR       lv_color_hex(0x1A1A2E)
-/** 高亮 / 选中态颜色 (蓝紫色调) */
-#define UI_COLOR_ACCENT         lv_color_hex(0x5B86E5)
-/** 滑条已填充部分颜色 */
-#define UI_COLOR_SLIDER_ACTIVE  lv_color_hex(0x5B86E5)
-/** 滑条未填充部分颜色 */
-#define UI_COLOR_SLIDER_BG      lv_color_hex(0x3A3A5C)
+#define UI_PANEL_BG_COLOR       lv_color_hex(0x1A1A1A)
+#define UI_COLOR_SLIDER_ACTIVE  UI_COLOR_ACCENT
+#define UI_COLOR_SLIDER_BG      lv_color_hex(0x484848)
 
 /* ======================== 状态栏参数 ======================== */
 /** 状态栏高度 (像素)，同时也是下拉手势的检测区域高度，增大使状态栏更高 */
