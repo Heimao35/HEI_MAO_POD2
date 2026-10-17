@@ -1,6 +1,7 @@
 #include "ui_lockscreen.h"
 #include "ui_statusbar.h"
 #include "sd_card.h"
+#include "music_player_adapter.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/jpeg_decode.h"
@@ -243,6 +244,9 @@ static void hide_anim_ready(lv_anim_t *a)
     s_visible = false;
     s_anim_running = false;
     ui_statusbar_show_time(true);
+    /* 解锁动画结束只投递补扫请求，不在 LVGL 回调内等待 SD。已成功扫描
+     * 的曲库不会重建；开机首次失败才由后台执行有限重试。 */
+    music_player_adapter_request_scan_if_needed();
 }
 
 static void anim_y_cb(void *obj, int32_t v)

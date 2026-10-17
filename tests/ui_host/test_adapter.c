@@ -17,6 +17,16 @@ static uint8_t backgrounds[4];
 static bool background_cached[4], interrupt_background, missing_cover;
 static unsigned background_refs[4];
 static uint32_t background_generated, background_published, background_cached_selects;
+static TickType_t test_ticks;
+static unsigned lock_failures, scan_failures, scan_calls, notify_calls, library_updates;
+static uint32_t scan_song_count=4, last_library_count;
+static bool replace_card_in_scan;
+static char last_library_status[128];
+static unsigned boot_anim_starts;
+bool ui_lockscreen_is_visible(void) { return true; }
+void ui_lockscreen_start_boot_anim(void) { ++boot_anim_starts; }
+void test_set_inserted(bool present);
+TickType_t xTaskGetTickCount(void) { return test_ticks; }
 
 bool lvgl_port_lock(uint32_t timeout)
 { (void)timeout; assert(!ui_locked && !sd_locked); ui_locked=true; return true; }
@@ -24,9 +34,13 @@ void lvgl_port_unlock(void) { assert(ui_locked); ui_locked=false; }
 bool sd_card_is_mounted(void) { return mounted; }
 uint32_t sd_card_get_generation(void) { return generation; }
 bool sd_card_io_lock(TickType_t ticks)
-{ (void)ticks; assert(!ui_locked && !sd_locked); sd_locked=true; return true; }
+{
+    assert(!ui_locked && !sd_locked);
+    if (lock_failures) { --lock_failures; test_ticks+=ticks; return false; }
+    sd_locked=true; return true;
+}
 void sd_card_io_unlock(void) { assert(sd_locked); sd_locked=false; }
-void xTaskNotifyGive(TaskHandle_t task) { (void)task; }
+void xTaskNotifyGive(TaskHandle_t task) { assert(task); ++notify_calls; }
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t ticks)
 { (void)clear; (void)ticks; return 0; }
 BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack,
@@ -51,8 +65,16 @@ esp_err_t music_library_get_item(uint32_t index, music_item_t *out)
 esp_err_t music_library_make_path(const music_item_t *item, const char *file,
                                   char *out, size_t size)
 { (void)item; snprintf(out,size,"%s",file); return ESP_OK; }
-esp_err_t music_library_scan(void) { return ESP_OK; }
-void music_library_reset(void) {}
+esp_err_t music_library_scan(void)
+{
+    assert(sd_locked && !ui_locked);
+    ++scan_calls;
+    if (replace_card_in_scan) { replace_card_in_scan=false; ++generation; }
+    if (scan_failures) { --scan_failures; count=0; return ESP_FAIL; }
+    count=scan_song_count;
+    return ESP_OK;
+}
+void music_library_reset(void) { count=0; }
 bool music_library_is_truncated(void) { return false; }
 esp_err_t music_library_get_page(uint32_t first, music_page_t *page)
 { (void)first; (void)page; return ESP_FAIL; }
@@ -130,7 +152,11 @@ void ui_music_player_show_song(uint32_t index, const char *title,
 void ui_music_player_set_lyrics(const char *text, uint32_t lines, bool truncated)
 { (void)text; (void)lines; (void)truncated; assert(ui_locked); ++lyric_published; }
 void ui_music_player_set_library(uint32_t songs, const char *status)
-{ (void)songs; (void)status; }
+{
+    assert(ui_locked && !sd_locked);
+    ++library_updates; last_library_count=songs;
+    snprintf(last_library_status,sizeof(last_library_status),"%s",status ? status : "");
+}
 void ui_music_player_set_page(const music_page_t *page) { (void)page; }
 void ui_music_player_bind(const ui_music_backend_t *backend) { (void)backend; }
 esp_err_t audio_player_probe(const char *path, audio_file_info_t *info)
@@ -163,6 +189,112 @@ static void reset(void)
     for (unsigned i=0;i<4;i++) assert(background_refs[i]==0);
     for (unsigned i=0;i<4;i++) assert(refs[i]==0);
 }
+/* Deterministic scheduling harness: no sleeping, threads, or actual SD writes.
+ * Keep the worker's real retry state and generation guards under test. */
+static void prepare_scan_test(uint32_t songs)
+{
+    reset();
+    ++generation;
+    mounted=true;
+    test_set_inserted(true);
+    s_worker=(void *)1;
+    s_seen_generation=UINT32_MAX;
+    s_scan_state=MUSIC_SCAN_PENDING;
+    s_scan_attempts=0;
+    s_scan_retry_delay=0;
+    s_scan_retry_start=0;
+    test_ticks=0;
+    lock_failures=scan_failures=scan_calls=notify_calls=library_updates=0;
+    scan_song_count=songs; count=0; ui_index=0;
+    replace_card_in_scan=false;
+    boot_anim_starts=0;
+    atomic_store(&s_scan_requested,false);
+    atomic_store(&s_requested_index,UINT32_MAX);
+    last_library_status[0]=0;
+}
+
+static void run_scan_tests(void)
+{
+    prepare_scan_test(4);
+    lock_failures=1; /* Boot animation owns the SD mutex for the first attempt. */
+    media_worker_step();
+    assert(s_scan_state==MUSIC_SCAN_WAIT_RETRY && s_scan_attempts==1 && scan_calls==0);
+    assert(!ui_locked && !sd_locked);
+    unsigned updates=library_updates;
+    media_worker_step(); /* Polling must not busy-retry before the backoff expires. */
+    assert(s_scan_attempts==1 && scan_calls==0 && library_updates==updates);
+    music_player_adapter_request_scan_if_needed();
+    media_worker_step(); /* Repeated unlock while waiting does not reset the retry budget. */
+    assert(s_scan_attempts==1 && scan_calls==0);
+    test_ticks=s_scan_retry_start+s_scan_retry_delay;
+    media_worker_step();
+    assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==1 && last_library_count==4);
+    assert(atomic_load(&s_requested_index)==0);
+    assert(notify_calls>=1);
+    for (unsigned i=0;i<4;i++) music_player_adapter_request_scan_if_needed();
+    updates=library_updates;
+    media_worker_step();
+    assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==1 && library_updates==updates);
+    puts("PASS first boot SD lock timeout recovers without reinsertion; unlock preserves a ready library");
+
+    prepare_scan_test(0);
+    media_worker_step();
+    assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==1 && last_library_count==0);
+    updates=library_updates;
+    for (unsigned i=0;i<4;i++) {
+        music_player_adapter_request_scan_if_needed(); media_worker_step();
+    }
+    assert(scan_calls==1 && library_updates==updates);
+    assert(atomic_load(&s_requested_index)==UINT32_MAX);
+    puts("PASS successful empty catalogue is ready, not an endlessly retried failure");
+
+    prepare_scan_test(4);
+    scan_failures=2;
+    for (unsigned i=0;i<3;i++) {
+        media_worker_step();
+        if (i<2) {
+            assert(s_scan_state==MUSIC_SCAN_WAIT_RETRY && scan_calls==i+1);
+            test_ticks=s_scan_retry_start+s_scan_retry_delay;
+        }
+    }
+    assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==3 && s_scan_attempts==3);
+    puts("PASS transient filesystem scan failures recover through bounded backoff");
+
+    prepare_scan_test(4);
+    lock_failures=10;
+    for (unsigned i=0;i<MUSIC_SCAN_MAX_ATTEMPTS;i++) {
+        media_worker_step(); test_ticks=s_scan_retry_start+s_scan_retry_delay;
+    }
+    assert(s_scan_state==MUSIC_SCAN_FAILED && scan_calls==0);
+    unsigned failures_left=lock_failures;
+    updates=library_updates;
+    for (unsigned i=0;i<10;i++) { test_ticks+=10000; media_worker_step(); }
+    assert(lock_failures==failures_left && library_updates==updates);
+    lock_failures=0;
+    music_player_adapter_request_scan_if_needed();
+    music_player_adapter_request_scan_if_needed();
+    media_worker_step();
+    assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==1 && s_scan_attempts==1);
+    puts("PASS repeated failures stop; a later unlock merges requests and retries without remounting");
+
+    prepare_scan_test(4);
+    replace_card_in_scan=true;
+    media_worker_step();
+    assert(s_scan_state!=MUSIC_SCAN_READY && last_library_count==0);
+    assert(atomic_load(&s_requested_index)==UINT32_MAX);
+    media_worker_step();
+    assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==2 && s_seen_generation==generation);
+    prepare_scan_test(4);
+    lock_failures=1; media_worker_step();
+    mounted=false; test_set_inserted(false); media_worker_step();
+    assert(s_seen_generation==UINT32_MAX && last_library_count==0);
+    mounted=true; test_set_inserted(true); ++generation;
+    media_worker_step();
+    assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==1 && last_library_count==4);
+    puts("PASS generation changes reject old scan results; removal cancels retry and reinsertion scans anew");
+    reset();
+}
+
 int main(void)
 {
     static char text[LYRIC_TEXT_BYTES+1];
@@ -219,6 +351,7 @@ int main(void)
     assert(!background_generated && !background_published && shown==1);
     reset();
     puts("PASS background follows foreground, cache hit, selection/card-change rejection and missing cover");
+    run_scan_tests();
     puts("ALL ADAPTER TESTS PASSED");
     return 0;
 }

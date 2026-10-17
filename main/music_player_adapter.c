@@ -5,6 +5,7 @@
 #include "music_background.h"
 #include "lyric_parser.h"
 #include "sd_card.h"
+#include "ui/ui_lockscreen.h"
 #include "ui/ui_music_player.h"
 #include "esp_heap_caps.h"
 #include "esp_lvgl_port.h"
@@ -24,7 +25,23 @@ static atomic_uint_fast32_t s_time_ms;
 static atomic_bool s_playing;
 static char *s_lyrics_text;
 static music_page_t s_page;
+/* 见过一次挂载不代表扫描成功：状态、重试和挂载代次必须分别记录。
+ * 这些字段只由单个媒体 worker 访问；UI 仅设置下面的原子请求标志。 */
 static uint32_t s_seen_generation = UINT32_MAX;
+typedef enum {
+    MUSIC_SCAN_PENDING,
+    MUSIC_SCAN_WAIT_RETRY,
+    MUSIC_SCAN_READY,
+    MUSIC_SCAN_FAILED,
+} music_scan_state_t;
+#define MUSIC_SCAN_MAX_ATTEMPTS 3U
+#define MUSIC_SCAN_RETRY_BASE_MS 1000U
+static music_scan_state_t s_scan_state = MUSIC_SCAN_PENDING;
+static unsigned s_scan_attempts;
+static TickType_t s_scan_retry_start;
+static TickType_t s_scan_retry_delay;
+static atomic_bool s_scan_requested;
+static bool s_boot_anim_pending;
 static atomic_uint_fast32_t s_requested_index;
 /* select 和发布都在 LVGL 锁内：序号用于拒绝先前点击的迟到结果。
  * 请求槽只保留最新索引，既有界，也允许同一首反复请求（包括单曲库）。 */
@@ -34,6 +51,14 @@ static atomic_bool s_lyrics_ready;
 static void notify_worker(void)
 {
     if (s_worker) xTaskNotifyGive(s_worker);
+}
+
+/* UI 可在解锁回调持有 LVGL 锁时调用。这里只投递请求，不等 SD 锁，
+ * 不读写文件；重复请求合并成一个标志，由 worker 判断是否需要补扫。 */
+void music_player_adapter_request_scan_if_needed(void)
+{
+    atomic_store(&s_scan_requested, true);
+    notify_worker();
 }
 
 static bool media_available(void);
@@ -96,7 +121,8 @@ static void publish_page(uint32_t first, uint32_t generation)
     if (ret != ESP_OK) return;
 
     lvgl_port_lock(0);
-    ui_music_player_set_page(&s_page);
+    if (media_available() && sd_card_get_generation() == generation)
+        ui_music_player_set_page(&s_page);
     lvgl_port_unlock();
 }
 
@@ -231,17 +257,30 @@ static void prefetch_neighbors(uint32_t index, uint32_t generation, uint32_t ser
     }
 }
 
-static void media_worker(void *arg)
+/* 发布前重新检查挂载代次，避免扫描结束到取得 LVGL 锁之间发生拔插，
+ * 将旧卡结果或错误覆盖到新卡。调用时不能持有 SD I/O 锁。 */
+static void publish_library_status(uint32_t generation, uint32_t count, const char *status)
 {
-    (void)arg;
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
-        bool available = media_available();
-        uint32_t generation = sd_card_get_generation();
+    lvgl_port_lock(0);
+    if (media_available() && sd_card_get_generation() == generation)
+        ui_music_player_set_library(count, status);
+    lvgl_port_unlock();
+}
 
-        if (available && generation != s_seen_generation) {
-            s_seen_generation = generation;
-            music_library_reset();
+/* 单次调度拆为独立函数，既保留单 worker 的串行 I/O，又允许主机测试
+ * 确定性模拟首次超时、退避、解锁补扫以及扫描过程中换卡。 */
+static void media_worker_step(void)
+{
+    bool requested = atomic_exchange(&s_scan_requested, false);
+    bool available = media_available();
+    uint32_t generation = sd_card_get_generation();
+
+    if (!available) {
+        if (s_seen_generation != UINT32_MAX) {
+            s_seen_generation = UINT32_MAX;
+            s_scan_state = MUSIC_SCAN_PENDING;
+            s_scan_attempts = 0;
+            s_boot_anim_pending = false;
             cover_loader_invalidate();
             music_background_invalidate();
             lvgl_port_lock(0);
@@ -251,60 +290,112 @@ static void media_worker(void *arg)
             atomic_store(&s_duration_sec, 0);
             atomic_store(&s_time_ms, 0);
             atomic_store(&s_playing, false);
-            ui_music_player_set_library(0, "正在扫描 SD 卡...");
+            ui_music_player_set_library(0, "请插入 SD 卡");
             lvgl_port_unlock();
-
-            if (lock_media(generation) == ESP_OK) {
-                esp_err_t ret = music_library_scan();
-                uint32_t count = music_library_get_count();
-                bool capped = music_library_is_truncated();
-                sd_card_io_unlock();
-                if (ret == ESP_OK && count) {
-                    lvgl_port_lock(0);
-                    ui_music_player_set_library(count, capped ? "歌曲列表已达上限" : "正在加载歌曲...");
-                    lvgl_port_unlock();
-                    publish_all_names(count, generation);
-                    /* Let the normal request path load the first song once;
-                     * this avoids decoding the first cover/LRC twice. */
-                    lvgl_port_lock(0);
-                    /* 如果发布歌名期间用户已经点了歌曲，保留用户选择。 */
-                    if (atomic_load(&s_requested_index) == UINT32_MAX) select_song(0);
-                    lvgl_port_unlock();
-                } else {
-                    lvgl_port_lock(0);
-                    ui_music_player_set_library(0, ret == ESP_OK ? "未找到歌曲" : "SD 卡扫描失败");
-                    lvgl_port_unlock();
-                }
-            }
-            continue;
         }
+        return;
+    }
 
-        if (!available) {
-            if (s_seen_generation != UINT32_MAX) {
-                s_seen_generation = UINT32_MAX;
-                cover_loader_invalidate();
-                music_background_invalidate();
-                lvgl_port_lock(0);
-                ++s_request_serial;
-                atomic_store(&s_requested_index, UINT32_MAX);
-                atomic_store(&s_lyrics_ready, false);
-                atomic_store(&s_duration_sec, 0);
-                atomic_store(&s_time_ms, 0);
-                atomic_store(&s_playing, false);
-                ui_music_player_set_library(0, "请插入 SD 卡");
-                lvgl_port_unlock();
-            }
-            continue;
-        }
-
-        /* 与 select 共用 LVGL 锁，使索引和请求序号成为一致的快照。
-         * 用 exchange 消费请求，不能按歌曲索引去重，否则重复选同一首会卡住转场。 */
+    if (generation != s_seen_generation) {
+        s_seen_generation = generation;
+        s_scan_state = MUSIC_SCAN_PENDING;
+        s_scan_attempts = 0;
+        s_boot_anim_pending = false;
+        music_library_reset();
+        cover_loader_invalidate();
+        music_background_invalidate();
         lvgl_port_lock(0);
-        uint32_t index = atomic_exchange(&s_requested_index, UINT32_MAX);
-        uint32_t serial = s_request_serial;
+        ++s_request_serial;
+        atomic_store(&s_requested_index, UINT32_MAX);
+        atomic_store(&s_lyrics_ready, false);
+        atomic_store(&s_duration_sec, 0);
+        atomic_store(&s_time_ms, 0);
+        atomic_store(&s_playing, false);
         lvgl_port_unlock();
-        if (index < music_library_get_count() && load_selected_song(index, generation, serial))
-            prefetch_neighbors(index, generation, serial);
+        publish_library_status(generation, 0, "正在扫描 SD 卡...");
+    }
+
+    /* 解锁仅用于兜底：成功（含零首歌曲）绝不重扫，不清空已有曲库或
+     * 当前歌曲；失败后允许新一轮有限尝试，退避期间的请求不跳过退避。 */
+    if (requested && s_scan_state == MUSIC_SCAN_FAILED) {
+        s_scan_state = MUSIC_SCAN_PENDING;
+        s_scan_attempts = 0;
+        publish_library_status(generation, 0, "正在扫描 SD 卡...");
+    }
+
+    if (s_scan_state != MUSIC_SCAN_READY) {
+        if (s_scan_state == MUSIC_SCAN_FAILED) return;
+        if (s_scan_state == MUSIC_SCAN_WAIT_RETRY &&
+            (TickType_t)(xTaskGetTickCount() - s_scan_retry_start) < s_scan_retry_delay) return;
+
+        ++s_scan_attempts;
+        esp_err_t ret = lock_media(generation);
+        if (ret == ESP_OK) {
+            ret = music_library_scan();
+            sd_card_io_unlock();
+        }
+        /* 换卡/拔卡交给下一轮挂载状态处理，不发布旧结果。 */
+        if (!media_available() || sd_card_get_generation() != generation) return;
+
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Music scan attempt %u/%u failed: %s", s_scan_attempts,
+                     MUSIC_SCAN_MAX_ATTEMPTS, esp_err_to_name(ret));
+            if (s_scan_attempts < MUSIC_SCAN_MAX_ATTEMPTS) {
+                s_scan_state = MUSIC_SCAN_WAIT_RETRY;
+                s_scan_retry_start = xTaskGetTickCount();
+                s_scan_retry_delay = pdMS_TO_TICKS(MUSIC_SCAN_RETRY_BASE_MS * s_scan_attempts);
+                publish_library_status(generation, 0, "正在等待 SD 卡，稍后重试...");
+            } else {
+                s_scan_state = MUSIC_SCAN_FAILED;
+                publish_library_status(generation, 0, "SD 卡扫描失败");
+            }
+            return;
+        }
+
+        /* 只有扫描真正成功才置 READY，零首歌曲也是成功结果，不能循环重扫。 */
+        s_scan_state = MUSIC_SCAN_READY;
+        uint32_t count = music_library_get_count();
+        bool capped = music_library_is_truncated();
+        s_boot_anim_pending = true;
+        publish_library_status(generation, count, count ?
+                               (capped ? "歌曲列表已达上限" : "正在加载歌曲...") : "未找到歌曲");
+        if (count) {
+            publish_all_names(count, generation);
+            lvgl_port_lock(0);
+            if (media_available() && sd_card_get_generation() == generation &&
+                atomic_load(&s_requested_index) == UINT32_MAX) select_song(0);
+            lvgl_port_unlock();
+        }
+        else if (s_boot_anim_pending && ui_lockscreen_is_visible()) {
+            /* 空曲库也算扫描成功；没有首首歌曲可等待时，立即启动动画。 */
+            s_boot_anim_pending = false;
+            ui_lockscreen_start_boot_anim();
+        }
+        return;
+    }
+
+    /* 成功曲库照常处理选歌；与 UI 使用相同的 LVGL 锁取得一致的请求快照。 */
+    lvgl_port_lock(0);
+    uint32_t index = atomic_exchange(&s_requested_index, UINT32_MAX);
+    uint32_t serial = s_request_serial;
+    lvgl_port_unlock();
+    if (index < music_library_get_count() && load_selected_song(index, generation, serial)) {
+        prefetch_neighbors(index, generation, serial);
+        /* 首首歌曲的封面、歌词和音频元数据已经读取完成后再启动动画，
+         * 避免动画任务与首首歌曲加载再次争用 SD I/O 锁。 */
+        if (s_boot_anim_pending && ui_lockscreen_is_visible()) {
+            s_boot_anim_pending = false;
+            ui_lockscreen_start_boot_anim();
+        }
+    }
+}
+
+static void media_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+        media_worker_step();
     }
 }
 
@@ -324,7 +415,7 @@ esp_err_t music_player_adapter_init(void)
     const ui_music_backend_t backend = {
         .select = select_song,
         .page = NULL,
-        .rescan = NULL,
+        .rescan = music_player_adapter_request_scan_if_needed,
         .get_time_ms = get_time_ms,
         .get_duration_sec = get_duration_sec,
         .get_lyric_line = get_lyric_line,

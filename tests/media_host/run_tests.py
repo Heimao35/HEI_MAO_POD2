@@ -187,7 +187,9 @@ def tests(lib):
     sysdir = Path("test_sd/HEI_MAO_POD_SYS")
     music = sysdir / "MUSIC"
     music.mkdir(parents=True)
-    (sysdir / ".hmcache").mkdir()
+    # Reproduce an absent cache directory after first-mount directory creation
+    # was incomplete. The actual scanner must create it on this attempt.
+    assert not (sysdir / ".hmcache").exists()
     for i in range(1300):
         d = music / f"song{i:04d}"
         d.mkdir()
@@ -219,7 +221,7 @@ def tests(lib):
             assert item.audio == b"Track.FLAC" and item.cover == b"track.JPG" and item.lyric == b"TRACK.LRC"
     assert lib.music_library_get_item(1301, C.byref(item)) != 0
     assert lib.music_library_scan() == 0 and lib.music_library_get_count() == 1301
-    print("PASS 1301-song disk index, 8-row transfer pages, uppercase extensions, same-stem sidecars, rescan")
+    print("PASS missing-cache-directory recovery, 1301-song disk index, 8-row pages, sidecars and rescan")
 
     with open(sysdir / ".hmcache/music.idx", "r+b") as f:
         f.write(b"x"*256)  # missing NUL in untrusted cache

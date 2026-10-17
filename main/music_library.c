@@ -99,9 +99,23 @@ esp_err_t music_library_scan(void)
     music_library_reset();
     DIR *dir = opendir(MUSIC_DIR);
     if (!dir) { ESP_LOGW(TAG, "Cannot open %s: errno=%d", MUSIC_DIR, errno); return ESP_FAIL; }
+    /* 首次挂载的目录创建若曾暂时失败，在后台重试时重新确认索引目录。
+     * 不格式化卡，不修改音频；仅使用原有可丢弃缓存目录和索引。 */
+#ifdef _WIN32
+    int mkdir_ret = mkdir(SD_SYS_DIR "/.hmcache"); /* MinGW host regression harness */
+#else
+    int mkdir_ret = mkdir(SD_SYS_DIR "/.hmcache", 0755);
+#endif
+    if (mkdir_ret != 0 && errno != EEXIST) {
+        int saved_errno = errno;
+        ESP_LOGE(TAG, "Cannot create index directory: errno=%d", saved_errno);
+        closedir(dir);
+        return ESP_FAIL;
+    }
     FILE *index = fopen(INDEX_PATH, "wb");
     if (!index) {
-        ESP_LOGE(TAG, "Cannot create bounded disk index (check free space/write protection)");
+        int saved_errno = errno;
+        ESP_LOGE(TAG, "Cannot create bounded disk index: errno=%d", saved_errno);
         closedir(dir); return ESP_FAIL;
     }
     struct dirent *e;
@@ -111,18 +125,31 @@ esp_err_t music_library_scan(void)
     while (sd_card_is_present()) {
         errno = 0;
         e = readdir(dir);
-        if (!e) { if (errno) result = ESP_FAIL; break; }
+        if (!e) {
+            if (errno) {
+                ESP_LOGW(TAG, "Music directory read failed: errno=%d", errno);
+                result = ESP_FAIL;
+            }
+            break;
+        }
         if (!(++visited % 16)) vTaskDelay(1);
         if (e->d_name[0] == '.' || !is_type(MUSIC_DIR, e, true)) continue;
         memset(&item, 0, sizeof(item));
         if (!copy_name(item.name, e->d_name) || !scan_folder(&item)) continue;
         if (s_count >= MUSIC_INDEX_MAX_BYTES / sizeof(item)) { s_truncated = true; break; }
-        if (fwrite(&item, sizeof(item), 1, index) != 1) { result = ESP_FAIL; break; }
+        if (fwrite(&item, sizeof(item), 1, index) != 1) {
+            ESP_LOGW(TAG, "Index write failed at song %lu: errno=%d", (unsigned long)s_count, errno);
+            result = ESP_FAIL;
+            break;
+        }
         ++s_count;
         if (!(s_count % 128)) ESP_LOGI(TAG, "Indexed %lu songs", (unsigned long)s_count);
     }
     if (!sd_card_is_present()) result = ESP_ERR_INVALID_STATE;
-    if (fclose(index) != 0) result = ESP_FAIL;
+    if (fclose(index) != 0) {
+        ESP_LOGW(TAG, "Index close failed: errno=%d", errno);
+        result = ESP_FAIL;
+    }
     closedir(dir);
     if (result != ESP_OK) music_library_reset();
     ESP_LOGI(TAG, "Scan: %lu songs, capped=%d, result=%s", (unsigned long)s_count,

@@ -319,10 +319,7 @@ void app_main(void)
     esp_err_t ret = music_player_adapter_init();
     if (ret != ESP_OK) ESP_LOGE(TAG, "Music integration failed: %s", esp_err_to_name(ret));
 
-    /* 如果 SD 卡已挂载且锁屏可见，启动开机动画 */
-    if (sd_card_is_mounted()) {
-        lvgl_port_lock(0);
-        ui_lockscreen_start_boot_anim();
-        lvgl_port_unlock();
-    }
+    /* 开机动画由音乐 worker 在首次 SD 曲库扫描和首首歌曲信息加载完成后
+     * 启动。这里不再与首次扫描并行启动，避免动画读取 MJPEG 时抢占 SD
+     * I/O 锁，导致音乐扫描在冷启动阶段超时。 */
 }
