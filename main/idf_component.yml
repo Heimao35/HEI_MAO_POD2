@@ -12,3 +12,6 @@ dependencies:
   espressif/esp_lcd_co5300:
     version: 2.0.*
     public: true
+  espressif/esp_audio_codec:
+    version: 2.*
+    public: false

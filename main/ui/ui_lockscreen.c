@@ -47,8 +47,21 @@ static void mjpeg_anim_task(void *arg)
 {
     (void)arg;
 
+    /* Share SD handle lifetime protection with the music worker. */
+    if (!sd_card_io_lock(portMAX_DELAY)) {
+        s_anim_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!sd_card_is_mounted() || !sd_card_is_present()) {
+        sd_card_io_unlock();
+        s_anim_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
     FILE *fp = fopen(MJPEG_PATH, "rb");
     if (!fp) {
+        sd_card_io_unlock();
         ESP_LOGW(TAG, "No boot animation file: %s", MJPEG_PATH);
         s_anim_running = false;
         vTaskDelete(NULL);
@@ -62,6 +75,7 @@ static void mjpeg_anim_task(void *arg)
     if (file_size <= 0 || file_size > 4 * 1024 * 1024) {
         ESP_LOGW(TAG, "MJPEG file size invalid: %ld", file_size);
         fclose(fp);
+        sd_card_io_unlock();
         s_anim_running = false;
         vTaskDelete(NULL);
         return;
@@ -71,6 +85,7 @@ static void mjpeg_anim_task(void *arg)
     if (!file_buf) {
         ESP_LOGE(TAG, "Failed to alloc %ld bytes for MJPEG", file_size);
         fclose(fp);
+        sd_card_io_unlock();
         s_anim_running = false;
         vTaskDelete(NULL);
         return;
@@ -78,6 +93,7 @@ static void mjpeg_anim_task(void *arg)
 
     size_t actually_read = fread(file_buf, 1, file_size, fp);
     fclose(fp);
+    sd_card_io_unlock();
 
     if ((long)actually_read != file_size) {
         ESP_LOGW(TAG, "MJPEG read incomplete: %u / %ld", (unsigned)actually_read, file_size);

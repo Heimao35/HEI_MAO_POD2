@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include <sys/stat.h>
 #include <string.h>
+#include <stdatomic.h>
 
 static const char *TAG = "sd_card";
 
@@ -17,7 +18,9 @@ static const char *TAG = "sd_card";
 #define DEBOUNCE_MS    200
 
 static sdmmc_card_t *s_card = NULL;
-static bool s_mounted = false;
+static atomic_bool s_mounted = false;
+static atomic_uint s_generation = 0;
+static SemaphoreHandle_t s_io_mutex;
 static SemaphoreHandle_t s_evt_sem = NULL;
 
 static bool card_inserted(void)
@@ -49,7 +52,8 @@ static void create_sys_dirs(void)
 
 static esp_err_t do_mount(void)
 {
-    if (s_mounted) return ESP_OK;
+    if (!sd_card_io_lock(portMAX_DELAY)) return ESP_ERR_INVALID_STATE;
+    if (s_mounted) { sd_card_io_unlock(); return ESP_OK; }
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
@@ -71,12 +75,15 @@ static esp_err_t do_mount(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(ret));
         s_card = NULL;
+        sd_card_io_unlock();
         return ret;
     }
 
-    s_mounted = true;
     sdmmc_card_print_info(stdout, s_card);
     create_sys_dirs();
+    ++s_generation;
+    s_mounted = true;
+    sd_card_io_unlock();
 
     lvgl_port_lock(0);
     ui_get_device_state()->sd_card_inserted = true;
@@ -88,11 +95,14 @@ static esp_err_t do_mount(void)
 
 static void do_unmount(void)
 {
-    if (!s_mounted) return;
+    if (!sd_card_io_lock(portMAX_DELAY)) return;
+    if (!s_mounted) { sd_card_io_unlock(); return; }
 
     esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
     s_card = NULL;
     s_mounted = false;
+    ++s_generation;
+    sd_card_io_unlock();
 
     lvgl_port_lock(0);
     ui_get_device_state()->sd_card_inserted = false;
@@ -113,7 +123,7 @@ static void sd_detect_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        xSemaphoreTake(s_evt_sem, portMAX_DELAY);
+        xSemaphoreTake(s_evt_sem, pdMS_TO_TICKS(1000));
         vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
 
         bool inserted = card_inserted();
@@ -129,7 +139,15 @@ static void sd_detect_task(void *arg)
 
 esp_err_t sd_card_init(void)
 {
+    if (s_io_mutex) return ESP_ERR_INVALID_STATE;
+    s_io_mutex = xSemaphoreCreateMutex();
     s_evt_sem = xSemaphoreCreateBinary();
+    if (!s_io_mutex || !s_evt_sem) {
+        if (s_io_mutex) vSemaphoreDelete(s_io_mutex);
+        if (s_evt_sem) vSemaphoreDelete(s_evt_sem);
+        s_io_mutex = NULL; s_evt_sem = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 
     gpio_config_t io_cfg = {
         .pin_bit_mask = 1ULL << CARD_DET_GPIO,
@@ -138,14 +156,16 @@ esp_err_t sd_card_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_ANYEDGE,
     };
-    gpio_config(&io_cfg);
-    gpio_isr_handler_add(CARD_DET_GPIO, card_det_isr, NULL);
-
-    xTaskCreate(sd_detect_task, "sd_det", 4096, NULL, 2, NULL);
+    esp_err_t ret = gpio_config(&io_cfg);
+    if (ret != ESP_OK) return ret;
+    ret = gpio_isr_handler_add(CARD_DET_GPIO, card_det_isr, NULL);
+    if (ret != ESP_OK) ESP_LOGW(TAG, "Card IRQ unavailable; polling enabled");
 
     if (card_inserted()) {
         do_mount();
     }
+    if (xTaskCreate(sd_detect_task, "sd_det", 4096, NULL, 2, NULL) != pdPASS)
+        return ESP_ERR_NO_MEM;
     return ESP_OK;
 }
 
@@ -158,3 +178,11 @@ void sd_card_poll_detect(void)
 {
     /* kept for API compat, no longer needed with interrupt-based detection */
 }
+
+bool sd_card_is_present(void) { return card_inserted(); }
+uint32_t sd_card_get_generation(void) { return s_generation; }
+bool sd_card_io_lock(TickType_t timeout)
+{
+    return s_io_mutex && xSemaphoreTake(s_io_mutex, timeout) == pdTRUE;
+}
+void sd_card_io_unlock(void) { xSemaphoreGive(s_io_mutex); }

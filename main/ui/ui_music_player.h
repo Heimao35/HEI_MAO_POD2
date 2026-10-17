@@ -12,7 +12,7 @@
  * 手势：
  *   - 点击封面：切换歌词/封面显示
  *   - 非边缘左右滑：切换上一首/下一首
- *   - 任意位置上滑：展开歌曲列表
+ *   - 歌词视口外上滑：展开歌曲列表
  *   - 歌曲列表中上边缘下滑：收起歌曲列表
  */
 
@@ -20,6 +20,8 @@
 #define UI_MUSIC_PLAYER_H
 
 #include "ui_common.h"
+#include "../music_library.h"
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +32,27 @@ extern "C" {
  * @param parent 父对象
  */
 void ui_music_player_create(lv_obj_t *parent);
+
+typedef struct {
+    void (*select)(uint32_t index);
+    void (*page)(uint32_t first);
+    void (*rescan)(void);
+    uint32_t (*get_time_ms)(void);
+    uint32_t (*get_duration_sec)(void);
+    uint32_t (*get_lyric_line)(uint32_t time_ms);
+    bool (*is_playing)(void);
+} ui_music_backend_t;
+
+void ui_music_player_bind(const ui_music_backend_t *backend);
+void ui_music_player_set_library(uint32_t count, const char *status);
+void ui_music_player_set_page(const music_page_t *page);
+void ui_music_player_show_song(uint32_t index, const char *title,
+                               const uint8_t *cover, uint32_t duration_sec);
+/** 后台发布前检查动画阶段；以下接口均须持有 LVGL 锁。 */
+bool ui_music_player_can_show_song(uint32_t index);
+/** 歌名/封面/歌词发布完成（失败时发布占位也须通知），释放离屏等待。 */
+void ui_music_player_song_ready(uint32_t index);
+void ui_music_player_set_lyrics(const char *text, uint32_t line_count, bool truncated);
 
 /**
  * @brief 获取音乐播放器页面容器（用于页面切换管理）
@@ -77,6 +100,11 @@ void ui_music_player_set_callbacks(ui_music_ctrl_cb_t on_prev,
  * @return true=歌曲列表可见
  */
 bool ui_music_player_is_playlist_visible(void);
+
+/** Returns true while the cover area is showing the vertically scrollable lyrics. */
+bool ui_music_player_is_lyric_visible(void);
+/** Tests whether a screen coordinate is inside the visible lyric viewport. */
+bool ui_music_player_is_lyric_point(int32_t x, int32_t y);
 
 /**
  * @brief 带滑动动画切换到下一首歌曲（用于手势触发）

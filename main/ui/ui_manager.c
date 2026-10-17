@@ -181,6 +181,16 @@ static void gesture_released_cb(lv_event_t *e)
     }
 
     /* ---- 音乐播放器下的手势 ---- */
+    /*
+     * 歌词区域内的竖向拖动由 LVGL 原生滚动接管，不展开歌曲列表。
+     * 按手势起点判断，避免手指滑出视口后突然展开列表；横向手势
+     * 仍保留原有的上一首/下一首操作，其他区域展开/收起规则不变。
+     */
+    if (s_current_mode == UI_MODE_MUSIC &&
+        ui_music_player_is_lyric_point(s_press_point.x, s_press_point.y) && !is_horizontal) {
+        return;
+    }
+
     if (s_current_mode == UI_MODE_MUSIC) {
         /* 非边缘上滑 → 展开歌曲列表 */
         if (!is_horizontal && dy < -GESTURE_MIN_DIST &&

@@ -21,6 +21,7 @@
 #include "ui_adj_panel.h"
 #include "ui_lockscreen.h"
 #include "sd_card.h"
+#include "music_player_adapter.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (460)
@@ -304,12 +305,19 @@ void app_main(void)
 
     lvgl_port_unlock();
 
-    /* SD card initialization (interrupt-based hot-plug, non-blocking) */
+    /* Initial SD mount, followed by interrupt/poll-based hot-plug detection. */
     /* 放在 UI 初始化之后，确保 lockscreen 等 UI 对象已创建 */
-    sd_card_init();
+    esp_err_t sd_ret = sd_card_init();
+    if (sd_ret != ESP_OK) ESP_LOGE(TAG, "SD init failed: %s", esp_err_to_name(sd_ret));
+
+    /* Background SD catalogue/cover/LRC loader. No fake decoder or DAC task. */
+    esp_err_t ret = music_player_adapter_init();
+    if (ret != ESP_OK) ESP_LOGE(TAG, "Music integration failed: %s", esp_err_to_name(ret));
 
     /* 如果 SD 卡已挂载且锁屏可见，启动开机动画 */
     if (sd_card_is_mounted()) {
+        lvgl_port_lock(0);
         ui_lockscreen_start_boot_anim();
+        lvgl_port_unlock();
     }
 }

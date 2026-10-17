@@ -1,5 +1,10 @@
 idf_component_register(SRCS "main.c"
                               "sd_card.c"
+                              "music_library.c"
+                              "audio_player.c"
+                              "lyric_parser.c"
+                              "cover_loader.c"
+                              "music_player_adapter.c"
                               "ui/ui_common.c"
                               "ui/ui_statusbar.c"
                               "ui/ui_lockscreen.c"
@@ -15,4 +20,5 @@ idf_component_register(SRCS "main.c"
                     PRIV_REQUIRES fatfs sdmmc esp_driver_jpeg
                                   esp_lcd esp_lcd_touch_cst820
                                   esp_hw_support driver
-                                  esp_lvgl_port)
+                                  esp_lvgl_port
+                                  esp_audio_codec)

@@ -9,6 +9,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.5.3
+  espressif/esp_audio_codec:
+    component_hash: a5b9275af74247e3ce536d16a7080e4d77207a185b63e1bea368eb4d57176c2b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.6.2
   espressif/esp_lcd_co5300:
     component_hash: 7004162c496b65a5e0ee7c92800c33c12b373ea70d07199318a182cb16c741b7
     dependencies:
@@ -59,11 +69,12 @@ dependencies:
       type: service
     version: 9.4.0
 direct_dependencies:
+- espressif/esp_audio_codec
 - espressif/esp_lcd_co5300
 - espressif/esp_lcd_touch
 - espressif/esp_lvgl_port
 - idf
 - lvgl/lvgl
-manifest_hash: 632122deab5b9e18aba7fffd9b52e71be7f9f511750c425f3196d2592dbf4830
+manifest_hash: bb7ea6c5da88c182dcb03e31a17bad028d4a6f6982a82ab03c8c84aa04bec570
 target: esp32p4
 version: 2.0.0
