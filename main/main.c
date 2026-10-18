@@ -13,6 +13,8 @@
 #include "esp_ldo_regulator.h"
 #include "esp_lvgl_port.h"
 #include "screen_power.h"
+#include "system_power.h"
+#include "player_settings.h"
 #include "volume_keys.h"
 
 #include "esp_lcd_co5300.h"
@@ -292,8 +294,13 @@ void app_main(void)
     /* LVGL initialization */
     ESP_ERROR_CHECK(app_lvgl_init());
 
+    /* 设置在 UI 创建前从 Flash 读取；失败保留 NVS 原数据并沿用默认设置。 */
+    esp_err_t settings_ret=player_settings_init();
+    if (settings_ret!=ESP_OK) ESP_LOGW(TAG,"Settings unavailable: %s",esp_err_to_name(settings_ret));
+
     /* Show LVGL objects */
     lvgl_port_lock(0);
+    player_settings_restore_ui();
 
     /* Mount and load the build-time font assets before any label is created. */
     esp_err_t font_ret = ui_fonts_init();
@@ -301,6 +308,7 @@ void app_main(void)
 
     /* 初始化自定义 UI 系统（替换原有 demo） */
     ui_manager_init();
+    ui_adj_panel_update(); /* 同步恢复的音量/亮度及静音/自动亮度图标。 */
 
     /* 注册亮度回调，滑条拖动时实际调节屏幕亮度 */
     ui_adj_panel_set_callbacks(screen_power_set_brightness, NULL);
@@ -310,7 +318,8 @@ void app_main(void)
     /* PMIC readings run on I2C1 in a separate worker. Start after UI objects
      * exist, outside the LVGL lock; an unavailable PMIC leaves an unknown
      * battery indication and is retried without blocking media startup. */
-    pmic_axp2101_set_key_callback(screen_power_key_short_press);
+    pmic_axp2101_set_key_callback(system_power_key_short);
+    pmic_axp2101_set_key_edge_callback(system_power_key_edge);
     esp_err_t pmic_ret = pmic_axp2101_init();
     if (pmic_ret != ESP_OK) ESP_LOGE(TAG, "PMIC monitor init failed: %s", esp_err_to_name(pmic_ret));
 
@@ -327,6 +336,9 @@ void app_main(void)
      * LVGL 正常输入，仅在熄屏时截获唤醒。所有硬件操作均在锁外执行。 */
     esp_err_t power_ret = screen_power_init(lvgl_disp, lvgl_touch_indev, lcd_panel, touch_handle);
     if (power_ret != ESP_OK) ESP_LOGE(TAG, "Screen power init failed: %s", esp_err_to_name(power_ret));
+
+    esp_err_t system_ret=system_power_init();
+    if (system_ret!=ESP_OK) ESP_LOGE(TAG,"System power init failed: %s",esp_err_to_name(system_ret));
 
     /* 音量键与触摸滑条共享设备音量和回调；UI 和熄屏状态机就绪后再接入。 */
     esp_err_t keys_ret = volume_keys_init();

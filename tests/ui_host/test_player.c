@@ -15,6 +15,7 @@ const lv_font_t *ui_font_18(void) { return &lv_font_montserrat_18; }
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 
 bool ui_settings_is_visible(void) { return false; }
+bool ui_power_dialog_is_visible(void) { return false; }
 bool ui_lockscreen_is_visible(void) { return false; }
 bool ui_mode_panel_is_visible(void) { return false; }
 static bool test_adj_visible, test_adj_modal;
@@ -457,6 +458,13 @@ int main(void)
     ui_music_player_set_library(0,NULL);
     assert(!lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));
     assert(!strcmp(lv_label_get_text(s_playlist_empty_lbl),"未找到歌曲"));
+    ui_music_player_set_library(3,"restored");
+    ui_music_player_restore_selection(2);
+    assert(s_current_idx==2 && ui_music_player_can_show_song(2));
+    ui_music_player_show_song(2,"restored song",NULL,123);
+    assert(!strcmp(lv_label_get_text(s_title_lbl),"restored song"));
+    ui_music_player_restore_selection(99); assert(s_current_idx==2);
+    ui_music_player_set_library(0,NULL);
     puts("PASS empty playlist status, no SD, scan results and reinserted card");
     for (unsigned i=0;i<3;i++) assert(!background_refs[i]);
     puts("ALL PLAYER UI TESTS PASSED");

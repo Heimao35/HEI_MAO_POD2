@@ -51,12 +51,65 @@ static const char *TAG = "axp2101";
  * These masks control notifications, not the PMIC's hardware protection,
  * charging algorithm or power-key shutdown behavior. When adding key/fault
  * handling, extend both these masks and the IRQ consumer together.
- * 0: SOC warning levels + Gauge New SOC; 1: VBUS/battery + short power key;
+ * 0: SOC warning levels + Gauge New SOC; 1: VBUS/battery + short/down/up power key;
  * 2: charging start/done. Other pending bits are left untouched. */
-static const uint8_t s_irq_masks[3] = {0xD0, 0xF8, 0x18};
+static const uint8_t s_irq_masks[3] = {0xD0, 0xFB, 0x18};
 #define IRQ_POWER_KEY_SHORT (1U << 3)
 static TaskHandle_t s_worker;
 static void (*s_key_callback)(void);
+static void (*s_key_edge_callback)(bool pressed);
+enum {
+    POWER_ACTION_IDLE,
+    POWER_ACTION_OFF_REQUESTED,
+    POWER_ACTION_RESTART_REQUESTED,
+    POWER_ACTION_EXECUTING,
+    POWER_ACTION_DONE,
+};
+static atomic_uint s_power_action_state;
+static atomic_int s_power_action_result;
+/* PMIC 上电/重启留下的 IRQ 不属于本次运行中的新按键。只在首次成功
+ * 读取并清除按键状态时建立基线，普通监测 I2C 重试不能重新吞掉用户按键。 */
+static bool s_key_events_armed;
+
+void pmic_axp2101_set_key_edge_callback(void (*callback)(bool))
+{
+    s_key_edge_callback = callback;
+}
+
+/* 关机/整机重启共用唯一 PMIC worker 的命令入口。请求种类直接编码在
+ * 同一原子字中，不能先发布请求、再填写参数，以免双核任务领取错误动作。 */
+static esp_err_t request_power_action(unsigned requested)
+{
+    if (!s_worker) return ESP_ERR_INVALID_STATE;
+    unsigned expected = POWER_ACTION_IDLE;
+    if (!atomic_compare_exchange_strong(&s_power_action_state, &expected, requested))
+        return ESP_ERR_INVALID_STATE;
+    xTaskNotifyGive(s_worker);
+    /* 尚未执行的超时请求必须撤销，避免界面恢复后迟到的命令突然断电。
+     * 已领取的命令只包含两个各100ms超时的I2C事务，等待其明确结果；
+     * 不能宣称撤销已经送达芯片的断电/重启动作。 */
+    for (unsigned i = 0;; ++i) {
+        unsigned state = atomic_load(&s_power_action_state);
+        if (state == POWER_ACTION_DONE) {
+            esp_err_t ret = atomic_load(&s_power_action_result);
+            atomic_store(&s_power_action_state, POWER_ACTION_IDLE);
+            return ret;
+        }
+        if (i >= 100 && state == requested) {
+            expected = requested;
+            if (atomic_compare_exchange_strong(&s_power_action_state, &expected, POWER_ACTION_IDLE))
+                return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+esp_err_t pmic_axp2101_poweroff(void)
+{ return request_power_action(POWER_ACTION_OFF_REQUESTED); }
+
+esp_err_t pmic_axp2101_restart(void)
+{ return request_power_action(POWER_ACTION_RESTART_REQUESTED); }
+
 static atomic_bool s_monitor_paused;
 static atomic_bool s_monitor_busy;
 
@@ -153,8 +206,13 @@ static esp_err_t initialize_power_outputs(void)
 
 static esp_err_t configure_monitor(void)
 {
+    /* 原厂手册 pp.36/38：OFFLEVEL=10s；使能硬件长按并选择断电。
+     * 保留 ONLEVEL、IRQLEVEL、过温保护；软件独立计时六秒弹窗。 */
+    esp_err_t ret = update_field_checked(0x27, 0x0C, 0x0C);
+    if (ret == ESP_OK) ret = update_field_checked(0x22, 0x03, 0x02);
+    if (ret != ESP_OK) return ret;
     uint8_t modules;
-    esp_err_t ret = read_register(REG_MODULE_ENABLE, &modules);
+    ret = read_register(REG_MODULE_ENABLE, &modules);
     if (ret != ESP_OK) return ret;
     if (!(modules & GAUGE_ENABLE)) {
         ret = write_register(REG_MODULE_ENABLE, modules | GAUGE_ENABLE);
@@ -182,16 +240,29 @@ static esp_err_t acknowledge_irqs(void)
             pending[bank] &= s_irq_masks[bank];
         }
         for (unsigned bank = 0; bank < 3; ++bank) {
-            if (!pending[bank]) continue;
-            esp_err_t ret = write_register(REG_IRQ_STATUS0 + bank, pending[bank]);
-            if (ret != ESP_OK) return ret;
-            handled = true;
+            if (pending[bank]) {
+                esp_err_t ret = write_register(REG_IRQ_STATUS0 + bank, pending[bank]);
+                if (ret != ESP_OK) return ret;
+                handled = true;
+            }
             /* 0x49[3] is the PMIC's debounced short-press event. Dispatch only
              * after successful RW1C acknowledgement, so an I2C retry cannot
-             * deliver the same press twice. Long-press shutdown policy stays
-             * untouched. Never perform UI or sleep work in this callback. */
-            if (bank == 1 && (pending[bank] & IRQ_POWER_KEY_SHORT) && s_key_callback)
-                s_key_callback();
+             * deliver the same press twice. Never perform UI or sleep work
+             * in these callbacks. */
+            if (bank == 1) {
+                /* 首次快照可能同时带着开机用的按下/释放/短按。先W1C
+                 * 消费但不转发；若ACK失败保持未就绪，下轮继续清理。
+                 * 之后真正的电量/VBUS事件和新按键仍按原路径处理。 */
+                if (!s_key_events_armed) {
+                    s_key_events_armed = true;
+                    continue;
+                }
+                /* 边沿位不是实时电平。合并时按下再释放，不推测丢失的
+                 * 持续时间；硬件十秒断电完全独立于软件计时。 */
+                if ((pending[bank] & 0x02) && s_key_edge_callback) s_key_edge_callback(true);
+                if ((pending[bank] & 0x01) && s_key_edge_callback) s_key_edge_callback(false);
+                if ((pending[bank] & IRQ_POWER_KEY_SHORT) && s_key_callback) s_key_callback();
+            }
         }
         if (!handled || gpio_get_level(PMIC_IRQ_GPIO) != 0) break;
     }
@@ -295,11 +366,29 @@ static void IRAM_ATTR pmic_irq_handler(void *arg)
     if (woken) portYIELD_FROM_ISR();
 }
 
+/* 原厂手册 pp.21/32：0x10[0] Soft PWROFF；0x10[1] 整机
+ * POWOFF/POWON并复位相关寄存器。两命令互斥；高六位完整保留。
+ * 重启不使用esp_restart，不改变十秒长按仍为强制关机的硬件策略。 */
+static void service_power_action(void)
+{
+    unsigned requested = atomic_load(&s_power_action_state);
+    if (requested != POWER_ACTION_OFF_REQUESTED && requested != POWER_ACTION_RESTART_REQUESTED) return;
+    unsigned expected = requested;
+    if (!atomic_compare_exchange_strong(&s_power_action_state, &expected, POWER_ACTION_EXECUTING)) return;
+    uint8_t value;
+    esp_err_t ret = read_register(0x10, &value);
+    const uint8_t command = requested == POWER_ACTION_RESTART_REQUESTED ? 0x02 : 0x01;
+    if (ret == ESP_OK) ret = write_register(0x10, (value & (uint8_t)~0x03) | command);
+    atomic_store(&s_power_action_result, ret);
+    atomic_store(&s_power_action_state, POWER_ACTION_DONE);
+}
+
 static void monitor_task(void *arg)
 {
     (void)arg;
     for (;;) {
         esp_err_t ret = ESP_OK;
+        service_power_action();
         atomic_store(&s_monitor_busy, true);
         if (!atomic_load(&s_monitor_paused)) ret = monitor_step();
         atomic_store(&s_monitor_busy, false);

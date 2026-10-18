@@ -97,6 +97,7 @@ static void vol_slider_cb(lv_event_t *e)
     /* 静音时手动拖滑条 → 自动解除静音 */
     if (s_muted && val > 0) {
         s_muted = false;
+        ui_get_device_state()->muted = false;
         set_toggle_colors(s_mute_btn, s_mute_icon, false);
         lv_label_set_text(s_mute_icon, LV_SYMBOL_VOLUME_MID);
     }
@@ -123,6 +124,7 @@ static void mute_btn_cb(lv_event_t *e)
     (void)e;
     volume_activity();
     s_muted = !s_muted;
+    ui_get_device_state()->muted = s_muted;
     if (s_muted) {
         set_toggle_colors(s_mute_btn, s_mute_icon, true);
         lv_label_set_text(s_mute_icon, LV_SYMBOL_MUTE);
@@ -424,6 +426,14 @@ bool ui_adj_panel_is_modal(void) { return s_visible && !s_volume_only; }
 void ui_adj_panel_update(void)
 {
     ui_device_state_t *st = ui_get_device_state();
+    /* 开机从 NVS 恢复后同时刷新滑条和按钮，避免逻辑已静音但图标未选中。
+     * 此处只渲染，不发送回调，不触发持久化写入或自动亮度切换。 */
+    s_muted = st->muted;
+    if (s_auto_btn) set_toggle_colors(s_auto_btn, s_auto_icon, st->auto_brightness);
+    if (s_mute_btn) {
+        set_toggle_colors(s_mute_btn, s_mute_icon, s_muted);
+        lv_label_set_text(s_mute_icon, s_muted ? LV_SYMBOL_MUTE : LV_SYMBOL_VOLUME_MID);
+    }
     if (s_bright_slider) lv_slider_set_value(s_bright_slider, st->brightness, LV_ANIM_OFF);
     if (s_vol_slider)    lv_slider_set_value(s_vol_slider, st->volume, LV_ANIM_OFF);
 }

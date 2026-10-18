@@ -23,6 +23,13 @@ static uint32_t scan_song_count=4, last_library_count;
 static bool replace_card_in_scan;
 static char last_library_status[128];
 static unsigned boot_anim_starts;
+static char saved_folder[MUSIC_NAME_MAX], saved_audio[MUSIC_NAME_MAX];
+void player_settings_set_song(const music_item_t *item)
+{ assert(ui_locked && !sd_locked); strcpy(saved_folder,item->name); strcpy(saved_audio,item->audio); }
+void player_settings_get_song(char *folder, char *audio)
+{ assert(ui_locked && !sd_locked); strcpy(folder,saved_folder); strcpy(audio,saved_audio); }
+void ui_music_player_restore_selection(uint32_t index)
+{ assert(ui_locked); ui_index=index; }
 bool ui_lockscreen_is_visible(void) { return true; }
 void ui_lockscreen_start_boot_anim(void) { ++boot_anim_starts; }
 void test_set_inserted(bool present);
@@ -208,9 +215,36 @@ static void prepare_scan_test(uint32_t songs)
     scan_song_count=songs; count=0; ui_index=0;
     replace_card_in_scan=false;
     boot_anim_starts=0;
+    saved_folder[0]=saved_audio[0]=0;
     atomic_store(&s_scan_requested,false);
     atomic_store(&s_requested_index,UINT32_MAX);
     last_library_status[0]=0;
+}
+
+static void run_restore_tests(void)
+{
+    prepare_scan_test(4);
+    strcpy(saved_folder,"song2"); strcpy(saved_audio,"a2");
+    media_worker_step();
+    assert(ui_index==2 && atomic_load(&s_requested_index)==2);
+    media_worker_step();
+    assert(shown==1 && s_selected_index==2 && !strcmp(saved_folder,"song2"));
+    lvgl_port_lock(0); ui_index=3; select_song(3); lvgl_port_unlock();
+    assert(music_player_adapter_pause(true));
+    assert(music_player_adapter_capture_selection()==ESP_OK);
+    assert(!strcmp(saved_folder,"song3") && !strcmp(saved_audio,"a3"));
+    assert(music_player_adapter_pause(false));
+    atomic_store(&s_worker_state,MEDIA_BUSY);
+    assert(!music_player_adapter_pause(true));
+    atomic_fetch_and(&s_worker_state,(unsigned)~MEDIA_BUSY);
+    assert(music_player_adapter_pause(true));
+    unsigned gate=0;
+    assert(!atomic_compare_exchange_strong(&s_worker_state,&gate,MEDIA_BUSY));
+    assert(music_player_adapter_pause(false));
+    prepare_scan_test(4);
+    strcpy(saved_folder,"song2"); strcpy(saved_audio,"missing.flac");
+    media_worker_step(); assert(ui_index==0 && atomic_load(&s_requested_index)==0);
+    puts("PASS stable folder/audio restore updates real UI selection, missing song falls back and pending click is captured on shutdown");
 }
 
 static void run_scan_tests(void)
@@ -352,6 +386,7 @@ int main(void)
     reset();
     puts("PASS background follows foreground, cache hit, selection/card-change rejection and missing cover");
     run_scan_tests();
+    run_restore_tests();
     puts("ALL ADAPTER TESTS PASSED");
     return 0;
 }

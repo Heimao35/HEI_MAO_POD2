@@ -989,6 +989,16 @@ bool ui_music_player_can_show_song(uint32_t index)
     return index == (uint32_t)s_current_idx;
 }
 
+void ui_music_player_restore_selection(uint32_t index)
+{
+    if (index >= s_library_count) return;
+    /* 元数据/封面发布均检查 s_current_idx；必须在 worker 读取前同步，
+     * 否则恢复非零歌曲会被当成迟到数据而丢弃。列表重建已经清理旧动画，
+     * 这里只改选择与条目状态，保持页面位置、歌词手势及播放控制台不变。 */
+    s_current_idx = (int)index;
+    update_playlist_highlight();
+}
+
 void ui_music_player_bind(const ui_music_backend_t *backend)
 {
     s_backend = backend ? *backend : (ui_music_backend_t){0};

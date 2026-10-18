@@ -1,4 +1,5 @@
 #include "screen_power.h"
+#include "system_power.h"
 #include "display_dpi_sleep.h"
 #include "pmic_axp2101.h"
 #include "sd_card.h"
@@ -24,13 +25,16 @@
  * 约 300ms、每 20ms 一步，仅发送小型 DCS 亮度命令，不绘制全屏遮罩。 */
 #define SCREEN_FADE_MS 300U
 #define SCREEN_FADE_STEP_MS 20U
-#define EVENT_TOUCH  (1U << 0)
+#define EVENT_TOUCH  (1U << 0) /* 仅为触摸候选，必须读CST820确认 */
 #define EVENT_KEY    (1U << 1)
+#define EVENT_WAKE_REQUEST (1U << 2) /* 已由业务逻辑确认的主动唤醒 */
+#define TOUCH_PROBE_MIN_MS 20U
 
 static const char *TAG = "screen_power";
 static lv_display_t *s_display;
 static lv_indev_t *s_input;
 static esp_lcd_panel_handle_t s_panel;
+static esp_lcd_touch_handle_t s_touch;
 static esp_lcd_touch_interrupt_callback_t s_original_touch_irq;
 static TaskHandle_t s_task;
 static atomic_uint s_events;
@@ -38,13 +42,35 @@ static atomic_bool s_dark;
 static atomic_uchar s_brightness = 80;
 static atomic_bool s_brightness_pending;
 static bool s_stream_stopped;
+static atomic_bool s_shutdown_display, s_display_suspended;
 static bool s_sleep_fault_logged;
 static bool s_fading_out;
 static TickType_t s_fade_started;
 static uint8_t s_fade_from;
+static bool s_touch_probed, s_touch_fault_logged, s_touch_rejected_logged;
+static bool s_touch_probe_pending;
+static TickType_t s_touch_probe_at;
 /* s_brightness 保存用户偏好，s_panel_brightness 保存实际已写入亮度。
  * 渐灭只改变后者，唤醒仍恢复到用户偏好；都只由电源任务写硬件。 */
 static uint8_t s_panel_brightness = 80;
+
+/* 任务上下文事件统一唤醒等待中的电源任务。软件请求与原始触摸IRQ必须
+ * 分开：电源键按下/关机失败恢复不需要也不能依赖触摸控制器存在触点。 */
+static void post_event(unsigned event)
+{
+    atomic_fetch_or(&s_events, event);
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+void screen_power_request_wake(void)
+{ post_event(EVENT_WAKE_REQUEST); }
+void screen_power_shutdown_display(bool off)
+{
+    atomic_store(&s_shutdown_display,off);
+    if (!off) screen_power_request_wake();
+}
+bool screen_power_display_suspended(void)
+{ return atomic_load(&s_display_suspended); }
 
 bool screen_power_is_dark(void)
 {
@@ -54,16 +80,20 @@ bool screen_power_is_dark(void)
 void screen_power_key_short_press(void)
 {
     /* No UI/I2C in PMIC IRQ consumer. The power task serializes transitions. */
-    atomic_fetch_or(&s_events, EVENT_KEY);
+    post_event(EVENT_KEY);
 }
 
 static void IRAM_ATTR touch_irq(esp_lcd_touch_handle_t touch)
 {
-    /* Preserve esp_lvgl_port's callback/user_data. Its ordinary event-mode
-     * input path remains unchanged while awake; dark touches only request wake.
-     * The GPIO ISR never reads the touch I2C bus or acquires the LVGL lock. */
-    if (atomic_load(&s_dark)) atomic_fetch_or(&s_events, EVENT_TOUCH);
-    else if (s_original_touch_irq) s_original_touch_irq(touch);
+    /* ISR只登记候选并通知任务，绝不读I2C/等待LVGL。亮屏时仍使用原
+     * esp_lvgl_port回调；熄屏时立即唤醒检查任务，避免100ms固定轮询
+     * 把快速点按拖到松手后才读，造成“需要长按触摸才能唤醒”。 */
+    if (atomic_load(&s_dark)) {
+        atomic_fetch_or(&s_events, EVENT_TOUCH);
+        BaseType_t woken = pdFALSE;
+        if (s_task) vTaskNotifyGiveFromISR(s_task, &woken);
+        if (woken) portYIELD_FROM_ISR();
+    } else if (s_original_touch_irq) s_original_touch_irq(touch);
 }
 
 void screen_power_set_brightness(uint8_t brightness)
@@ -73,6 +103,7 @@ void screen_power_set_brightness(uint8_t brightness)
     /* Slider callbacks execute under LVGL lock: queue only; serialize DCS
      * commands with screen-off/wake on the power worker, outside the lock. */
     atomic_store(&s_brightness_pending, true);
+    if (s_task) xTaskNotifyGive(s_task);
 }
 
 static esp_err_t write_panel_brightness(uint8_t brightness)
@@ -82,11 +113,46 @@ static esp_err_t write_panel_brightness(uint8_t brightness)
     return ret;
 }
 
+/* 只在熄屏的电源任务调用；此时LVGL输入和计时已停止，所以不会和
+ * 正常触摸读取并发。所有阻塞I2C均在ISR/LVGL锁/SD锁之外完成。
+ * IRQ低电平或EXT1标志只能说明需要检查控制器，不能证明手指按下。
+ * 每次重新read_data后再get_data，不使用熄屏前留下的坐标缓存；失败、
+ * 零触点或越界数据均保持黑屏。持续低电平/IRQ风暴最多每20ms读一次。 */
+static bool touch_confirms_wake(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (s_touch_probed && now - s_touch_probe_at < pdMS_TO_TICKS(TOUCH_PROBE_MIN_MS))
+        return false;
+    s_touch_probe_pending = false;
+    s_touch_probed = true;
+    s_touch_probe_at = now;
+    esp_lcd_touch_point_data_t point = {0};
+    uint8_t count = 0;
+    esp_err_t ret = esp_lcd_touch_read_data(s_touch);
+    if (ret == ESP_OK) ret = esp_lcd_touch_get_data(s_touch, &point, &count, 1);
+    if (ret != ESP_OK) {
+        if (!s_touch_fault_logged)
+            ESP_LOGW(TAG, "Touch wake check failed: %s; keeping screen off", esp_err_to_name(ret));
+        s_touch_fault_logged = true;
+        return false;
+    }
+    s_touch_fault_logged = false;
+    bool touched = count != 0 && point.x < UI_HOR_RES && point.y < UI_VER_RES;
+    if (!touched && !s_touch_rejected_logged) {
+        ESP_LOGI(TAG, "Touch wake hint without valid contact; keeping screen off");
+        s_touch_rejected_logged = true;
+    }
+    return touched;
+}
+
 /* 调用方持有 LVGL 锁。超时与锁屏下短按共用这条路径：先停止画面和
  * 输入活动，再让显示链路继续输出固定画面，直到亮度渐灭完毕才停 DMA。
  * s_dark 在渐灭开始时即置位，使此期间触摸也能取消熄屏，不会丢失操作。 */
 static void begin_screen_off_locked(void)
 {
+    s_touch_probed = false;
+    s_touch_probe_pending = false;
+    s_touch_rejected_logged = false;
     atomic_store(&s_dark, true);
     lv_indev_enable(s_input, false);
     ui_lockscreen_stop_anim();
@@ -98,6 +164,7 @@ static void begin_screen_off_locked(void)
 
 static void check_lock_timeout(void)
 {
+    if (system_power_is_active()) return;
     if (lvgl_port_lock(50)) {
         /* 只在锁屏计时。LVGL 的显示器活动时间涵盖全屏输入，而不只是在
          * 主屏冒泡成功的手势；持续按住/滑动也不会被当成十秒无操作。 */
@@ -155,6 +222,7 @@ static void fade_screen_off_step(void)
     if (ret == ESP_OK) ret = player_dpi_suspend(s_panel);
     if (ret == ESP_OK) {
         s_stream_stopped = true;
+        atomic_store(&s_display_suspended,true);
         gpio_intr_disable(LCD_TE_GPIO);
         ESP_LOGI(TAG, "Lock screen faded out; DPI refresh off");
     } else {
@@ -169,14 +237,14 @@ static void dark_idle(void)
      * uses bounded Light-sleep intervals, retaining PSRAM/UI and allowing SD
      * hotplug and PMIC monitoring to run between intervals. Never Deep-sleep:
      * it cannot resume the existing UI and is inappropriate for this lock. */
-    if (music_player_adapter_is_playing() || !ui_lockscreen_anim_is_idle()) return;
+    if (s_touch_probe_pending || system_power_is_active() || music_player_adapter_is_playing() || !ui_lockscreen_anim_is_idle()) return;
     /* The production adapter may have a real decoder worker in the future.
      * Its SD accesses are covered by the same mutex; this check only makes
      * the present metadata-only path explicit. */
-    if (gpio_get_level(TOUCH_IRQ_GPIO) == 0) {
-        atomic_fetch_or(&s_events, EVENT_TOUCH);
-        return;
-    }
+    /* 低电平候选已在screen_power_step中读触摸数据。仍为低时不进入
+     * ANY_LOW睡眠，避免立刻被同一电平唤醒；也不再给自己排无条件亮屏
+     * 事件/通知，防止持续低电平导致I2C忙循环。 */
+    if (gpio_get_level(TOUCH_IRQ_GPIO) == 0) return;
     /* A pending PMIC notification first needs the monitor to drain it. VBUS,
      * charging and SOC events can wake the CPU without turning on the screen. */
     if (gpio_get_level(PMIC_IRQ_GPIO) == 0) return;
@@ -188,7 +256,7 @@ static void dark_idle(void)
      * Acquire without waiting and outside LVGL; never sleep across live SD DMA.
      * Before SD init, the missing mutex also prevents an early sleep. */
     if (sd_card_io_lock(0)) {
-        if (!atomic_load(&s_events) && gpio_get_level(PMIC_IRQ_GPIO) != 0 &&
+        if (!system_power_is_active() && !atomic_load(&s_events) && gpio_get_level(PMIC_IRQ_GPIO) != 0 &&
             gpio_get_level(TOUCH_IRQ_GPIO) != 0 && !music_player_adapter_is_playing()) {
             esp_sleep_enable_timer_wakeup(1000000ULL);
             esp_err_t ret = esp_light_sleep_start();
@@ -198,10 +266,16 @@ static void dark_idle(void)
             uint64_t wake_pins = ret == ESP_OK ? esp_sleep_get_ext1_wakeup_status() : 0;
             /* EXT1 temporarily owns these RTC-capable pins. Return them to
              * digital GPIO before normal touch/PMIC edge IRQs are used again. */
+            /* v5.5.4的EXT1会把唤醒pad设为HOLD；先解除HOLD，再切回
+             * 数字GPIO。仅deinit无法解除冻结的MUX/输入配置：触摸可能
+             * 被误读为低电平、PMIC下降沿ISR也可能失效而退化到5秒轮询。
+             * 即使睡眠被拒绝也执行清理，避免部分准备留下pad保持状态。 */
+            rtc_gpio_hold_dis(TOUCH_IRQ_GPIO);
+            rtc_gpio_hold_dis(PMIC_IRQ_GPIO);
             rtc_gpio_deinit(TOUCH_IRQ_GPIO);
             rtc_gpio_deinit(PMIC_IRQ_GPIO);
             if ((wake_pins & (1ULL << TOUCH_IRQ_GPIO)) || gpio_get_level(TOUCH_IRQ_GPIO) == 0)
-                atomic_fetch_or(&s_events, EVENT_TOUCH);
+                post_event(EVENT_TOUCH);
 
         }
         sd_card_io_unlock();
@@ -213,30 +287,54 @@ static void dark_idle(void)
 static void screen_power_step(void)
 {
     unsigned events = atomic_exchange(&s_events, 0);
+    /* 确认关机后复用渐灭/DPI 停止逻辑，但不进入 Light-sleep，也不接受
+     * 唤醒打断持久化。失败时清除请求后再沿原唤醒路径恢复。 */
+    if (atomic_load(&s_shutdown_display)) {
+        if (!atomic_load(&s_dark)) {
+            if (lvgl_port_lock(50)) {
+                begin_screen_off_locked();
+                lvgl_port_unlock();
+            }
+        } else if (s_fading_out) fade_screen_off_step();
+        return;
+    }
     if (!atomic_load(&s_dark) && atomic_exchange(&s_brightness_pending, false))
         write_panel_brightness(atomic_load(&s_brightness));
     if (atomic_load(&s_dark)) {
-        if (events & (EVENT_TOUCH | EVENT_KEY)) {
+        bool explicit_wake = (events & (EVENT_KEY | EVENT_WAKE_REQUEST)) != 0;
+        bool touch_wake = false;
+        if ((events & EVENT_TOUCH) || gpio_get_level(TOUCH_IRQ_GPIO) == 0)
+            s_touch_probe_pending = true;
+        if (!explicit_wake && s_touch_probe_pending) touch_wake = touch_confirms_wake();
+        /* CPU从EXT1醒来不等于用户要求亮屏；仅确认触点或独立电源键/
+         * 软件请求才能恢复显示。渐灭途中也执行相同检查，不被空IRQ打断。 */
+        if (explicit_wake || touch_wake) {
             if (s_stream_stopped) {
                 esp_err_t ret = player_dpi_resume(s_panel);
                 if (ret != ESP_OK) {
                     ESP_LOGE(TAG, "DPI resume failed: %s", esp_err_to_name(ret));
-                    atomic_fetch_or(&s_events, events);
+                    /* 已确认的触摸需重试DPI恢复时升级为主动唤醒请求，
+                     * 不能因为下一轮手指已抬起而遗失这次有效操作。 */
+                    post_event(EVENT_WAKE_REQUEST);
                     return;
                 }
             }
             /* 渐灭中也能唤醒，此时 DPI 尚未停，无需重复 resume。 */
+            s_touch_probe_pending = false;
             s_fading_out = false;
             s_stream_stopped = false;
+            atomic_store(&s_display_suspended,false);
             gpio_intr_enable(LCD_TE_GPIO);
             restore_ui();
-            ESP_LOGI(TAG, "Screen awake; lock MJPEG restarted without page slide");
+            ESP_LOGI(TAG, "Screen awake (%s); lock MJPEG restarted without page slide",
+                     touch_wake ? "touch data" : (events & EVENT_KEY) ? "power key" : "request");
         } else if (s_fading_out) {
             fade_screen_off_step();
         } else if (s_stream_stopped) {
             dark_idle();
         }
     } else if (events & EVENT_KEY) {
+        if (system_power_is_active()) return;
         if (lvgl_port_lock(0)) {
             /* 未锁屏：进入锁屏并滑入；锁屏亮屏：短按直接开始渐灭。
              * 不再次调用 lock/show，所以不会把短按误当成重新进入锁屏。 */
@@ -254,7 +352,9 @@ static void power_task(void *arg)
     (void)arg;
     for (;;) {
         screen_power_step();
-        vTaskDelay(pdMS_TO_TICKS(s_fading_out ? SCREEN_FADE_STEP_MS : 100U));
+        /* 有候选立即读触摸，平时仍用原周期推进渐灭/锁屏超时。RTC触摸
+         * 唤醒后也会post_event，因此不额外等100ms才确认一次点按。 */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((s_fading_out || s_touch_probe_pending) ? SCREEN_FADE_STEP_MS : 100U));
     }
 }
 
@@ -265,6 +365,7 @@ esp_err_t screen_power_init(lv_display_t *display, lv_indev_t *input,
     s_display = display;
     s_input = input;
     s_panel = panel;
+    s_touch = touch;
     s_original_touch_irq = touch->config.interrupt_callback;
     /* GPIO6/GPIO10 are RTC GPIOs on P4. EXT1 does not replace their normal
      * negative-edge IRQ configuration with a level IRQ while the UI is awake.
@@ -277,6 +378,7 @@ esp_err_t screen_power_init(lv_display_t *display, lv_indev_t *input,
     lvgl_port_lock(0);
     s_panel_brightness = ui_get_device_state()->brightness;
     atomic_store(&s_brightness, s_panel_brightness);
+    atomic_store(&s_brightness_pending,true); /* 应用恢复的偏好，不沿用面板上电80%。 */
     lv_display_trigger_activity(display);
     lvgl_port_unlock();
     /* xTaskCreate uses internal RAM for stack: esp_light_sleep_start rejects

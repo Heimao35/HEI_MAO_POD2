@@ -11,3 +11,7 @@ void music_player_adapter_request_scan_if_needed(void);
 /* Atomic playback state for the screen-power worker. A future real decoder
  * must keep this state true for the entire active output interval. */
 bool music_player_adapter_is_playing(void);
+
+/* 关机屏障：停止新选歌/I/O，返回 worker 是否空闲；均在 LVGL 锁外调用。 */
+bool music_player_adapter_pause(bool pause);
+esp_err_t music_player_adapter_capture_selection(void);

@@ -13,6 +13,7 @@
  */
 
 #include "ui_manager.h"
+#include "ui_power_dialog.h"
 #include "ui_statusbar.h"
 #include "ui_lockscreen.h"
 #include "ui_music_player.h"
@@ -88,6 +89,8 @@ static void gesture_pressed_cb(lv_event_t *e)
 static void gesture_released_cb(lv_event_t *e)
 {
     (void)e;
+    /* 关机弹窗是唯一新增模态层；取消后恢复原手势判定和页面动画。 */
+    if (ui_power_dialog_is_visible()) return;
     lv_indev_t *indev = lv_indev_active();
     if (!indev) return;
 

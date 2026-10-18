@@ -17,3 +17,9 @@ void screen_power_set_brightness(uint8_t brightness);
 
 /* Lock-free snapshot for input workers; includes brightness fade-out. */
 bool screen_power_is_dark(void);
+
+/* 系统电源任务与显示任务通过原子请求交接，不在持有 LVGL 锁时等待。
+ * request_wake是已确认的软件主动唤醒，独立于需要I2C确认的原始触摸IRQ。 */
+void screen_power_request_wake(void);
+void screen_power_shutdown_display(bool off);
+bool screen_power_display_suspended(void);

@@ -9,6 +9,7 @@
 #include "../../main/ui/ui_statusbar.c"
 
 static uint8_t registers[256];
+void vTaskDelay(unsigned ticks) { (void)ticks; }
 static bool ui_locked, in_isr, unavailable, task_failure, handler_installed;
 static bool inject_remove_on_ack, repeated_irq, force_irq_low;
 static int fail_read_reg = -1;
@@ -77,6 +78,16 @@ esp_err_t i2c_master_transmit(i2c_master_dev_handle_t device, const uint8_t *wri
         assert(value == (registers[reg] | (1U << 3)));
         registers[reg] = value;
     } else if (reg >= 0x40 && reg <= 0x42) {
+        registers[reg] = value;
+    } else if (reg == 0x22 || reg == 0x27) {
+        uint8_t mask = reg==0x22 ? 0x03 : 0x0C;
+        assert((value & mask)==(reg==0x22 ? 0x02 : 0x0C));
+        assert((value & (uint8_t)~mask)==(registers[reg] & (uint8_t)~mask));
+        if (reg!=ignored_write_reg) registers[reg] = value;
+    } else if (reg == 0x10) {
+        uint8_t command=value & 0x03;
+        assert(command==0x01 || command==0x02);
+        assert((value & 0xFC)==(registers[reg] & 0xFC));
         registers[reg] = value;
     } else {
         /* Only the two requested rails, gauge and IRQ fields may be written.
@@ -152,6 +163,13 @@ static void key_event(void)
     ++key_presses;
 }
 
+static unsigned down_events, up_events;
+static void edge_event(bool down)
+{
+    assert(!in_isr && !ui_locked && !(registers[0x49] & 3));
+    if (down) ++down_events; else ++up_events;
+}
+
 int main(void)
 {
     lv_init();
@@ -175,6 +193,8 @@ int main(void)
     assert(buses == 1 && devices == 1 && handler_installed);
     puts("PASS separate I2C1 pins/address, shared GPIO ISR service and failed-init resource cleanup");
 
+    registers[0x22] = 0xA5; /* preserve thermal/reserved bits while selecting hardware off */
+    registers[0x27] = 0xA1; /* preserve IRQLEVEL and ONLEVEL */
     registers[0x85] = 0xA2;
     registers[0x94] = 0xA5;
     registers[0x80] = 0x65; /* DCDC4 off; DCDC1/3 and mode flags untouched. */
@@ -183,11 +203,15 @@ int main(void)
     registers[0x00] = (1U << 5) | (1U << 3);
     registers[0x01] = (1U << 5) | 2;
     registers[0xA4] = 68;
-    registers[0x49] = (1U << 7) | (1U << 3); /* startup-low VBUS + owned short-key event. */
+    pmic_axp2101_set_key_callback(key_event);
+    pmic_axp2101_set_key_edge_callback(edge_event);
+    registers[0x49] = (1U << 7) | (1U << 3) | 0x03; /* startup-low VBUS + owned short-key event. */
     assert(monitor_step() == ESP_OK);
     assert(state->power_valid && state->battery_present && state->battery_pct_valid);
     assert(state->vbus_present && state->charging && state->battery_pct == 68);
     assert(registers[0x18] == 0x0B && module_writes == 1);
+    assert(registers[0x22]==0xA6 && registers[0x27]==0xAD);
+    assert(s_key_events_armed && !key_presses && !down_events && !up_events);
     assert(s_outputs_ready && rail_writes == 4);
     const uint8_t expected_order[] = {0x85, 0x94, 0x80, 0x90};
     assert(!memcmp(rail_write_order, expected_order, sizeof(expected_order)));
@@ -309,14 +333,14 @@ int main(void)
     pmic_axp2101_set_key_callback(key_event);
     registers[0x49] |= 1U << 3;
     assert(monitor_step() == ESP_OK && key_presses == 1);
-    assert(registers[0x41] == 0xF8);
+    assert(registers[0x41] == 0xFB);
     assert(monitor_step() == ESP_OK && key_presses == 1);
     registers[0x49] |= 1U << 3;
     fail_write_reg = 0x49;
     assert(monitor_step() == ESP_ERR_TIMEOUT && key_presses == 1);
     fail_write_reg = -1;
     assert(monitor_step() == ESP_OK && key_presses == 2);
-    registers[0x49] |= 1U << 2; /* Long key remains unowned. */
+    registers[0x49] |= 1U << 2; /* Long IRQ remains disabled; hardware OFFLEVEL is used. */
     assert(monitor_step() == ESP_OK && key_presses == 2);
     assert(registers[0x49] & (1U << 2));
     assert(pmic_axp2101_pause_monitor(true));
@@ -324,8 +348,44 @@ int main(void)
     assert(!pmic_axp2101_pause_monitor(true));
     atomic_store(&s_monitor_busy, false);
     assert(pmic_axp2101_pause_monitor(false));
-    puts("PASS short-key delivered once after ACK, retry safe, long-key policy unchanged, monitor sleep handshake");
+    puts("PASS short-key delivered once after ACK, retry safe, long-key IRQ remains disabled; hardware 10s policy configured, monitor sleep handshake");
 
+    pmic_axp2101_set_key_edge_callback(edge_event);
+    registers[0x49] |= 0x02;
+    assert(monitor_step()==ESP_OK && down_events==1 && up_events==0);
+    registers[0x49] |= 0x01; fail_write_reg=0x49;
+    assert(monitor_step()==ESP_ERR_TIMEOUT && up_events==0);
+    fail_write_reg=-1;
+    assert(monitor_step()==ESP_OK && up_events==1 && down_events==1);
+    registers[0x49] |= 0x03;
+    assert(monitor_step()==ESP_OK && up_events==2 && down_events==2);
+    registers[0x27] &= (uint8_t)~0x0C; s_configured=false; ignored_write_reg=0x27;
+    assert(monitor_step()==ESP_ERR_INVALID_RESPONSE && !s_configured);
+    ignored_write_reg=-1; assert(monitor_step()==ESP_OK && s_configured);
+    registers[0x10]=0xBE;
+    atomic_store(&s_power_action_state,POWER_ACTION_OFF_REQUESTED); service_power_action();
+    assert(registers[0x10]==0xBD && atomic_load(&s_power_action_state)==POWER_ACTION_DONE);
+    assert(atomic_load(&s_power_action_result)==ESP_OK);
+    atomic_store(&s_power_action_state,POWER_ACTION_OFF_REQUESTED); fail_write_reg=0x10;
+    service_power_action(); assert(atomic_load(&s_power_action_result)==ESP_ERR_TIMEOUT);
+    fail_write_reg=-1;
+    registers[0x10]=0xBD;
+    atomic_store(&s_power_action_state,POWER_ACTION_RESTART_REQUESTED); service_power_action();
+    assert(registers[0x10]==0xBE && atomic_load(&s_power_action_result)==ESP_OK);
+    assert(atomic_load(&s_power_action_state)==POWER_ACTION_DONE);
+    /* Actual restart command must never rewrite the 10s hardware-off policy. */
+    assert((registers[0x22] & 3)==2 && (registers[0x27] & 0x0C)==0x0C);
+    fail_read_reg=0x10; before=writes;
+    atomic_store(&s_power_action_state,POWER_ACTION_RESTART_REQUESTED); service_power_action();
+    assert(atomic_load(&s_power_action_result)==ESP_ERR_TIMEOUT && writes==before);
+    fail_read_reg=-1; atomic_store(&s_power_action_state,POWER_ACTION_IDLE);
+    assert(pmic_axp2101_restart()==ESP_ERR_TIMEOUT);
+    assert(atomic_load(&s_power_action_state)==POWER_ACTION_IDLE);
+    before=transactions; service_power_action(); assert(transactions==before);
+    assert(pmic_axp2101_poweroff()==ESP_ERR_TIMEOUT); /* worker never scheduled: request cancelled */
+    assert(atomic_load(&s_power_action_state)==POWER_ACTION_IDLE);
+    before=transactions; service_power_action(); assert(transactions==before);
+    puts("PASS 10s hardware-off masks/readback, edge ACK retry, safe soft-off bit ownership and cancellation of late requests");
     lv_deinit();
     puts("ALL POWER MONITOR TESTS PASSED");
     return 0;

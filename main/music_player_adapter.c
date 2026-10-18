@@ -1,4 +1,5 @@
 #include "music_player_adapter.h"
+#include "player_settings.h"
 #include "music_library.h"
 #include "audio_player.h"
 #include "cover_loader.h"
@@ -61,11 +62,32 @@ void music_player_adapter_request_scan_if_needed(void)
     notify_worker();
 }
 
+/* PAUSED/BUSY 放在同一个原子字中：暂停者和 worker 的 CAS 竞争同一入口，
+ * 一旦返回空闲，worker 就不能再开始 I/O，也不会因一次空轮询临时变 BUSY。
+ * 两个独立 bool 无法保证这一交接，尤其在 P4 双核同时运行时。 */
+#define MEDIA_PAUSED (1U << 0)
+#define MEDIA_BUSY   (1U << 1)
+static atomic_uint s_worker_state;
+static bool media_paused(void) { return (atomic_load(&s_worker_state) & MEDIA_PAUSED) != 0; }
+static uint32_t s_selected_index = UINT32_MAX; /* LVGL lock */
+bool music_player_adapter_pause(bool pause)
+{
+    unsigned previous;
+    if (pause) previous = atomic_fetch_or(&s_worker_state, MEDIA_PAUSED);
+    else {
+        previous = atomic_fetch_and(&s_worker_state, (unsigned)~MEDIA_PAUSED);
+        notify_worker();
+    }
+    return (previous & MEDIA_BUSY) == 0;
+}
+
 static bool media_available(void);
 
 static void select_song(uint32_t index)
 {
     /* UI callbacks post one scalar index; the media task performs all file I/O. */
+    if (media_paused()) return;
+    s_selected_index = index;
     ++s_request_serial;
     atomic_store(&s_requested_index, index);
     atomic_store(&s_lyrics_ready, false);
@@ -132,7 +154,7 @@ static void publish_all_names(uint32_t count, uint32_t generation)
     /* MUSIC_PAGE_SIZE is only the bounded transport batch. Every song already
      * has a normal row in the original scrolling list. */
     for (uint32_t first = 0; first < count; first += MUSIC_PAGE_SIZE) {
-        if (!media_available() || sd_card_get_generation() != generation) return;
+        if (media_paused() || !media_available() || sd_card_get_generation() != generation) return;
         publish_page(first, generation);
     }
 }
@@ -196,6 +218,7 @@ static bool load_selected_song(uint32_t index, uint32_t generation, uint32_t ser
     lvgl_port_lock(0);
     current = request_current(index, generation, serial);
     if (current) {
+        if (item_ret == ESP_OK) player_settings_set_song(&item);
         uint32_t duration = audio_ret == ESP_OK && info.metadata_known ?
                             (uint32_t)(info.duration_ms / 1000) : 0;
         atomic_store(&s_duration_sec, duration);
@@ -240,7 +263,7 @@ static void prefetch_neighbors(uint32_t index, uint32_t generation, uint32_t ser
         /* 每张封面前检查选择是否变化；一张已开始的 JPEG 解码正常结束，
          * 不再启动后续预读。通知保留在任务槽中，下一轮立即处理新选歌。 */
         lvgl_port_lock(0);
-        bool current = request_current(index, generation, serial) &&
+        bool current = !media_paused() && request_current(index, generation, serial) &&
                        atomic_load(&s_requested_index) == UINT32_MAX;
         lvgl_port_unlock();
         if (!current) return;
@@ -268,6 +291,53 @@ static void publish_library_status(uint32_t generation, uint32_t count, const ch
     lvgl_port_unlock();
 }
 
+/* 常驻内存只有两个文件名和一条记录；逐条读取磁盘索引，不把曲库复制到
+ * RAM。每条释放 SD 锁，拔卡/关机/用户先选歌时停止；匹配同时验证目录和
+ * 音频名，避免重名。没有匹配时采用第一首，不恢复进度或自动播放。 */
+static uint32_t restored_song_index(uint32_t count, uint32_t generation)
+{
+    char folder[MUSIC_NAME_MAX], audio[MUSIC_NAME_MAX];
+    lvgl_port_lock(0);
+    player_settings_get_song(folder,audio);
+    lvgl_port_unlock();
+    if (!folder[0] || !audio[0]) return 0;
+    for (uint32_t i=0; i<count; ++i) {
+        if (media_paused() || atomic_load(&s_requested_index)!=UINT32_MAX) return 0;
+        music_item_t item;
+        if (lock_media(generation)!=ESP_OK) return 0;
+        esp_err_t ret=music_library_get_item(i,&item);
+        sd_card_io_unlock();
+        if (ret!=ESP_OK) return 0;
+        if (!strcmp(folder,item.name) && !strcmp(audio,item.audio)) return i;
+        if ((i & 31U)==31U) vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return 0;
+}
+
+/* 电源任务先暂停 worker 并等其空闲，再调用此函数捕获最后一次点击。
+ * 即使用户刚切歌、元数据尚未发布，也保存该曲身份。I/O 在 LVGL 锁外。
+ * 无卡时保留原身份，不能用空曲库覆盖已经保存的最后歌曲。 */
+esp_err_t music_player_adapter_capture_selection(void)
+{
+    if (atomic_load(&s_worker_state) != MEDIA_PAUSED) return ESP_ERR_INVALID_STATE;
+    lvgl_port_lock(0);
+    uint32_t index=s_selected_index;
+    lvgl_port_unlock();
+    if (index==UINT32_MAX || !media_available()) return ESP_OK;
+    uint32_t generation=sd_card_get_generation();
+    esp_err_t ret=lock_media(generation);
+    if (ret!=ESP_OK) return ret;
+    music_item_t item;
+    ret=music_library_get_item(index,&item);
+    sd_card_io_unlock();
+    if (ret==ESP_OK) {
+        lvgl_port_lock(0);
+        if (sd_card_get_generation()==generation) player_settings_set_song(&item);
+        lvgl_port_unlock();
+    }
+    return ret;
+}
+
 /* 单次调度拆为独立函数，既保留单 worker 的串行 I/O，又允许主机测试
  * 确定性模拟首次超时、退避、解锁补扫以及扫描过程中换卡。 */
 static void media_worker_step(void)
@@ -286,6 +356,7 @@ static void media_worker_step(void)
             music_background_invalidate();
             lvgl_port_lock(0);
             ++s_request_serial;
+            s_selected_index=UINT32_MAX;
             atomic_store(&s_requested_index, UINT32_MAX);
             atomic_store(&s_lyrics_ready, false);
             atomic_store(&s_duration_sec, 0);
@@ -307,6 +378,7 @@ static void media_worker_step(void)
         music_background_invalidate();
         lvgl_port_lock(0);
         ++s_request_serial;
+        s_selected_index=UINT32_MAX;
         atomic_store(&s_requested_index, UINT32_MAX);
         atomic_store(&s_lyrics_ready, false);
         atomic_store(&s_duration_sec, 0);
@@ -362,9 +434,13 @@ static void media_worker_step(void)
                                (capped ? "歌曲列表已达上限" : "正在加载歌曲...") : "未找到歌曲");
         if (count) {
             publish_all_names(count, generation);
+            uint32_t restored=restored_song_index(count,generation);
             lvgl_port_lock(0);
             if (media_available() && sd_card_get_generation() == generation &&
-                atomic_load(&s_requested_index) == UINT32_MAX) select_song(0);
+                atomic_load(&s_requested_index) == UINT32_MAX && !media_paused()) {
+                ui_music_player_restore_selection(restored);
+                select_song(restored);
+            }
             lvgl_port_unlock();
         }
         else if (s_boot_anim_pending && ui_lockscreen_is_visible()) {
@@ -396,7 +472,11 @@ static void media_worker(void *arg)
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
-        media_worker_step();
+        unsigned expected = 0;
+        if (atomic_compare_exchange_strong(&s_worker_state, &expected, MEDIA_BUSY)) {
+            media_worker_step();
+            atomic_fetch_and(&s_worker_state, (unsigned)~MEDIA_BUSY);
+        }
     }
 }
 

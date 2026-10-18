@@ -43,6 +43,9 @@ typedef struct {
     bool (*is_playing)(void);
 } ui_music_backend_t;
 
+/* 开机/重新挂载后恢复歌曲选择。须持有 LVGL 锁，先同步 UI 当前索引，
+ * 再由适配器排队加载；不播放切歌动画、不调用后端、不开始播放。 */
+void ui_music_player_restore_selection(uint32_t index);
 void ui_music_player_bind(const ui_music_backend_t *backend);
 void ui_music_player_set_library(uint32_t count, const char *status);
 void ui_music_player_set_page(const music_page_t *page);

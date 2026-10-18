@@ -3,15 +3,53 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include "src/indev/lv_indev_private.h"
 #include "../../main/screen_power.c"
 
 void vTaskDelay(unsigned ticks) { (void)ticks; }
 
+static bool power_active;
+bool system_power_is_active(void) { return power_active; }
 static bool ui_locked, locked = true, anim_idle = true, playing;
 static bool sd_available = true, sd_locked, pmic_idle = true, pmic_paused;
 static int touch_level = 1, pmic_level = 1;
 static unsigned stops, resumes, suspend_calls, resume_calls, locks, cancels;
 static unsigned sleep_calls, original_irqs, te_disabled, rtc_restores;
+static uint64_t held_pads;
+static unsigned hold_releases;
+static unsigned touch_reads, task_notifications, isr_notifications;
+static bool in_touch_isr;
+static uint8_t touch_points;
+static uint16_t touch_x=100, touch_y=120;
+static esp_err_t touch_read_result, touch_get_result;
+static uint8_t stale_touch_points;
+void xTaskNotifyGive(TaskHandle_t task)
+{ assert(!in_touch_isr && task==(void *)2); ++task_notifications; }
+void vTaskNotifyGiveFromISR(TaskHandle_t task, BaseType_t *woken)
+{ assert(in_touch_isr && task==(void *)2); ++isr_notifications; *woken=pdTRUE; }
+uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t ticks)
+{ (void)ticks; assert(clear==pdTRUE); return 0; }
+esp_err_t esp_lcd_touch_read_data(esp_lcd_touch_handle_t touch)
+{
+    assert(!ui_locked && !sd_locked && !pmic_paused && !in_touch_isr && touch==s_touch);
+    assert(atomic_load(&s_dark) && !s_input->enabled);
+    ++touch_reads;
+    if(touch_read_result==ESP_OK) stale_touch_points=touch_points;
+    return touch_read_result;
+}
+esp_err_t esp_lcd_touch_get_data(esp_lcd_touch_handle_t touch, esp_lcd_touch_point_data_t *out,
+                                uint8_t *count, uint8_t capacity)
+{
+    assert(!ui_locked && !in_touch_isr && touch==s_touch && capacity==1);
+    *count=stale_touch_points;
+    *out=(esp_lcd_touch_point_data_t){.x=touch_x,.y=touch_y};
+    stale_touch_points=0;
+    return touch_get_result;
+}
+static void touch_edge(esp_lcd_touch_handle_t touch)
+{
+    in_touch_isr=true; touch->config.interrupt_callback(touch); in_touch_isr=false;
+}
 static unsigned brightness_calls;
 static TickType_t test_ticks;
 static uint8_t brightness_history[512];
@@ -41,11 +79,23 @@ bool pmic_axp2101_pause_monitor(bool pause)
 bool sd_card_io_lock(TickType_t ticks)
 { assert(!ui_locked && !sd_locked && !ticks); sd_locked = sd_available; return sd_locked; }
 void sd_card_io_unlock(void) { assert(sd_locked); sd_locked = false; }
-int gpio_get_level(gpio_num_t pin) { return pin == 6 ? touch_level : pmic_level; }
+int gpio_get_level(gpio_num_t pin)
+{
+    /* Frozen RTC mux appears low to the digital GPIO path. Old code would
+     * spuriously queue TOUCH and PMIC edges would stay unavailable. */
+    if (held_pads & (1ULL << pin)) return 0;
+    return pin == 6 ? touch_level : pmic_level;
+}
 esp_err_t gpio_intr_enable(gpio_num_t pin) { assert(pin == 23); te_disabled = false; return ESP_OK; }
 esp_err_t gpio_intr_disable(gpio_num_t pin) { assert(pin == 23); te_disabled = true; return ESP_OK; }
 esp_err_t rtc_gpio_deinit(gpio_num_t pin)
-{ assert(pin == 6 || pin == 10); ++rtc_restores; return ESP_OK; }
+{
+    assert(pin == 6 || pin == 10);
+    assert(!(held_pads & (1ULL << pin))); /* HOLD must be disabled before changing mux. */
+    ++rtc_restores; return ESP_OK;
+}
+esp_err_t rtc_gpio_hold_dis(gpio_num_t pin)
+{ assert(pin==6 || pin==10); held_pads &= ~(1ULL<<pin); ++hold_releases; return ESP_OK; }
 esp_err_t esp_sleep_enable_ext1_wakeup_io(uint64_t mask, int mode)
 { assert(mask == ((1ULL << 6) | (1ULL << 10)) && mode == ESP_EXT1_WAKEUP_ANY_LOW); return ESP_OK; }
 esp_err_t esp_sleep_enable_timer_wakeup(uint64_t us)
@@ -56,6 +106,7 @@ esp_err_t esp_light_sleep_start(void)
     assert(!ui_locked && sd_locked && pmic_paused && atomic_load(&s_dark));
     assert(s_stream_stopped && te_disabled && !playing && anim_idle);
     ++sleep_calls;
+    held_pads=(1ULL<<6)|(1ULL<<10);
     wake_status = inject_sleep_touch ? 1ULL << 6 : inject_sleep_key ? 1ULL << 10 : 0;
     return ESP_OK;
 }
@@ -121,7 +172,7 @@ int main(void)
     assert(screen_power_init(display, input, (void *)1, &touch) == ESP_OK);
     lvgl_port_lock(0); screen_power_set_brightness(65); lvgl_port_unlock();
     assert(!brightness_calls); screen_power_step(); assert(brightness_value == 65);
-    touch.config.interrupt_callback(&touch);
+    touch_edge(&touch);
     assert(original_irqs == 1 && !atomic_load(&s_events));
     lv_tick_inc(9999); screen_power_step();
     assert(!atomic_load(&s_dark));
@@ -141,6 +192,7 @@ int main(void)
 
     screen_power_set_brightness(72);
     assert(brightness_value == 0); /* preserve desired brightness without lighting screen */
+    touch_points=0;
     playing = true; screen_power_step(); assert(!sleep_calls);
     playing = false; anim_idle = false; screen_power_step(); assert(!sleep_calls);
     anim_idle = true; sd_available = false; screen_power_step(); assert(!sleep_calls && !pmic_paused);
@@ -150,12 +202,12 @@ int main(void)
     assert(atomic_load(&s_dark)); /* timer/monitoring wake must not turn on display */
     puts("PASS playback, JPEG, SD and PMIC sleep guards unchanged; timer keeps screen dark");
 
-    inject_sleep_touch = true; screen_power_step();
+    inject_sleep_touch = true; touch_points=1; screen_power_step();
     assert(atomic_load(&s_events) & EVENT_TOUCH);
     screen_power_step();
     assert(!atomic_load(&s_dark) && !s_stream_stopped && locks == 1);
     assert(resumes == 1 && resume_calls == 1 && brightness_value == 72 && !te_disabled);
-    assert(rtc_restores == 4);
+    assert(rtc_restores == 4 && hold_releases==4 && !held_pads);
     puts("PASS touch RTC wake resumes existing UI, consumes wake touch and restores saved brightness");
 
     locked = false; expire(); assert(!atomic_load(&s_dark));
@@ -166,7 +218,7 @@ int main(void)
     screen_power_key_short_press(); screen_power_step();
     assert(atomic_load(&s_dark) && s_fading_out && locks == 2 && !s_stream_stopped);
     finish_fade();
-    touch.config.interrupt_callback(&touch);
+    touch_edge(&touch);
     assert(original_irqs == 1); screen_power_step();
     assert(!atomic_load(&s_dark) && locks == 3 && brightness_value == 72);
     puts("PASS key locks unlocked UI; next key on visible lock fades off without re-entering lock; touch wakes");
@@ -186,7 +238,7 @@ int main(void)
     screen_power_key_short_press(); screen_power_step();
     test_ticks += pdMS_TO_TICKS(100); screen_power_step();
     assert(s_fading_out && brightness_value > 0 && brightness_value < 72);
-    touch.config.interrupt_callback(&touch); screen_power_step();
+    touch_points=1; touch_edge(&touch); screen_power_step();
     assert(!s_fading_out && !atomic_load(&s_dark) && brightness_value == 72 && locks == 5);
     assert(suspend_calls == dma_before && resume_calls == dma_resume_before && sleep_calls == sleeps_before);
     screen_power_key_short_press(); screen_power_step();
@@ -213,6 +265,74 @@ int main(void)
     screen_power_key_short_press(); screen_power_step();
     assert(!atomic_load(&s_dark) && brightness_value == 5);
     puts("PASS 5-percent brightness and RTOS tick wrap preserve gradient and saved wake brightness");
+    power_active=true;
+    lv_tick_inc(11000); screen_power_step(); assert(!screen_power_is_dark());
+    unsigned no_sleep=sleep_calls;
+    screen_power_shutdown_display(true); screen_power_step();
+    assert(screen_power_is_dark() && s_fading_out);
+    finish_fade(); assert(screen_power_display_suspended() && brightness_value==0);
+    screen_power_request_wake(); screen_power_step();
+    assert(screen_power_display_suspended() && screen_power_is_dark() && sleep_calls==no_sleep);
+    screen_power_shutdown_display(false); screen_power_step();
+    assert(!screen_power_is_dark() && !screen_power_display_suspended() && brightness_value==5);
+    power_active=false;
+    puts("PASS power dialog prevents idle screen-off; shutdown fades/stops DPI, ignores touch, never sleeps and recovers on failure");
+    /* Repeat both ways of turning off, with empty IRQ pulses and RTC hints.
+     * The old code unconditionally restored DPI on any one of these inputs. */
+    inject_sleep_touch=false; inject_sleep_key=false; touch_points=0;
+    unsigned wake_before=resume_calls;
+    for (unsigned pass=0; pass<2; ++pass) {
+        touch_level=pmic_level=1;
+        if (pass==0) { screen_power_key_short_press(); screen_power_step(); }
+        else expire();
+        assert(s_fading_out && screen_power_is_dark());
+        stale_touch_points=1; /* Must be replaced by a fresh hardware read. */
+        touch_edge(&touch); finish_fade();
+        assert(screen_power_display_suspended() && resume_calls==wake_before && brightness_value==0);
+        touch_level=0;
+        unsigned probes=touch_reads;
+        for (unsigned n=0;n<5;++n) {
+            test_ticks+=20; screen_power_step();
+            assert(screen_power_is_dark() && brightness_value==0 && resume_calls==wake_before);
+        }
+        assert(touch_reads==probes+5);
+        touch_level=1;
+        inject_sleep_touch=true; screen_power_step(); screen_power_step();
+        assert(screen_power_is_dark() && resume_calls==wake_before);
+        inject_sleep_touch=false;
+        screen_power_request_wake(); screen_power_step();
+        assert(!screen_power_is_dark() && resume_calls==++wake_before);
+    }
+    puts("PASS key/idle screen-off survives zero-contact IRQ pulses, held-low GPIO, stale cache and empty RTC hints");
+
+    screen_power_key_short_press(); screen_power_step(); finish_fade();
+    unsigned probes=touch_reads;
+    touch_level=0; touch_read_result=ESP_ERR_TIMEOUT; stale_touch_points=1;
+    test_ticks+=20; screen_power_step();
+    assert(screen_power_is_dark() && touch_reads==probes+1 && stale_touch_points==1);
+    touch_read_result=ESP_OK; touch_points=1; touch_x=999;
+    test_ticks+=20; screen_power_step(); assert(screen_power_is_dark());
+    touch_x=100; touch_get_result=ESP_FAIL;
+    test_ticks+=20; screen_power_step(); assert(screen_power_is_dark());
+    touch_get_result=ESP_OK; touch_points=0;
+    test_ticks+=20; screen_power_step(); assert(screen_power_is_dark());
+    /* A real pulse immediately after an empty hint is deferred, never dropped;
+     * it is still validated once the 20ms probe bound expires even with pin high. */
+    touch_level=1; touch_points=1; touch_edge(&touch); screen_power_step();
+    assert(screen_power_is_dark() && s_touch_probe_pending);
+    test_ticks+=20; screen_power_step();
+    assert(!screen_power_is_dark() && !s_touch_probe_pending);
+    assert(isr_notifications && task_notifications);
+    puts("PASS I2C/get-data failures and invalid coordinates stay dark; subsequent real pulse survives probe throttling");
+
+    touch_points=0;
+    screen_power_key_short_press(); screen_power_step(); finish_fade();
+    touch_read_result=ESP_ERR_TIMEOUT; touch_level=0;
+    screen_power_key_short_press(); screen_power_step(); assert(!screen_power_is_dark());
+    screen_power_key_short_press(); screen_power_step(); finish_fade();
+    screen_power_request_wake(); screen_power_step(); assert(!screen_power_is_dark());
+    touch_read_result=ESP_OK; touch_level=1;
+    puts("PASS power key and explicit wake remain independent of an absent/faulted touch controller");
     lv_deinit();
     puts("ALL SCREEN POWER TESTS PASSED");
     return 0;
