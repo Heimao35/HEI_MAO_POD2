@@ -106,7 +106,8 @@ typedef struct {
 
     /* 数值状态 */
     uint8_t battery_pct;      /**< 电池电量百分比 0-100 */
-    uint8_t brightness;       /**< 当前亮度 0-100 */
+    uint8_t brightness;       /**< 当前亮屏亮度5-100；自动模式下由光感更新，不含熄屏渐灭值 */
+    uint8_t manual_brightness; /**< 最近手动亮度，单独持久化，避免光照变化触发NVS写入 */
     uint8_t volume;           /**< 当前音量 0-100 */
     bool muted;              /**< 静音独立于音量数值保存，供 UI 和 NVS 共用 */
     bool auto_brightness;     /**< 自动亮度是否开启 */

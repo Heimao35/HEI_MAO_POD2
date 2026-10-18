@@ -2,6 +2,7 @@ idf_component_register(SRCS "main.c"
                               "sd_card.c"
                               "pmic_axp2101.c"
                               "screen_power.c"
+                              "ambient_light.c"
                               "system_power.c"
                               "player_settings.c"
                               "volume_keys.c"
@@ -29,7 +30,7 @@ idf_component_register(SRCS "main.c"
                                   esp_lcd esp_lcd_touch_cst820
                                   esp_hw_support driver
                                   esp_lvgl_port
-                                  esp_audio_codec spiffs nvs_flash)
+                                  esp_audio_codec spiffs nvs_flash esp_adc)
 
 # Font assets are packaged into a separate read-only-at-runtime SPIFFS image.
 # The image is flashed by `idf.py flash` together with the application.

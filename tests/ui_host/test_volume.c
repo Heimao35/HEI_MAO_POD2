@@ -9,7 +9,9 @@ static ui_device_state_t state = {.brightness=80, .volume=50};
 static bool locked_page, dark, ui_locked, allow_lock=true;
 static int up_level=1, down_level=1;
 static TickType_t ticks;
-static unsigned vol_calls, br_calls, other_clicks;
+static unsigned vol_calls, br_calls, other_clicks, auto_calls;
+static bool backend_automatic;
+static void auto_backend(bool automatic) { ++auto_calls; backend_automatic=automatic; }
 static uint8_t backend_volume;
 ui_device_state_t *ui_get_device_state(void) { return &state; }
 bool ui_lockscreen_is_visible(void) { return locked_page; }
@@ -135,6 +137,23 @@ int main(void)
     ticks=UINT32_MAX-20;up_level=0;poll_keys();key_time(40);assert(state.volume==75);
     assert(!br_calls && !ui_locked);
     puts("PASS GPIO pin config, debounce, repeat, chords, LVGL contention, dark suppression, tick wrap");
+    ui_adj_panel_set_auto_brightness_callback(auto_backend);
+    state.manual_brightness=80; state.brightness=45; state.auto_brightness=true;
+    lvgl_port_lock(0);ui_adj_panel_update_brightness();lvgl_port_unlock();
+    assert(lv_slider_get_value(s_bright_slider)==45 && state.auto_brightness);
+    assert(state.manual_brightness==80 && !br_calls);
+    lvgl_port_lock(0);lv_obj_send_event(s_auto_btn,LV_EVENT_CLICKED,NULL);lvgl_port_unlock();
+    assert(!state.auto_brightness && state.manual_brightness==45 && !br_calls);
+    assert(auto_calls==1 && !backend_automatic);
+    lvgl_port_lock(0);
+    lv_obj_send_event(s_auto_btn,LV_EVENT_CLICKED,NULL);
+    assert(auto_calls==2 && backend_automatic);
+    lv_slider_set_value(s_bright_slider,70,LV_ANIM_OFF);
+    lv_obj_send_event(s_bright_slider,LV_EVENT_VALUE_CHANGED,NULL);
+    lvgl_port_unlock();
+    assert(!state.auto_brightness && state.brightness==70 && state.manual_brightness==70 && br_calls==1);
+    assert(auto_calls==3 && !backend_automatic);
+    puts("PASS automatic slider sync retains mode/preference; explicit off and manual drag save preference");
     puts("ALL VOLUME TESTS PASSED");
     return 0;
 }

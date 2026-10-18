@@ -106,13 +106,16 @@ esp_err_t player_settings_init(void)
 void player_settings_restore_ui(void)
 {
     ui_device_state_t *st=ui_get_device_state();
-    st->brightness=s_ram.brightness; st->volume=s_ram.volume;
+    st->brightness=s_ram.brightness; st->manual_brightness=s_ram.brightness; st->volume=s_ram.volume;
     st->muted=s_ram.muted; st->auto_brightness=s_ram.auto_brightness;
 }
 void player_settings_capture(player_settings_t *out)
 {
     ui_device_state_t *st=ui_get_device_state();
-    s_ram.brightness=st->brightness<5?5:st->brightness;
+    /* TLV字段1延续原格式，含义为用户手动亮度。自动亮度只更新brightness，
+     * 不随环境变化保存，从而避免每次亮度调整后都触发3秒合并写入。
+     * 开机先用手动值亮屏，自动模式恢复后再由新鲜ADC数据平滑接管。 */
+    s_ram.brightness=st->manual_brightness<5?5:st->manual_brightness;
     s_ram.volume=st->volume; s_ram.muted=st->muted; s_ram.auto_brightness=st->auto_brightness;
     *out=s_ram;
 }

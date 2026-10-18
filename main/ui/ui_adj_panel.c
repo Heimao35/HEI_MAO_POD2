@@ -41,6 +41,7 @@ static bool s_muted   = false;            /**< 是否静音 */
 
 static ui_brightness_cb_t s_br_cb  = NULL;
 static ui_volume_cb_t     s_vol_cb = NULL;
+static ui_auto_brightness_cb_t s_auto_cb = NULL;
 
 /* 白色选中态必须反转图标颜色；所有点击和拖动取消路径统一配对恢复。
  * 此函数只设颜色，不修改自动亮度、静音、滑条数值或回调执行顺序。 */
@@ -82,10 +83,15 @@ static void bright_slider_cb(lv_event_t *e)
     /* 自动亮度开启时手动拖滑条 → 自动关闭自动亮度 */
     if (st->auto_brightness) {
         st->auto_brightness = false;
+        /* 手动拖动立即撤销显示任务中的自动模式，无需等滑条重新绘制。 */
+        if (s_auto_cb) s_auto_cb(false);
         set_toggle_colors(s_auto_btn, s_auto_icon, false);
     }
     int32_t val = lv_slider_get_value(s_bright_slider);
     st->brightness = (uint8_t)val;
+    /* 手动拖动仍退出自动模式；单独记住手动偏好，光感调整不会覆盖它。
+     * 不改变原滑条布局/事件传播/手势，硬件亮度继续由显示电源任务串行写入。 */
+    st->manual_brightness = (uint8_t)val;
     if (s_br_cb) s_br_cb((uint8_t)val);
 }
 
@@ -111,9 +117,15 @@ static void auto_bright_cb(lv_event_t *e)
     (void)e;
     ui_device_state_t *st = ui_get_device_state();
     st->auto_brightness = !st->auto_brightness;
+    /* 硬件渐变与UI绘制解耦后，开关必须主动通知后端，而不是由后端拿
+     * LVGL锁轮询。仅投递布尔值，不改变布局/手势，也不在此读取ADC。 */
+    if (s_auto_cb) s_auto_cb(st->auto_brightness);
     if (st->auto_brightness) {
         set_toggle_colors(s_auto_btn, s_auto_icon, true);
     } else {
+        /* 用户明确关闭自动模式时，以当前可见亮度作为新的手动偏好。
+         * 这只在点击开关时发生；光照引起的连续调节不会反复写NVS。 */
+        st->manual_brightness = st->brightness;
         set_toggle_colors(s_auto_btn, s_auto_icon, false);
     }
 }
@@ -436,6 +448,20 @@ void ui_adj_panel_update(void)
     }
     if (s_bright_slider) lv_slider_set_value(s_bright_slider, st->brightness, LV_ANIM_OFF);
     if (s_vol_slider)    lv_slider_set_value(s_vol_slider, st->volume, LV_ANIM_OFF);
+}
+
+/* 光感发布只同步亮度滑条，必须持有LVGL锁。set_value不发送VALUE_CHANGED，
+ * 因而不会触发手动回调、关闭自动亮度，也不会影响正在操作的音量/静音控件。
+ * 关闭自动模式时保留当前亮度；下次拖动再记录新的手动偏好。 */
+void ui_adj_panel_update_brightness(void)
+{
+    if (s_bright_slider)
+        lv_slider_set_value(s_bright_slider, ui_get_device_state()->brightness, LV_ANIM_OFF);
+}
+
+void ui_adj_panel_set_auto_brightness_callback(ui_auto_brightness_cb_t callback)
+{
+    s_auto_cb = callback;
 }
 
 void ui_adj_panel_set_callbacks(ui_brightness_cb_t br_cb, ui_volume_cb_t vol_cb)

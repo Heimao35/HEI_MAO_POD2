@@ -45,10 +45,16 @@ bool ui_adj_panel_is_visible(void);
 /** @brief 用当前设备状态刷新滑条位置和图标 */
 void ui_adj_panel_update(void);
 
+/** @brief 光感更新亮度滑条专用；持有LVGL锁，不发手动事件，不改变音量/静音。 */
+void ui_adj_panel_update_brightness(void);
+
 /** 亮度变更回调类型，参数为新亮度 0-100 */
 typedef void (*ui_brightness_cb_t)(uint8_t brightness);
 /** 音量变更回调类型，参数为新音量 0-100 */
 typedef void (*ui_volume_cb_t)(uint8_t volume);
+/** 自动亮度模式回调：UI锁内调用，后端只能投递请求，不能执行ADC/屏幕I/O。 */
+typedef void (*ui_auto_brightness_cb_t)(bool enabled);
+void ui_adj_panel_set_auto_brightness_callback(ui_auto_brightness_cb_t callback);
 
 /**
  * @brief 注册亮度和音量变更回调

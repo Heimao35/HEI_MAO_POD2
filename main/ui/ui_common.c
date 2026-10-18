@@ -19,6 +19,7 @@ static ui_device_state_t s_device_state = {
     .vbus_present      = false,
     .battery_pct       = 0,
     .brightness        = 80,
+    .manual_brightness = 80,
     .volume            = 50,
     .auto_brightness   = false,
     .hour              = 12,

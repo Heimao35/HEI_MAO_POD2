@@ -1,4 +1,6 @@
 #include "screen_power.h"
+#include "ambient_light.h"
+#include "ui/ui_adj_panel.h"
 #include "system_power.h"
 #include "display_dpi_sleep.h"
 #include "pmic_axp2101.h"
@@ -41,6 +43,13 @@ static atomic_uint s_events;
 static atomic_bool s_dark;
 static atomic_uchar s_brightness = 80;
 static atomic_bool s_brightness_pending;
+/* UI只在极短临界区投递模式/手动命令；ADC和DCS不持有此锁或LVGL锁。
+ * generation用于丢弃采样期间发生手动拖动/模式切换后已过期的自动结果。 */
+static portMUX_TYPE s_brightness_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_auto_brightness;
+static uint32_t s_brightness_generation;
+static bool s_auto_ui_dirty;
+static uint32_t s_auto_ui_generation;
 static bool s_stream_stopped;
 static atomic_bool s_shutdown_display, s_display_suspended;
 static bool s_sleep_fault_logged;
@@ -99,10 +108,26 @@ static void IRAM_ATTR touch_irq(esp_lcd_touch_handle_t touch)
 void screen_power_set_brightness(uint8_t brightness)
 {
     if (brightness < 5) brightness = 5;
+    if (brightness > 100) brightness = 100;
+    /* 此入口仅代表用户手动操作。自动渐变不再绕回此回调，否则UI锁竞争
+     * 会让硬件中间值无法提交。临界区只交接标量，绝不调用ADC/DCS/LVGL。 */
+    portENTER_CRITICAL(&s_brightness_mux);
+    s_auto_brightness = false;
+    ++s_brightness_generation;
     atomic_store(&s_brightness, brightness);
-    /* Slider callbacks execute under LVGL lock: queue only; serialize DCS
-     * commands with screen-off/wake on the power worker, outside the lock. */
     atomic_store(&s_brightness_pending, true);
+    portEXIT_CRITICAL(&s_brightness_mux);
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+void screen_power_set_auto_brightness(bool enabled)
+{
+    /* A按钮事件已经持有LVGL锁；这里只投递模式，不能等待显示任务。
+     * 关闭后即使UI暂时没机会刷新，也立即停止自动渐变并保留实际亮度。 */
+    portENTER_CRITICAL(&s_brightness_mux);
+    s_auto_brightness = enabled;
+    ++s_brightness_generation;
+    portEXIT_CRITICAL(&s_brightness_mux);
     if (s_task) xTaskNotifyGive(s_task);
 }
 
@@ -165,8 +190,9 @@ static void begin_screen_off_locked(void)
 static void check_lock_timeout(void)
 {
     if (system_power_is_active()) return;
-    if (lvgl_port_lock(50)) {
-        /* 只在锁屏计时。LVGL 的显示器活动时间涵盖全屏输入，而不只是在
+    if (lvgl_port_lock(ambient_light_is_transitioning() ? 1 : 50)) {
+        /* 渐变期间不为了检查锁屏超时长等LVGL，否则会拖慢锁外硬件步进。
+         * 只在锁屏计时。LVGL 的显示器活动时间涵盖全屏输入，而不只是在
          * 主屏冒泡成功的手势；持续按住/滑动也不会被当成十秒无操作。 */
         if (ui_lockscreen_is_visible() &&
             lv_display_get_inactive_time(s_display) >= LOCK_IDLE_MS &&
@@ -283,6 +309,53 @@ static void dark_idle(void)
     pmic_axp2101_pause_monitor(false);
 }
 
+/* 硬件渐变不能依赖LVGL锁：歌词/字体绘制可能占锁超过250ms，旧实现
+ * 会丢失整个过渡的中间值，解锁时按已经过去的时间直接写终点。
+ * 现在自动模式由UI回调投递，ADC/渐变/DCS均由显示任务锁外推进；
+ * generation复核保证采样期间手动操作后，迟到结果不能覆盖用户命令。 */
+static void update_ambient_brightness(void)
+{
+    if (screen_power_is_dark() || system_power_is_active()) {
+        ambient_light_reset();
+        return;
+    }
+    portENTER_CRITICAL(&s_brightness_mux);
+    bool automatic = s_auto_brightness;
+    uint32_t generation = s_brightness_generation;
+    portEXIT_CRITICAL(&s_brightness_mux);
+    if (!automatic) { ambient_light_reset(); return; }
+    uint8_t target;
+    /* 从已经成功发送的物理亮度起步；UI滑条允许稍后同步，不能当作硬件值。 */
+    if (!ambient_light_poll(s_panel_brightness, &target)) return;
+    if (system_power_is_active()) return;
+    portENTER_CRITICAL(&s_brightness_mux);
+    if (s_auto_brightness && s_brightness_generation == generation) {
+        atomic_store(&s_brightness, target);
+        atomic_store(&s_brightness_pending, true);
+        s_auto_ui_dirty = true;
+        s_auto_ui_generation = generation;
+    }
+    portEXIT_CRITICAL(&s_brightness_mux);
+}
+
+/* UI同步只是观察者。拿不到锁就保留dirty，下轮更新最新实际亮度，不能阻断
+ * 硬件渐变，也不重放积压的滑条动画。必须锁内发布状态，且不触发用户活动。
+ * 手动/模式事件只可能在LVGL锁内发生，因此锁内复核代次后不会覆盖新操作。 */
+static void publish_ambient_brightness(void)
+{
+    if (!s_auto_ui_dirty || screen_power_is_dark() || system_power_is_active()) return;
+    if (!lvgl_port_lock(1)) return;
+    portENTER_CRITICAL(&s_brightness_mux);
+    bool current = s_auto_brightness && s_auto_ui_generation == s_brightness_generation;
+    portEXIT_CRITICAL(&s_brightness_mux);
+    if (current && ui_get_device_state()->auto_brightness) {
+        ui_get_device_state()->brightness = s_panel_brightness;
+        ui_adj_panel_update_brightness();
+    }
+    s_auto_ui_dirty = false;
+    lvgl_port_unlock();
+}
+
 /* One serialized transition per iteration, also used by host regressions. */
 static void screen_power_step(void)
 {
@@ -290,6 +363,7 @@ static void screen_power_step(void)
     /* 确认关机后复用渐灭/DPI 停止逻辑，但不进入 Light-sleep，也不接受
      * 唤醒打断持久化。失败时清除请求后再沿原唤醒路径恢复。 */
     if (atomic_load(&s_shutdown_display)) {
+        ambient_light_reset();
         if (!atomic_load(&s_dark)) {
             if (lvgl_port_lock(50)) {
                 begin_screen_off_locked();
@@ -298,8 +372,12 @@ static void screen_power_step(void)
         } else if (s_fading_out) fade_screen_off_step();
         return;
     }
-    if (!atomic_load(&s_dark) && atomic_exchange(&s_brightness_pending, false))
-        write_panel_brightness(atomic_load(&s_brightness));
+    update_ambient_brightness();
+    if (!atomic_load(&s_dark) && atomic_exchange(&s_brightness_pending, false)) {
+        if (write_panel_brightness(atomic_load(&s_brightness)) != ESP_OK)
+            atomic_store(&s_brightness_pending, true); /* 失败不把建议值冒充实际亮度。 */
+    }
+    publish_ambient_brightness();
     if (atomic_load(&s_dark)) {
         bool explicit_wake = (events & (EVENT_KEY | EVENT_WAKE_REQUEST)) != 0;
         bool touch_wake = false;
@@ -354,7 +432,10 @@ static void power_task(void *arg)
         screen_power_step();
         /* 有候选立即读触摸，平时仍用原周期推进渐灭/锁屏超时。RTC触摸
          * 唤醒后也会post_event，因此不额外等100ms才确认一次点按。 */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS((s_fading_out || s_touch_probe_pending) ? SCREEN_FADE_STEP_MS : 100U));
+        /* 自动亮度只有跨档的250ms线性过渡用20ms步进，稳定后仍100ms轮询。
+         * ADC自身限速100ms；中间步只写小型亮度命令，不新增全屏动画/遮罩。 */
+        bool fast_step = s_fading_out || s_touch_probe_pending || ambient_light_is_transitioning();
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(fast_step ? SCREEN_FADE_STEP_MS : 100U));
     }
 }
 
@@ -378,6 +459,10 @@ esp_err_t screen_power_init(lv_display_t *display, lv_indev_t *input,
     lvgl_port_lock(0);
     s_panel_brightness = ui_get_device_state()->brightness;
     atomic_store(&s_brightness, s_panel_brightness);
+    portENTER_CRITICAL(&s_brightness_mux);
+    s_auto_brightness = ui_get_device_state()->auto_brightness;
+    ++s_brightness_generation;
+    portEXIT_CRITICAL(&s_brightness_mux);
     atomic_store(&s_brightness_pending,true); /* 应用恢复的偏好，不沿用面板上电80%。 */
     lv_display_trigger_activity(display);
     lvgl_port_unlock();

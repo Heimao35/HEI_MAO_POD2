@@ -13,6 +13,7 @@
 #include "esp_ldo_regulator.h"
 #include "esp_lvgl_port.h"
 #include "screen_power.h"
+#include "ambient_light.h"
 #include "system_power.h"
 #include "player_settings.h"
 #include "volume_keys.h"
@@ -312,6 +313,7 @@ void app_main(void)
 
     /* 注册亮度回调，滑条拖动时实际调节屏幕亮度 */
     ui_adj_panel_set_callbacks(screen_power_set_brightness, NULL);
+    ui_adj_panel_set_auto_brightness_callback(screen_power_set_auto_brightness);
 
     lvgl_port_unlock();
 
@@ -334,6 +336,10 @@ void app_main(void)
 
     /* 字体和 SD 初始挂载结束后才启动十秒计时；触摸 IRQ 包装器保留
      * LVGL 正常输入，仅在熄屏时截获唤醒。所有硬件操作均在锁外执行。 */
+    /* ALS初始化和ADC校准在LVGL锁外；随后由显示电源任务低频采样，
+     * 不额外创建会与Light-sleep并发的ADC任务。失败时保留原手动亮度。 */
+    esp_err_t light_ret = ambient_light_init();
+    if (light_ret != ESP_OK) ESP_LOGW(TAG, "Ambient light init failed: %s", esp_err_to_name(light_ret));
     esp_err_t power_ret = screen_power_init(lvgl_disp, lvgl_touch_indev, lcd_panel, touch_handle);
     if (power_ret != ESP_OK) ESP_LOGE(TAG, "Screen power init failed: %s", esp_err_to_name(power_ret));
 

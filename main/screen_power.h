@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "esp_err.h"
 #include <stdbool.h>
 #include "esp_lcd_panel_ops.h"
@@ -14,6 +14,8 @@ void screen_power_key_short_press(void);
 /* Existing brightness slider callback. Zero is reserved for screen-off;
  * restores the user's last nonzero brightness rather than a hardcoded value. */
 void screen_power_set_brightness(uint8_t brightness);
+/* UI自动亮度A开关回调：仅排队，不等待LVGL/ADC/DCS。硬件渐变独立于UI绘制。 */
+void screen_power_set_auto_brightness(bool enabled);
 
 /* Lock-free snapshot for input workers; includes brightness fade-out. */
 bool screen_power_is_dark(void);

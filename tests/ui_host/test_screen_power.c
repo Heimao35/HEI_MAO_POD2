@@ -8,9 +8,14 @@
 
 void vTaskDelay(unsigned ticks) { (void)ticks; }
 
+/* Sensor integration double: verifies sampling is outside UI/SD locks and
+ * that manual override during conversion defeats a late automatic result. */
+static unsigned light_polls, light_resets, light_ui_updates;
+static bool light_ready, manual_during_sample;
+static uint8_t light_target;
 static bool power_active;
 bool system_power_is_active(void) { return power_active; }
-static bool ui_locked, locked = true, anim_idle = true, playing;
+static bool ui_locked, locked = true, anim_idle = true, playing, ui_busy;
 static bool sd_available = true, sd_locked, pmic_idle = true, pmic_paused;
 static int touch_level = 1, pmic_level = 1;
 static unsigned stops, resumes, suspend_calls, resume_calls, locks, cancels;
@@ -58,10 +63,27 @@ static uint8_t brightness_value;
 static esp_err_t suspend_result, resume_result;
 static uint64_t wake_status;
 static bool inject_sleep_touch, inject_sleep_key;
-static ui_device_state_t state = {.brightness = 65};
+static ui_device_state_t state = {.brightness = 65, .manual_brightness = 65};
+void ambient_light_reset(void) { ++light_resets; }
+bool ambient_light_is_transitioning(void) { return light_ready && s_auto_brightness; }
+bool ambient_light_poll(uint8_t current, uint8_t *target)
+{
+    assert(!ui_locked && !sd_locked && !atomic_load(&s_dark) && !power_active);
+    ++light_polls; (void)current;
+    if(manual_during_sample) {
+        state.auto_brightness=false; state.brightness=63;
+        screen_power_set_auto_brightness(false); screen_power_set_brightness(63);
+    }
+    *target=light_target; return light_ready;
+}
+void ui_adj_panel_update_brightness(void) { assert(ui_locked); ++light_ui_updates; }
 
 bool lvgl_port_lock(uint32_t timeout)
-{ (void)timeout; assert(!ui_locked); ui_locked = true; return true; }
+{
+    assert(!ui_locked);
+    if(ui_busy && timeout) { test_ticks+=timeout; return false; }
+    ui_locked = true; return true;
+}
 void lvgl_port_unlock(void) { assert(ui_locked); ui_locked = false; }
 esp_err_t lvgl_port_stop(void) { assert(ui_locked); ++stops; return ESP_OK; }
 esp_err_t lvgl_port_resume(void) { assert(ui_locked); ++resumes; return ESP_OK; }
@@ -333,6 +355,51 @@ int main(void)
     screen_power_request_wake(); screen_power_step(); assert(!screen_power_is_dark());
     touch_read_result=ESP_OK; touch_level=1;
     puts("PASS power key and explicit wake remain independent of an absent/faulted touch controller");
+
+    /* Awake automatic control updates UI and queues hardware, without activity reset. */
+    locked=false; power_active=false; touch_level=1;
+    state.brightness=65; state.auto_brightness=true; light_ready=true; light_target=60;
+    screen_power_set_auto_brightness(true);
+    uint32_t inactive=lv_display_get_inactive_time(s_display);
+    unsigned updates_before=light_ui_updates;
+    screen_power_step();
+    assert(state.brightness==60 && brightness_value==60 && light_ui_updates==updates_before+1);
+    assert(state.manual_brightness==65 && lv_display_get_inactive_time(s_display)==inactive);
+    manual_during_sample=true;light_target=55; screen_power_step();
+    assert(state.brightness==63 && light_ui_updates==updates_before+1);
+    manual_during_sample=false;
+    unsigned polls_before=light_polls;
+    screen_power_step();assert(light_polls==polls_before); /* manual */
+    state.auto_brightness=true;screen_power_set_auto_brightness(true);power_active=true;
+    screen_power_step();assert(light_polls==polls_before); /* shutdown/dialog */
+    power_active=false;atomic_store(&s_dark,true);s_stream_stopped=false;
+    screen_power_step();assert(light_polls==polls_before); /* fade/off */
+    puts("PASS ALS outside locks, UI synchronization, no activity/NVS changes and manual/dark/power guards");
+
+    /* Regression: keep LVGL busy for longer than the entire250ms transition.
+     * Hardware must still receive every intermediate brightness, with UI catching
+     * up only after rendering releases the lock. Old UI-gated pipeline wrote none. */
+    atomic_store(&s_dark,false);power_active=false;locked=false;
+    state.brightness=63;state.auto_brightness=true;screen_power_set_auto_brightness(true);
+    ui_busy=true;unsigned history_before=brightness_calls;updates_before=light_ui_updates;
+    for(unsigned i=0;i<15;++i) {
+        test_ticks+=20;light_target=62-i;screen_power_step();
+        assert(brightness_value==62-i && state.brightness==63);
+        assert(light_ui_updates==updates_before);
+    }
+    assert(brightness_calls==history_before+15 && s_auto_ui_dirty);
+    ui_busy=false;light_ready=false;screen_power_step();
+    assert(state.brightness==48 && light_ui_updates==updates_before+1 && !s_auto_ui_dirty);
+    puts("PASS actual DCS intermediate values continue while LVGL busy>250ms; latest UI sync is deferred");
+
+    /* User cancels even while stale UI publication is deferred: never overwrite
+     * the manual slider/NVS preference with the old automatic result. */
+    ui_busy=true;light_ready=true;light_target=47;screen_power_step();assert(s_auto_ui_dirty);
+    state.auto_brightness=false;state.brightness=72;state.manual_brightness=72;
+    screen_power_set_auto_brightness(false);screen_power_set_brightness(72);
+    ui_busy=false;screen_power_step();
+    assert(brightness_value==72 && state.brightness==72 && state.manual_brightness==72 && !s_auto_ui_dirty);
+    puts("PASS deferred automatic publication cannot overwrite a newer manual request");
     lv_deinit();
     puts("ALL SCREEN POWER TESTS PASSED");
     return 0;

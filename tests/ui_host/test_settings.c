@@ -43,7 +43,7 @@ int main(void)
 {
     assert(player_settings_init()==ESP_OK && s_ready && !s_have_saved);
     player_settings_restore_ui(); assert(state.brightness==80 && state.volume==50);
-    state.brightness=29; state.volume=0; state.muted=true; state.auto_brightness=true;
+    state.manual_brightness=29; state.brightness=29; state.volume=0; state.muted=true; state.auto_brightness=true;
     music_item_t item; memset(&item,0,sizeof(item)); strcpy(item.name,"中文歌曲目录"); strcpy(item.audio,"同名音频.flac");
     player_settings_set_song(&item);
     player_settings_t before,after;
@@ -54,6 +54,12 @@ int main(void)
     player_settings_restore_ui(); player_settings_capture(&after);
     assert(player_settings_equal(&before,&after));
     assert(state.brightness==29 && state.volume==0 && state.muted && state.auto_brightness);
+    state.brightness=95; /* Automatically changed brightness is not a saved preference. */
+    player_settings_capture(&after);
+    assert(after.brightness==29 && player_settings_equal(&before,&after));
+    assert(player_settings_save(&after)==ESP_OK && commits==1);
+    assert(state.manual_brightness==29);
+    puts("PASS automatic brightness changes do not write NVS or replace manual preference");
     puts("PASS versioned UTF-8 song/settings roundtrip, commit/reopen/readback and unchanged write suppression");
     after.volume=66; fail_commit=true;
     assert(player_settings_save(&after)==ESP_FAIL && s_saved.volume==0);

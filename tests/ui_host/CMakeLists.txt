@@ -114,3 +114,12 @@ foreach(name settings system_power)
   endif()
   add_test(NAME ${name} COMMAND ${name}_tests)
 endforeach()
+
+# Production ALS sampler/linear ramp with a host ADC substitute.
+add_executable(ambient_light_tests test_ambient_light.c)
+target_include_directories(ambient_light_tests PRIVATE ../ambient_host/stubs ../media_host/stubs "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(ambient_light_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+  target_link_options(ambient_light_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME ambient_light COMMAND ambient_light_tests)
