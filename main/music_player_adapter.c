@@ -87,7 +87,8 @@ static void select_song(uint32_t index)
 
 static uint32_t get_time_ms(void) { return atomic_load(&s_time_ms); }
 static uint32_t get_duration_sec(void) { return atomic_load(&s_duration_sec); }
-static bool is_playing(void) { return atomic_load(&s_playing); }
+bool music_player_adapter_is_playing(void) { return atomic_load(&s_playing); }
+static bool is_playing(void) { return music_player_adapter_is_playing(); }
 
 static uint32_t get_lyric_line(uint32_t time_ms)
 {

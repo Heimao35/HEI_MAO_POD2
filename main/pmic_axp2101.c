@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "ui/ui_common.h"
 #include "ui/ui_statusbar.h"
+#include <stdatomic.h>
 
 static const char *TAG = "axp2101";
 
@@ -50,13 +51,31 @@ static const char *TAG = "axp2101";
  * These masks control notifications, not the PMIC's hardware protection,
  * charging algorithm or power-key shutdown behavior. When adding key/fault
  * handling, extend both these masks and the IRQ consumer together.
- * 0: SOC warning levels + Gauge New SOC; 1: VBUS/battery insertion/removal;
+ * 0: SOC warning levels + Gauge New SOC; 1: VBUS/battery + short power key;
  * 2: charging start/done. Other pending bits are left untouched. */
-static const uint8_t s_irq_masks[3] = {0xD0, 0xF0, 0x18};
+static const uint8_t s_irq_masks[3] = {0xD0, 0xF8, 0x18};
+#define IRQ_POWER_KEY_SHORT (1U << 3)
+static TaskHandle_t s_worker;
+static void (*s_key_callback)(void);
+static atomic_bool s_monitor_paused;
+static atomic_bool s_monitor_busy;
+
+void pmic_axp2101_set_key_callback(void (*callback)(void))
+{
+    /* Install before init starts the worker. Callback only queues an event. */
+    s_key_callback = callback;
+}
+
+bool pmic_axp2101_pause_monitor(bool pause)
+{
+    bool was_paused = atomic_exchange(&s_monitor_paused, pause);
+    if (was_paused && !pause && s_worker) xTaskNotifyGive(s_worker);
+    return !atomic_load(&s_monitor_busy);
+}
 
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_device;
-static TaskHandle_t s_worker;
+
 static bool s_configured;
 /* Rail startup has an independent lifetime from battery sampling. A monitor
  * retry must not cycle chips that have already been powered successfully. */
@@ -167,6 +186,12 @@ static esp_err_t acknowledge_irqs(void)
             esp_err_t ret = write_register(REG_IRQ_STATUS0 + bank, pending[bank]);
             if (ret != ESP_OK) return ret;
             handled = true;
+            /* 0x49[3] is the PMIC's debounced short-press event. Dispatch only
+             * after successful RW1C acknowledgement, so an I2C retry cannot
+             * deliver the same press twice. Long-press shutdown policy stays
+             * untouched. Never perform UI or sleep work in this callback. */
+            if (bank == 1 && (pending[bank] & IRQ_POWER_KEY_SHORT) && s_key_callback)
+                s_key_callback();
         }
         if (!handled || gpio_get_level(PMIC_IRQ_GPIO) != 0) break;
     }
@@ -274,7 +299,10 @@ static void monitor_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        esp_err_t ret = monitor_step();
+        esp_err_t ret = ESP_OK;
+        atomic_store(&s_monitor_busy, true);
+        if (!atomic_load(&s_monitor_paused)) ret = monitor_step();
+        atomic_store(&s_monitor_busy, false);
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ret == ESP_OK ? PMIC_POLL_MS : PMIC_RETRY_MS));
     }
 }

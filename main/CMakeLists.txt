@@ -1,6 +1,8 @@
 idf_component_register(SRCS "main.c"
                               "sd_card.c"
                               "pmic_axp2101.c"
+                              "screen_power.c"
+                              "volume_keys.c"
                               "music_library.c"
                               "audio_player.c"
                               "lyric_parser.c"

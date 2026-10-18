@@ -102,3 +102,25 @@ ESP32 供电依据：官方 Hardware Design Guidelines / Schematic Checklist / P
 - 插着充电线关机后的充电/自动开机表现需要在本板上验证；读取 VBUS good 和接收到 VBUS IRQ 不能证明关机状态的开机策略。
 - 锁屏与关机应分别设计。普通锁屏建议保留运行所需电源，仅处理界面、屏幕和交互；更低功耗可进一步评估主控睡眠与有选择的外设断电。PMIC 本身还有 `0x26` 睡眠/唤醒控制，须结合供电映射和唤醒线路设计，不能直接将整机 Soft PWROFF 用作需要继续播放或立即恢复的锁屏（第 20～21、37～38 页）。
 - 本轮仅核对能力并记录信息，尚未添加软件关机/PMIC 睡眠接口，未实际执行断电试验。
+
+## 锁屏熄屏、短按电源键与浅睡眠接入（2026-10-18）
+
+- 本轮新增授权：短按电源键进入锁屏，锁屏十秒无操作熄屏，触摸/短按电源键唤醒；未授权也未实现长按关机、整机 Deep-sleep 或 AXP2101 Soft PWROFF。
+- 仅增加 `0x41[3]` POWERON Short PRESS IRQ 使能，IRQ 掩码从 `D0/F0/18` 改为 `D0/F8/18`；对应 `0x49[3]` 在成功 RW1C 后向电源任务投递一次事件（原厂 PDF 第 42、44 页）。不改变按键时长、长按断电策略、充电设置或任何电源通道。
+- 现有屏幕触摸为 CST820：I2C0 SDA7/SCL8、RESET GPIO5、低有效 INT GPIO6。原 esp_lvgl_port 的触摸 IRQ 回调和 user_data 保留；熄屏时回调只记录唤醒标志，亮屏正常转交。IRQ 中不执行 I2C、LVGL 或文件操作。
+- `main/screen_power.c` 使用 LVGL 的输入活动时间：仅锁屏可见且无人按住屏幕时，满十秒或锁屏亮屏时再次短按电源键，先暂停 LVGL 定时器/输入、取消旧锁屏解码请求，再用 FreeRTOS 时钟推进约 300ms 亮度渐灭，到零后在帧 DMA 完成处停下 DPI 刷新，屏蔽仅用于诊断计数的 GPIO23 TE IRQ。不是只把画面刷成黑色。
+- 播放状态保持 CPU 运行；暂停/空闲采用最多约一秒一轮的显式 Light-sleep，轮次之间保留 PMIC 监测和 SD 热插拔处理机会。入睡前必须锁屏 JPEG worker 空闲、PMIC I2C worker 停稳，并在 LVGL 锁外取得 SD I/O 互斥锁。当前音乐后端尚无 DAC/连续解码，`music_player_adapter_is_playing()` 当前报告无真实输出；未来音频接入必须在实际输出整个期间维持准确播放状态。
+- P4 GPIO6/GPIO10 都是 RTC GPIO。使用 `esp_sleep_enable_ext1_wakeup_io(..., ESP_EXT1_WAKEUP_ANY_LOW)`，不通过 `gpio_wakeup_enable` 将正常负边沿 IRQ 改为电平 IRQ；每次睡眠返回后 `rtc_gpio_deinit` 交还数字 GPIO。触摸控制器、PMIC、PSRAM 及所需数字外设保持供电，不关闭 DCDC4/ALDO3，不开 HP 外设睡眠掉电。
+- PMIC 的 VBUS/SOC/充电中断可唤醒 CPU 进行后台处理，但只有解析出的短按事件才亮屏。触摸 EXT1 唤醒状态也用于捕获已结束的 IRQ 脉冲；唤醒触摸被等待释放逻辑吞掉，不同时触发解锁。恢复使用之前的非零亮度，并从锁屏首帧重播，保留原布局/上滑解锁及侧栏手势；仅从其他页面进入锁屏时使用 `UI_ANIM_DURATION_MS` 与 `UI_ANIM_PATH` 滑入；锁屏熄屏唤醒只重播 MJPEG，不重新滑入，渐灭中触摸/短按也可取消熄屏。
+- 锁屏 MJPEG 改成单一常驻 worker，复用原画布和解码 staging buffer；请求代次阻止旧帧写回，新锁屏/唤醒从头播放，熄屏和解锁禁止迟到的开机动画请求重新启动 JPEG。图像发布和 LVGL 绘制共用锁，JPEG/文件读取在锁外。
+- IDF v5.5.4 的 DPI 驱动无公开暂停 API，因此工程通过 `scripts/display_sleep.cmake`/`scripts/patch_dpi_sleep.py` 从已安装驱动生成带帧边界暂停握手的编译副本，输出仅在 `build/player_display`。追加实现为 `main/display_dpi_sleep.inc`，与原驱动同一编译单元，不猜测私有结构体 ABI、不修改 SDK 安装目录或 managed_components；版本及替换锚点不匹配则配置阶段报错，升级 SDK 必须复核。
+- 官方 API 核对范围：ESP-IDF v5.5.4 Sleep Modes（EXT1、显式 Light-sleep、PSRAM 保持及内部任务栈要求），本机同版本 `sleep_modes.c`、GPIO/RTCIO 与 MIPI-DPI/GDMA 驱动源码。能力不等于本板实测，GPIO 电平/脉宽、重复休眠恢复、DPI 首帧稳定性及整机电流仍需板上验证。
+
+
+## 锁屏唤醒后显示错位修正（2026-10-18）
+
+- 用户实测：熄屏后可正常唤醒，但显示内容错位。代码中已发现高疑似原因：DMA done 仅代表像素送至显示桥，不代表整帧已经从显示桥/Host 发往面板。原暂停立即关 DPI，随后直接从帧首重启，未清除旧 FIFO 和扫描状态；是否为本板唯一根因仍待实测。
+- `display_dpi_sleep.inc` 唤醒时在亮度仍为零、DMA 已停的条件下，保存显示桥时序/颜色/DMA 配置，复位显示桥及 Host，恢复配置，再使用原 `cur_fb_index` 的帧缓冲启动。不重建 LVGL、不新增全屏缓冲、不重置屏幕或 D-PHY，也不操作 PMIC 供电。
+- `patch_dpi_sleep.py` 在官方桥中断处理器加入真实 VSYNC 序号。恢复需等两个新 VSYNC 才成功返回并允许亮屏；不将 DMA done 或熄屏前遗留的中断状态作为完成条件。等待超时保持黑屏，并可重试等待，不能对已运行的 DMA 再次复位桥。
+- 此实现明确要求 `CONFIG_ESP32P4_REV_MIN_FULL >= 300`（本项目当前为 300）；较早芯片缺少对应桥复位/真实 VSYNC，编译报错，不能悄悄套用。SDK 仍固定 v5.5.4，生成文件仅位于 build，不改已安装 SDK 或 managed_components。
+- 主机测试 7/7 通过，含残留 FIFO、配置保存、保留当前帧缓冲、真实 VSYNC 等待、无 VSYNC 超时重试和计数器回绕。固件构建通过，镜像大小 `0x10cad0`；用户随后反馈恢复效果不错；连续长时间熄屏/唤醒稳定性仍需板上验证。

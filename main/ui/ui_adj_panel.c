@@ -25,6 +25,17 @@ static lv_obj_t *s_auto_btn      = NULL;
 static lv_obj_t *s_auto_icon     = NULL;
 static lv_obj_t *s_mute_btn      = NULL;  /**< 静音切换按钮 */
 static lv_obj_t *s_mute_icon     = NULL;  /**< 静音按钮图标 */
+/* 两种展开来源共用现有滑条和滑入曲线。手势模式仍显示亮度+音量并使用
+ * 原遮罩；实体键模式只显示音量，透明容器不参与命中，空白处可直接操作
+ * 下层页面。所有对象、计时和状态均只在 LVGL 线程/锁内访问。 */
+static lv_obj_t *s_bright_col;
+static lv_timer_t *s_volume_timer;
+static bool s_volume_only;
+static bool s_closing;
+static bool s_volume_touch;
+static uint32_t s_volume_activity;
+#define VOLUME_IDLE_MS 5000U
+#define VOLUME_PANEL_WIDTH (UI_ADJ_PANEL_WIDTH / 2)
 static bool s_visible = false;
 static bool s_muted   = false;            /**< 是否静音 */
 
@@ -37,6 +48,29 @@ static void set_toggle_colors(lv_obj_t *btn, lv_obj_t *icon, bool active)
 {
     lv_obj_set_style_bg_color(btn, active ? UI_COLOR_ACCENT : UI_COLOR_CONTROL_BG, 0);
     lv_obj_set_style_text_color(icon, active ? UI_COLOR_ON_ACCENT : UI_COLOR_TEXT, 0);
+}
+
+static void volume_activity(void)
+{
+    s_volume_activity = lv_tick_get();
+}
+
+/* 即便拖动到上下限、不再产生 VALUE_CHANGED，持续按住也不能超时收起。
+ * RELEASED/PRESS_LOST 后重新计五秒；触摸事件不冒泡到页面手势处理。 */
+static void volume_touch_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) s_volume_touch = true;
+    else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) s_volume_touch = false;
+    else return;
+    volume_activity();
+}
+
+static void volume_timeout_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_volume_only && s_visible && !s_closing && !s_volume_touch &&
+        lv_tick_elaps(s_volume_activity) >= VOLUME_IDLE_MS) ui_adj_panel_hide();
 }
 
 static void overlay_click_cb(lv_event_t *e) { (void)e; ui_adj_panel_hide(); }
@@ -58,6 +92,7 @@ static void bright_slider_cb(lv_event_t *e)
 static void vol_slider_cb(lv_event_t *e)
 {
     (void)e;
+    volume_activity();
     int32_t val = lv_slider_get_value(s_vol_slider);
     /* 静音时手动拖滑条 → 自动解除静音 */
     if (s_muted && val > 0) {
@@ -86,6 +121,7 @@ static void auto_bright_cb(lv_event_t *e)
 static void mute_btn_cb(lv_event_t *e)
 {
     (void)e;
+    volume_activity();
     s_muted = !s_muted;
     if (s_muted) {
         set_toggle_colors(s_mute_btn, s_mute_icon, true);
@@ -192,7 +228,7 @@ void ui_adj_panel_create(lv_obj_t *parent)
     lv_obj_set_style_border_width(s_panel, 0, 0);
     lv_obj_set_style_radius(s_panel, 0, 0);
     lv_obj_set_style_pad_all(s_panel, 0, 0);
-    lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
     /* 两列容器 —— flex START 使图标和滑条顶部对齐 */
     lv_obj_t *cols = lv_obj_create(s_panel);
@@ -204,10 +240,11 @@ void ui_adj_panel_create(lv_obj_t *parent)
     lv_obj_set_flex_flow(cols, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(cols, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-    lv_obj_remove_flag(cols, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(cols, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
     /* ===== 左列：亮度 ===== */
     lv_obj_t *br_col = lv_obj_create(cols);
+    s_bright_col = br_col;
     lv_obj_set_size(br_col, 80, UI_VER_RES - 20);
     lv_obj_set_style_bg_opa(br_col, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(br_col, 0, 0);
@@ -217,7 +254,7 @@ void ui_adj_panel_create(lv_obj_t *parent)
     lv_obj_set_flex_align(br_col, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(br_col, 10, 0);
-    lv_obj_remove_flag(br_col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(br_col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
     /* 亮度图标 —— EYE_OPEN 代表亮度/可见度（LVGL 无太阳图标） */
     lv_obj_t *br_icon = lv_label_create(br_col);
@@ -241,7 +278,7 @@ void ui_adj_panel_create(lv_obj_t *parent)
     lv_obj_set_flex_align(vol_col, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(vol_col, 10, 0);
-    lv_obj_remove_flag(vol_col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(vol_col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
     /* 音量图标 */
     lv_obj_t *vol_icon = lv_label_create(vol_col);
@@ -250,9 +287,13 @@ void ui_adj_panel_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(vol_icon, &lv_font_montserrat_22, 0);
 
     s_vol_slider = create_vertical_slider(vol_col, vol_slider_cb);
+    lv_obj_add_event_cb(s_vol_slider, volume_touch_cb, LV_EVENT_ALL, NULL);
 
     /* 静音按钮 —— 与自动亮度按钮样式相同 */
     s_mute_btn = create_round_btn(vol_col, LV_SYMBOL_VOLUME_MID, mute_btn_cb, &s_mute_icon);
+    lv_obj_add_event_cb(s_mute_btn, volume_touch_cb, LV_EVENT_ALL, NULL);
+    s_volume_timer = lv_timer_create(volume_timeout_cb, 100, NULL);
+    lv_timer_pause(s_volume_timer);
 
     lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     s_visible = false;
@@ -276,79 +317,109 @@ static void panel_hide_ready(lv_anim_t *a)
     (void)a;
     lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     s_visible = false;
+    s_closing = false;
+    s_volume_touch = false;
 }
 
-void ui_adj_panel_show(void)
+/* 从当前 X 开始滑动，连续按键只刷新数值/超时，不重复播放入场动画。
+ * 显示来源改变或收起中再次按键时，取消旧完成回调，避免旧回调隐藏新面板。 */
+static void animate_panel(int32_t target, bool hide)
 {
-    if (!s_panel || s_visible) return;
-    bool on_lockscreen = ui_lockscreen_is_visible();
-
-    lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_overlay);
-
-    if (on_lockscreen) {
-        lv_obj_set_style_bg_opa(s_overlay, LV_OPA_TRANSP, 0);
-    } else {
-        lv_obj_set_style_bg_opa(s_overlay, 0, 0);
-
-        lv_anim_t a_ov;
-        lv_anim_init(&a_ov);
-        lv_anim_set_var(&a_ov, s_overlay);
-        lv_anim_set_values(&a_ov, 0, 80);
-        lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
-        lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
-        lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
-        lv_anim_start(&a_ov);
-    }
-
-    lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_panel);
-    ui_adj_panel_update();
-
+    lv_anim_delete(s_panel, panel_anim_x_cb);
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_panel);
-    lv_anim_set_values(&a, (int32_t)UI_HOR_RES,
-                       (int32_t)(UI_HOR_RES - UI_ADJ_PANEL_WIDTH));
+    lv_anim_set_values(&a, lv_obj_get_x(s_panel), target);
     lv_anim_set_duration(&a, UI_ANIM_DURATION_MS);
     lv_anim_set_path_cb(&a, UI_ANIM_PATH);
     lv_anim_set_exec_cb(&a, panel_anim_x_cb);
+    if (hide) lv_anim_set_completed_cb(&a, panel_hide_ready);
     lv_anim_start(&a);
+}
+
+static void show_panel(bool volume_only)
+{
+    if (!s_panel) return;
+    if (s_visible && !s_closing && s_volume_only == volume_only) return;
+    bool on_lockscreen = ui_lockscreen_is_visible();
+    s_volume_only = volume_only;
+    s_closing = false;
+    lv_anim_delete(s_overlay, overlay_anim_opa_cb);
+
+    if (volume_only) {
+        /* 按键展开完全不显示遮罩，也不启动其渐变；仅控件本身接收触摸。
+         * 隐藏亮度列后缩成单列，避免保留一个不可见的半屏触摸占位。 */
+        lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_bright_col, LV_OBJ_FLAG_HIDDEN);
+        lv_timer_resume(s_volume_timer);
+        lv_timer_reset(s_volume_timer);
+        volume_activity();
+    } else {
+        lv_timer_pause(s_volume_timer);
+        lv_obj_remove_flag(s_bright_col, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_overlay);
+        lv_obj_set_style_bg_opa(s_overlay, LV_OPA_TRANSP, 0);
+        if (!on_lockscreen) {
+            lv_anim_t a_ov;
+            lv_anim_init(&a_ov);
+            lv_anim_set_var(&a_ov, s_overlay);
+            lv_anim_set_values(&a_ov, 0, 80);
+            lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
+            lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
+            lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
+            lv_anim_start(&a_ov);
+        }
+    }
+    int32_t width = volume_only ? VOLUME_PANEL_WIDTH : UI_ADJ_PANEL_WIDTH;
+    lv_obj_set_width(s_panel, width);
+    lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_panel);
+    ui_adj_panel_update();
+    animate_panel((int32_t)UI_HOR_RES - width, false);
     s_visible = true;
+}
+
+void ui_adj_panel_show(void) { show_panel(false); }
+
+void ui_adj_panel_adjust_volume(int delta)
+{
+    if (!s_panel) return;
+    int value = ui_get_device_state()->volume + delta;
+    if (value < 0) value = 0;
+    if (value > 100) value = 100;
+    show_panel(true);
+    lv_slider_set_value(s_vol_slider, value, LV_ANIM_OFF);
+    /* 与拖动滑条共用解除静音、设备音量和后端回调，避免两条路径不同步。
+     * 暂未注册 DAC 回调时仍保留真实 UI 状态，之后可直接挂接音频后端。 */
+    vol_slider_cb(NULL);
+    lv_display_trigger_activity(lv_display_get_default());
 }
 
 void ui_adj_panel_hide(void)
 {
-    if (!s_panel || !s_visible) return;
-    bool on_lockscreen = ui_lockscreen_is_visible();
-
-    if (on_lockscreen) {
+    if (!s_panel || !s_visible || s_closing) return;
+    s_closing = true;
+    lv_timer_pause(s_volume_timer);
+    lv_anim_delete(s_overlay, overlay_anim_opa_cb);
+    if (s_volume_only || ui_lockscreen_is_visible()) {
         lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_anim_t a_ov;
         lv_anim_init(&a_ov);
         lv_anim_set_var(&a_ov, s_overlay);
-        lv_anim_set_values(&a_ov, 80, 0);
+        lv_anim_set_values(&a_ov, lv_obj_get_style_bg_opa(s_overlay, 0), 0);
         lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
         lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
         lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
         lv_anim_set_completed_cb(&a_ov, overlay_hide_ready);
         lv_anim_start(&a_ov);
     }
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, s_panel);
-    lv_anim_set_values(&a, (int32_t)(UI_HOR_RES - UI_ADJ_PANEL_WIDTH),
-                       (int32_t)UI_HOR_RES);
-    lv_anim_set_duration(&a, UI_ANIM_DURATION_MS);
-    lv_anim_set_path_cb(&a, UI_ANIM_PATH);
-    lv_anim_set_exec_cb(&a, panel_anim_x_cb);
-    lv_anim_set_completed_cb(&a, panel_hide_ready);
-    lv_anim_start(&a);
+    animate_panel((int32_t)UI_HOR_RES, true);
 }
 
 bool ui_adj_panel_is_visible(void) { return s_visible; }
+bool ui_adj_panel_is_modal(void) { return s_visible && !s_volume_only; }
 
 void ui_adj_panel_update(void)
 {

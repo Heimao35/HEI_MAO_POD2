@@ -34,7 +34,9 @@ void ui_lockscreen_create(lv_obj_t *parent);
 void ui_lockscreen_update(void);
 
 /**
- * @brief 显示锁屏页面（带滑入动画）
+ * @brief 进入锁屏或恢复已有锁屏，并从头重播 MJPEG。
+ * @note  仅从已隐藏的锁屏进入时播放页面滑入；亮屏唤醒不重复滑入。
+ *        调用方须持有 LVGL 锁。
  */
 void ui_lockscreen_show(void);
 
@@ -50,9 +52,12 @@ void ui_lockscreen_hide(void);
 bool ui_lockscreen_is_visible(void);
 
 /**
- * @brief 启动锁屏 MJPEG 开机动画（SD 卡挂载后调用）
+ * @brief 从头重播锁屏 MJPEG 动画（开机 SD 就绪、再次锁屏、熄屏唤醒均调用）
  */
 void ui_lockscreen_start_boot_anim(void);
+/** 取消旧代次，不等待 I/O；电源任务在锁外等待 idle 后才允许浅睡眠。 */
+void ui_lockscreen_stop_anim(void);
+bool ui_lockscreen_anim_is_idle(void);
 
 #ifdef __cplusplus
 }

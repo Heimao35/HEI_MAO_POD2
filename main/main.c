@@ -12,6 +12,8 @@
 #include "driver/gpio.h"
 #include "esp_ldo_regulator.h"
 #include "esp_lvgl_port.h"
+#include "screen_power.h"
+#include "volume_keys.h"
 
 #include "esp_lcd_co5300.h"
 #include "co5300_init_cmds.h"
@@ -277,12 +279,6 @@ static esp_err_t app_lvgl_init(void)
     return ESP_OK;
 }
 
-static void on_brightness_change(uint8_t val)
-{
-    if (val < 5) val = 5;
-    esp_lcd_panel_co5300_set_brightness(lcd_panel, val);
-}
-
 void app_main(void)
 {
     /* LCD HW initialization */
@@ -307,13 +303,14 @@ void app_main(void)
     ui_manager_init();
 
     /* 注册亮度回调，滑条拖动时实际调节屏幕亮度 */
-    ui_adj_panel_set_callbacks(on_brightness_change, NULL);
+    ui_adj_panel_set_callbacks(screen_power_set_brightness, NULL);
 
     lvgl_port_unlock();
 
     /* PMIC readings run on I2C1 in a separate worker. Start after UI objects
      * exist, outside the LVGL lock; an unavailable PMIC leaves an unknown
      * battery indication and is retried without blocking media startup. */
+    pmic_axp2101_set_key_callback(screen_power_key_short_press);
     esp_err_t pmic_ret = pmic_axp2101_init();
     if (pmic_ret != ESP_OK) ESP_LOGE(TAG, "PMIC monitor init failed: %s", esp_err_to_name(pmic_ret));
 
@@ -325,6 +322,15 @@ void app_main(void)
     /* Background SD catalogue/cover/LRC loader. No fake decoder or DAC task. */
     esp_err_t ret = music_player_adapter_init();
     if (ret != ESP_OK) ESP_LOGE(TAG, "Music integration failed: %s", esp_err_to_name(ret));
+
+    /* 字体和 SD 初始挂载结束后才启动十秒计时；触摸 IRQ 包装器保留
+     * LVGL 正常输入，仅在熄屏时截获唤醒。所有硬件操作均在锁外执行。 */
+    esp_err_t power_ret = screen_power_init(lvgl_disp, lvgl_touch_indev, lcd_panel, touch_handle);
+    if (power_ret != ESP_OK) ESP_LOGE(TAG, "Screen power init failed: %s", esp_err_to_name(power_ret));
+
+    /* 音量键与触摸滑条共享设备音量和回调；UI 和熄屏状态机就绪后再接入。 */
+    esp_err_t keys_ret = volume_keys_init();
+    if (keys_ret != ESP_OK) ESP_LOGE(TAG, "Volume keys init failed: %s", esp_err_to_name(keys_ret));
 
     /* 开机动画由音乐 worker 在首次 SD 曲库扫描和首首歌曲信息加载完成后
      * 启动。这里不再与首次扫描并行启动，避免动画读取 MJPEG 时抢占 SD

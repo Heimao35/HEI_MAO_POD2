@@ -115,7 +115,7 @@ static void gesture_released_cb(lv_event_t *e)
 
     /* ---- 锁屏页面下：上滑解锁，右边缘左滑开声光调节栏 ---- */
     if (ui_lockscreen_is_visible()) {
-        if (ui_adj_panel_is_visible()) {
+        if (ui_adj_panel_is_modal()) {
             if (is_horizontal && dx > GESTURE_MIN_DIST) {
                 ui_adj_panel_hide();
             }
@@ -156,8 +156,9 @@ static void gesture_released_cb(lv_event_t *e)
         return; /* 歌曲列表展开时不处理其他手势 */
     }
 
-    /* ---- 面板展开时不处理新手势 ---- */
-    if (ui_mode_panel_is_visible() || ui_adj_panel_is_visible()) return;
+    /* 完整声光栏保持原手势互斥；按键音量栏不拦截锁屏解锁、模式切换、
+     * 设置下拉或播放器手势。实际滑条触摸由控件接收，不冒泡到这里。 */
+    if (ui_mode_panel_is_visible() || ui_adj_panel_is_modal()) return;
 
     /* ---- 从状态栏区域下滑 → 展开设置页面 ---- */
     if (!is_horizontal && dy > GESTURE_MIN_DIST &&
@@ -368,5 +369,12 @@ ui_mode_t ui_manager_get_current_mode(void)
  */
 void ui_manager_lock(void)
 {
+    /* 电源键锁屏时收起原有浮层，防止设置页/面板继续盖住锁屏。
+     * 仅复用原收起动画，不改变这些页面自身的手势、布局及动画曲线。 */
+    ui_settings_hide();
+    ui_mode_panel_hide();
+    ui_adj_panel_hide();
     ui_lockscreen_show();
+    ui_statusbar_set_visible(true);
+    lv_display_trigger_activity(lv_display_get_default());
 }

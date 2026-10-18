@@ -115,6 +115,7 @@ int gpio_get_level(gpio_num_t gpio)
         if (registers[0x48+i] & registers[0x40+i]) return 0;
     return 1;
 }
+void xTaskNotifyGive(TaskHandle_t task) { assert(!in_isr && task == (void *)3); }
 void vTaskNotifyGiveFromISR(TaskHandle_t task, BaseType_t *woken)
 { assert(in_isr && task == (void *)3); ++notifications; *woken = pdTRUE; }
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t ticks)
@@ -144,6 +145,13 @@ static void check_right_bounds(void)
     if (!lv_obj_has_flag(s_charge, LV_OBJ_FLAG_HIDDEN))
         assert(icon.x2 < charge.x1 && charge.x2 <= parent.x2 && charge.y2 <= bar.y2);
 }
+static unsigned key_presses;
+static void key_event(void)
+{
+    assert(!in_isr && !ui_locked && !(registers[0x49] & (1U << 3)));
+    ++key_presses;
+}
+
 int main(void)
 {
     lv_init();
@@ -175,7 +183,7 @@ int main(void)
     registers[0x00] = (1U << 5) | (1U << 3);
     registers[0x01] = (1U << 5) | 2;
     registers[0xA4] = 68;
-    registers[0x49] = (1U << 7) | (1U << 3); /* startup-low VBUS + unowned key event. */
+    registers[0x49] = (1U << 7) | (1U << 3); /* startup-low VBUS + owned short-key event. */
     assert(monitor_step() == ESP_OK);
     assert(state->power_valid && state->battery_present && state->battery_pct_valid);
     assert(state->vbus_present && state->charging && state->battery_pct == 68);
@@ -185,7 +193,7 @@ int main(void)
     assert(!memcmp(rail_write_order, expected_order, sizeof(expected_order)));
     assert(registers[0x85] == 0xE4 && registers[0x94] == 0xBC);
     assert(registers[0x80] == 0x6D && registers[0x90] == 0xAD);
-    assert(registers[0x49] == (1U << 3));
+    assert(registers[0x49] == 0);
     assert(!strcmp(lv_label_get_text(s_batt_pct), "68%"));
     assert(!lv_obj_has_flag(s_charge, LV_OBJ_FLAG_HIDDEN));
     assert(lv_color_eq(lv_obj_get_style_text_color(s_charge, 0), lv_color_hex(0xFFD700)));
@@ -297,6 +305,26 @@ int main(void)
     fail_read_reg = -1;
     assert(monitor_step() == ESP_OK && s_outputs_ready && rail_writes == rails_before);
     puts("PASS already-on rails remain on; failed power I2C operations recover independently of battery monitoring");
+
+    pmic_axp2101_set_key_callback(key_event);
+    registers[0x49] |= 1U << 3;
+    assert(monitor_step() == ESP_OK && key_presses == 1);
+    assert(registers[0x41] == 0xF8);
+    assert(monitor_step() == ESP_OK && key_presses == 1);
+    registers[0x49] |= 1U << 3;
+    fail_write_reg = 0x49;
+    assert(monitor_step() == ESP_ERR_TIMEOUT && key_presses == 1);
+    fail_write_reg = -1;
+    assert(monitor_step() == ESP_OK && key_presses == 2);
+    registers[0x49] |= 1U << 2; /* Long key remains unowned. */
+    assert(monitor_step() == ESP_OK && key_presses == 2);
+    assert(registers[0x49] & (1U << 2));
+    assert(pmic_axp2101_pause_monitor(true));
+    atomic_store(&s_monitor_busy, true);
+    assert(!pmic_axp2101_pause_monitor(true));
+    atomic_store(&s_monitor_busy, false);
+    assert(pmic_axp2101_pause_monitor(false));
+    puts("PASS short-key delivered once after ACK, retry safe, long-key policy unchanged, monitor sleep handshake");
 
     lv_deinit();
     puts("ALL POWER MONITOR TESTS PASSED");

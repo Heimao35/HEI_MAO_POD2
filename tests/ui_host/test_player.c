@@ -17,7 +17,9 @@ const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 bool ui_settings_is_visible(void) { return false; }
 bool ui_lockscreen_is_visible(void) { return false; }
 bool ui_mode_panel_is_visible(void) { return false; }
-bool ui_adj_panel_is_visible(void) { return false; }
+static bool test_adj_visible, test_adj_modal;
+bool ui_adj_panel_is_visible(void) { return test_adj_visible; }
+bool ui_adj_panel_is_modal(void) { return test_adj_visible && test_adj_modal; }
 void ui_settings_show(void) {} void ui_settings_hide(void) {}
 void ui_lockscreen_hide(void) {}
 void ui_mode_panel_show(void) {} void ui_mode_panel_hide(void) {}
@@ -37,6 +39,7 @@ void ui_mode_panel_set_callback(ui_mode_switch_cb_t cb) { (void)cb; }
 void ui_adj_panel_create(lv_obj_t *p) { (void)p; }
 void ui_settings_create(lv_obj_t *p) { (void)p; }
 void ui_statusbar_create(lv_obj_t *p) { (void)p; }
+void ui_statusbar_set_visible(bool visible) { (void)visible; }
 void ui_statusbar_show_time(bool show) { (void)show; }
 
 /* Track display references independently of the JPEG cache tested by media_host. */
@@ -426,11 +429,17 @@ int main(void)
     drag(indev,230,new_bottom_strip,0,-90);
     assert(s_show_lyric && !ui_music_player_is_playlist_visible());
     assert(!s_lyric_touch_active);
+    /* 硬件按键栏可见时仍允许下层原有手势；完整声光栏仍然互斥。 */
+    test_adj_visible=true;test_adj_modal=true;
+    drag(indev,230,330,0,-80); advance(400);
+    assert(!ui_music_player_is_playlist_visible());
+    test_adj_modal=false;
     drag(indev,230,330,0,-80); advance(400);
     assert(ui_music_player_is_playlist_visible());
     drag(indev,230,10,0,100); advance(400);
     assert(!ui_music_player_is_playlist_visible());
-    puts("PASS real pointer gestures: swipe does not click, lyrics scroll, playlist opens outside and closes from top");
+    test_adj_visible=false;
+    puts("PASS real pointer gestures: lyrics scroll, playlist gestures and non-modal volume coexist");
     ui_music_player_set_library(0,"请插入 SD 卡");
     assert(s_pl_item_count==0 && s_library_count==0);
     assert(!lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));

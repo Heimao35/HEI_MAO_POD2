@@ -6,3 +6,5 @@ cmake_minimum_required(VERSION 3.5)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(esp32p4-idf5_co5300-mipi_esp-lvgl-port_lvgl9)
+
+include("${CMAKE_SOURCE_DIR}/scripts/display_sleep.cmake")
