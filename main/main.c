@@ -21,6 +21,7 @@
 #include "ui_adj_panel.h"
 #include "ui_lockscreen.h"
 #include "sd_card.h"
+#include "pmic_axp2101.h"
 #include "music_player_adapter.h"
 #include "ui_fonts.h"
 
@@ -309,6 +310,12 @@ void app_main(void)
     ui_adj_panel_set_callbacks(on_brightness_change, NULL);
 
     lvgl_port_unlock();
+
+    /* PMIC readings run on I2C1 in a separate worker. Start after UI objects
+     * exist, outside the LVGL lock; an unavailable PMIC leaves an unknown
+     * battery indication and is retried without blocking media startup. */
+    esp_err_t pmic_ret = pmic_axp2101_init();
+    if (pmic_ret != ESP_OK) ESP_LOGE(TAG, "PMIC monitor init failed: %s", esp_err_to_name(pmic_ret));
 
     /* Initial SD mount, followed by interrupt/poll-based hot-plug detection. */
     /* 放在 UI 初始化之后，确保 lockscreen 等 UI 对象已创建 */

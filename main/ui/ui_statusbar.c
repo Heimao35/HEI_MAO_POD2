@@ -4,7 +4,7 @@
  *
  * 布局：高度 UI_STATUSBAR_HEIGHT(38px)，宽度铺满屏幕，背景为低不透明度黑色。
  * 左侧 flex 容器放 WiFi/BT/耳机/SD 图标(20px字体)，中间放时间，
- * 右侧放电量百分比 + 电池图标(22px字体) + 充电闪电。
+ * 右侧放电量百分比 + 电池图标(26px字体) + 充电闪电。
  * 右侧容器使用固定宽度避免百分比文字被裁切。
  */
 
@@ -33,8 +33,10 @@ static const char *battery_symbol(uint8_t pct)
 
 /** 状态栏图标字体大小，增大使图标更大 */
 #define SB_ICON_FONT  (&lv_font_montserrat_20)
-/** 状态栏电池图标字体，需要比普通图标更大以清晰显示电池形状 */
-#define SB_BATT_FONT  (&lv_font_montserrat_22)
+/** 电池图标从 22px 调大到 26px，沿用已编译的 LVGL 符号字体。
+ * 仍放在原 120px 右侧容器中并垂直居中；不改变状态栏高度、触摸区域
+ * 或左右区域的位置。充电闪电独立保留原字号和金色。 */
+#define SB_BATT_FONT  (&lv_font_montserrat_26)
 /** 状态栏文字字体 */
 #define SB_TEXT_FONT  (ui_font_16())
 
@@ -117,13 +119,14 @@ void ui_statusbar_create(lv_obj_t *parent)
 
     /* 电量百分比文字 —— 使用与图标相同的字体避免裁切 */
     s_batt_pct = lv_label_create(right);
-    lv_label_set_text(s_batt_pct, "75%");
+    /* 首次 PMIC 采样前明确表示未知，避免开机展示固定的虚假电量。 */
+    lv_label_set_text(s_batt_pct, "--%");
     lv_obj_set_style_text_color(s_batt_pct, UI_COLOR_STATUS_TEXT, 0);
     lv_obj_set_style_text_font(s_batt_pct, SB_TEXT_FONT, 0);
 
     /* 电池图标 —— 使用更大字体以清晰显示 */
     s_batt_icon = lv_label_create(right);
-    lv_label_set_text(s_batt_icon, LV_SYMBOL_BATTERY_FULL);
+    lv_label_set_text(s_batt_icon, LV_SYMBOL_BATTERY_EMPTY);
     lv_obj_set_style_text_color(s_batt_icon, UI_COLOR_STATUS_TEXT, 0);
     lv_obj_set_style_text_font(s_batt_icon, SB_BATT_FONT, 0);
 
@@ -137,6 +140,7 @@ void ui_statusbar_create(lv_obj_t *parent)
 
 void ui_statusbar_update(void)
 {
+    if (!s_bar) return;
     ui_device_state_t *st = ui_get_device_state();
     char buf[16];
 
@@ -152,11 +156,16 @@ void ui_statusbar_update(void)
     snprintf(buf, sizeof(buf), "%02d:%02d", st->hour, st->minute);
     lv_label_set_text(s_time_lbl, buf);
 
-    snprintf(buf, sizeof(buf), "%d%%", st->battery_pct);
+    /* 没有电池、读数越界或 I2C 暂时失败时显示 --% 和空电池。
+     * 不把无效读数夹成 0/100%，也不沿用之前的充电图标误导用户。
+     * VBUS 状态另存于 st->vbus_present；闪电只代表电池实际充电。 */
+    bool battery_known = st->power_valid && st->battery_present && st->battery_pct_valid;
+    if (battery_known) snprintf(buf, sizeof(buf), "%u%%", (unsigned)st->battery_pct);
+    else snprintf(buf, sizeof(buf), "--%%");
     lv_label_set_text(s_batt_pct, buf);
-    lv_label_set_text(s_batt_icon, battery_symbol(st->battery_pct));
+    lv_label_set_text(s_batt_icon, battery_known ? battery_symbol(st->battery_pct) : LV_SYMBOL_BATTERY_EMPTY);
 
-    if (st->charging) lv_obj_remove_flag(s_charge, LV_OBJ_FLAG_HIDDEN);
+    if (st->power_valid && st->charging) lv_obj_remove_flag(s_charge, LV_OBJ_FLAG_HIDDEN);
     else              lv_obj_add_flag(s_charge, LV_OBJ_FLAG_HIDDEN);
 }
 

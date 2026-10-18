@@ -96,7 +96,13 @@ typedef struct {
     bool bt_connected;
     bool headphone_inserted;
     bool sd_card_inserted;
-    bool charging;            /**< 充电线是否插入 */
+    /* 电源状态由 PMIC worker 在 LVGL 锁内整体发布。VBUS 接入与正在充电
+     * 分开：充满、未装电池等情况下即便有外部电源，也不显示充电闪电。 */
+    bool power_valid;         /**< 最近一次 PMIC 状态读取成功 */
+    bool battery_present;     /**< PMIC 检测到电池 */
+    bool battery_pct_valid;   /**< 已读取有效 SOC；false 时显示 --%，不用演示值 */
+    bool vbus_present;        /**< PMIC 报告 VBUS good，代表有效外部输入 */
+    bool charging;            /**< 电池实际处于充电过程 */
 
     /* 数值状态 */
     uint8_t battery_pct;      /**< 电池电量百分比 0-100 */
