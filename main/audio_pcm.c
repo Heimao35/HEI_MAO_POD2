@@ -2,12 +2,45 @@
 #include <string.h>
 #include "esp_attr.h"
 _Static_assert(ATOMIC_INT_LOCK_FREE==2,"DMA counters must be lock free");
+
+/* 按连续区段转换，格式分支放在样本循环外。输入按字节读取，允许解码器
+ * 返回非对齐地址；输出为内部 SRAM 中 4 字节对齐的 32bit I2S 槽。
+ * 无符号左移保留全部有效位，不截断 24/32bit，不做音量乘法或重采样。 */
+static uint32_t sample16(const uint8_t *p)
+{return (uint32_t)p[0]<<16 | (uint32_t)p[1]<<24;}
+static uint32_t sample24(const uint8_t *p)
+{return (uint32_t)p[0]<<8 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<24;}
+static uint32_t sample32(const uint8_t *p)
+{return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;}
+static void pack_contiguous(uint8_t *dst,const uint8_t *pcm,size_t frames,
+                            unsigned bits,unsigned channels)
+{
+    uint32_t *out=(uint32_t *)dst;
+    if(channels==2) {
+        if(bits==16) {
+            for(size_t f=0;f<frames;++f,pcm+=4,out+=2) {
+                out[0]=sample16(pcm);out[1]=sample16(pcm+2);
+            }
+        } else { /* 32bit stereo 已在调用处直接复制，此处只有 packed 24bit。 */
+            for(size_t f=0;f<frames;++f,pcm+=6,out+=2) {
+                out[0]=sample24(pcm);out[1]=sample24(pcm+3);
+            }
+        }
+    } else if(bits==16) {
+        for(size_t f=0;f<frames;++f,pcm+=2,out+=2)out[0]=out[1]=sample16(pcm);
+    } else if(bits==24) {
+        for(size_t f=0;f<frames;++f,pcm+=3,out+=2)out[0]=out[1]=sample24(pcm);
+    } else {
+        for(size_t f=0;f<frames;++f,pcm+=4,out+=2)out[0]=out[1]=sample32(pcm);
+    }
+}
 void audio_pcm_reset(audio_pcm_t *s,uint8_t *ring)
 {
     memset(s,0,sizeof(*s));s->ring=ring;
     atomic_init(&s->head,0);atomic_init(&s->tail,0);
     atomic_init(&s->sent,0);atomic_init(&s->submitted,0);atomic_init(&s->feed,false);
     atomic_init(&s->underrun_frames,0);
+    atomic_init(&s->min_queued_bytes,AUDIO_RING_BYTES);
 }
 size_t audio_pcm_push(audio_pcm_t *s,const uint8_t *pcm,size_t frames,unsigned bits,unsigned channels)
 {
@@ -16,29 +49,17 @@ size_t audio_pcm_push(audio_pcm_t *s,const uint8_t *pcm,size_t frames,unsigned b
     unsigned tail=atomic_load_explicit(&s->tail,memory_order_acquire);
     size_t free_frames=(AUDIO_RING_BYTES-(unsigned)(head-tail))/8;
     if(frames>free_frames)frames=free_frames;
-    /* 按格式在循环外分支；32bit双声道已经是总线格式，只需最多两次复制。
-     * 避免每个样本重新遍历字节；保留源数据的全部有效位。 */
+    size_t offset=head&(AUDIO_RING_BYTES-1);
+    size_t first_frames=(AUDIO_RING_BYTES-offset)/8;
+    if(first_frames>frames)first_frames=frames;
     if(bits==32 && channels==2) {
-        size_t bytes=frames*8;
-        size_t first=AUDIO_RING_BYTES-(head&(AUDIO_RING_BYTES-1));
-        if(first>bytes)first=bytes;
-        memcpy(s->ring+(head&(AUDIO_RING_BYTES-1)),pcm,first);
-        if(bytes>first)memcpy(s->ring,pcm+first,bytes-first);
+        memcpy(s->ring+offset,pcm,first_frames*8);
+        if(frames>first_frames)memcpy(s->ring,pcm+first_frames*8,(frames-first_frames)*8);
     } else {
-        unsigned width=bits/8;
-        for(size_t f=0;f<frames;++f) {
-            uint32_t stereo[2];
-            for(unsigned c=0;c<channels;++c) {
-                const uint8_t *p=pcm+(f*channels+c)*width;
-                uint32_t value=(uint32_t)p[0]|(uint32_t)p[1]<<8;
-                if(bits>=24)value|=(uint32_t)p[2]<<16;
-                if(bits==32)value|=(uint32_t)p[3]<<24;
-                /* 无符号移位避免负样本左移的未定义行为。 */
-                stereo[c]=value<<(32-bits);
-            }
-            if(channels==1)stereo[1]=stereo[0];
-            memcpy(s->ring+((head+f*8)&(AUDIO_RING_BYTES-1)),stereo,8);
-        }
+        pack_contiguous(s->ring+offset,pcm,first_frames,bits,channels);
+        if(frames>first_frames)
+            pack_contiguous(s->ring,pcm+first_frames*channels*(bits/8),
+                            frames-first_frames,bits,channels);
     }
     atomic_fetch_add_explicit(&s->submitted,frames,memory_order_relaxed);
     atomic_store_explicit(&s->head,head+frames*8,memory_order_release);
@@ -69,6 +90,12 @@ void IRAM_ATTR audio_pcm_dma(audio_pcm_t *s,void *dma,size_t bytes)
     if(first>take)first=take;
     memcpy(dma,s->ring+(tail&(AUDIO_RING_BYTES-1)),first);
     if(take>first)memcpy((uint8_t*)dma+first,s->ring,take-first);
+    /* 只有 ISR 降低水位；任务每个诊断窗口 exchange 重置。记录 DMA 消费后
+     * 的最低值，避免任务只在补完数据后采样而漏掉短暂见底。窗口边界允许
+     * 一次采样落在任一侧，不增加 ISR 循环、锁或日志。 */
+    unsigned left=(unsigned)(head-tail)-take;
+    if(left<atomic_load_explicit(&s->min_queued_bytes,memory_order_relaxed))
+        atomic_store_explicit(&s->min_queued_bytes,left,memory_order_relaxed);
     s->dma[slot].frames=take/8;
     atomic_store_explicit(&s->tail,tail+take,memory_order_release);
 }

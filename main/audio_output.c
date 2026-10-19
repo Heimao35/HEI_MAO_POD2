@@ -9,7 +9,7 @@
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "esp_audio_simple_dec.h"
-#include "esp_mp3_dec.h"
+#include "audio_mp3.h"
 #include "esp_flac_dec.h"
 #include "esp_heap_caps.h"
 #include "esp_lvgl_port.h"
@@ -52,7 +52,7 @@ static size_t s_output_capacity;
 static FILE *s_file; /* 仅在SD锁内访问，包括卸载回调；不将指针交给UI。 */
 static uint64_t s_file_size,s_file_offset,s_sent_total;
 static uint8_t s_flac_header[42];
-static bool s_flac_prefix;
+static bool s_flac_prefix,s_mp3_session;
 static uint32_t s_last_sent;
 static esp_audio_simple_dec_handle_t s_decoder;
 static esp_audio_simple_dec_raw_t s_raw;
@@ -62,28 +62,59 @@ static bool s_input_eof,s_decode_eof,s_dac_ready,s_tx_on,s_format_ready;
 static i2s_chan_handle_t s_tx;
 static TickType_t s_poll_at,s_retry_at;
 static bool s_have_retry,s_hp_dirty,s_hp;
-/* 任务内统计只记录阶段最大经过时间，不在ISR输出日志；5秒汇总一次。
- * 区分SD等待、解码耗时和真实PCM欠载，这些耗时不等同于CPU占用率。 */
-static TickType_t s_diag_at,s_read_max,s_decode_max,s_poll_max;
-static uint32_t s_diag_underrun;
-static void record_max(TickType_t *maximum,TickType_t start)
+/* 只在音频任务中计时、每 5s 汇总，ISR 仅维护内部 SRAM 中的无锁计数。
+ * max 是单次最大墙钟耗时（包括抢占），work 是本窗口各阶段累计墙钟耗时；
+ * decoded 是这些解码调用产出的音频时长，不能把单次 67ms 直接当成实时率。
+ * 例如一次产出 8192 帧/96kHz = 85.3ms，67ms 解码本身仍快于实时，但需要
+ * 足够储备覆盖这个突发；若 work 长期超过 decoded，再考虑解码器吞吐问题。 */
+static TickType_t s_diag_at,s_read_max,s_decode_max,s_push_max,s_step_max,s_poll_max;
+static uint64_t s_read_ticks,s_decode_ticks,s_push_ticks,s_decoded_frames;
+static uint32_t s_diag_underrun,s_decode_peak_frames;
+static TickType_t record_max(TickType_t *maximum,TickType_t start)
 {
     TickType_t elapsed=xTaskGetTickCount()-start;
     if(elapsed>*maximum)*maximum=elapsed;
+    return elapsed;
+}
+static void reset_diagnostics(void)
+{
+    s_diag_at=xTaskGetTickCount();
+    s_diag_underrun=atomic_load(&s_pcm.underrun_frames);
+    atomic_store(&s_pcm.min_queued_bytes,AUDIO_RING_BYTES);
+    s_read_max=s_decode_max=s_push_max=s_step_max=s_poll_max=0;
+    s_read_ticks=s_decode_ticks=s_push_ticks=s_decoded_frames=0;
+    s_decode_peak_frames=0;
+    audio_mp3_take_stats();
 }
 static void report_diagnostics(void)
 {
     TickType_t now=xTaskGetTickCount();
     if(!s_tx_on || (TickType_t)(now-s_diag_at)<pdMS_TO_TICKS(5000))return;
     uint32_t missing=atomic_load(&s_pcm.underrun_frames);
-    ESP_LOGI(TAG,"Audio: %luHz, queued=%uB, underrun=%lu frames/5s, max read/decode/poll=%lu/%lu/%lu ms",
-        (unsigned long)s_format.sample_rate,(unsigned)audio_pcm_queued(&s_pcm),
+    unsigned minimum=atomic_exchange(&s_pcm.min_queued_bytes,AUDIO_RING_BYTES);
+    ESP_LOGI(TAG,"Audio: %luHz, queued=%uB, min=%uB, underrun=%lu frames/%lums, max read/decode/push/step/poll=%lu/%lu/%lu/%lu/%lu ms",
+        (unsigned long)s_format.sample_rate,(unsigned)audio_pcm_queued(&s_pcm),minimum,
         (unsigned long)(missing-s_diag_underrun),
+        (unsigned long)((now-s_diag_at)*portTICK_PERIOD_MS),
         (unsigned long)(s_read_max*portTICK_PERIOD_MS),
         (unsigned long)(s_decode_max*portTICK_PERIOD_MS),
+        (unsigned long)(s_push_max*portTICK_PERIOD_MS),
+        (unsigned long)(s_step_max*portTICK_PERIOD_MS),
         (unsigned long)(s_poll_max*portTICK_PERIOD_MS));
+    ESP_LOGI(TAG,"Audio work: read/decode/push=%lu/%lu/%lu ms, decoded=%lu ms, peak decode=%lu frames/%lu ms",
+        (unsigned long)(s_read_ticks*portTICK_PERIOD_MS),
+        (unsigned long)(s_decode_ticks*portTICK_PERIOD_MS),
+        (unsigned long)(s_push_ticks*portTICK_PERIOD_MS),
+        (unsigned long)(s_decoded_frames*1000/s_format.sample_rate),
+        (unsigned long)s_decode_peak_frames,(unsigned long)(s_decode_max*portTICK_PERIOD_MS));
+    audio_mp3_stats_t mp3=audio_mp3_take_stats();
+    if(s_mp3_session)ESP_LOGI(TAG,"MP3 core: calls=%lu, work=%lu ms, max=%lu ms",
+        (unsigned long)mp3.calls,(unsigned long)(mp3.core_ticks*portTICK_PERIOD_MS),
+        (unsigned long)(mp3.max_core_ticks*portTICK_PERIOD_MS));
     s_diag_underrun=missing;s_diag_at=now;
-    s_read_max=s_decode_max=s_poll_max=0;
+    s_read_max=s_decode_max=s_push_max=s_step_max=s_poll_max=0;
+    s_read_ticks=s_decode_ticks=s_push_ticks=s_decoded_frames=0;
+    s_decode_peak_frames=0;
 }
 
 static command_t command(void)
@@ -146,7 +177,7 @@ static void IRAM_ATTR dac_irq(void *arg)
 static bool IRAM_ATTR dma_sent(i2s_chan_handle_t handle,i2s_event_data_t *event,void *arg)
 {
     (void)handle;(void)arg;
-    /* ISR最多搬运3840字节，不读取PSRAM/SD/I2C。达到低水位时通知生产者，
+    /* ISR最多搬运2048字节，不读取PSRAM/SD/I2C。达到低水位时通知生产者，
      * 满队列上的任务真正阻塞，避免taskYIELD后继续抢占低优先级任务。
      * 由I2S驱动根据返回值执行ISR调度。 */
     audio_pcm_dma(&s_pcm,event->dma_buf,event->size);
@@ -203,9 +234,8 @@ static bool close_session(void)
     s_pcm_bytes=s_pcm_offset=0;s_file_offset=0;s_sent_total=0;s_last_sent=0;
     s_read_size=0;
     s_input_eof=s_decode_eof=s_format_ready=s_flac_prefix=false;
-    s_diag_underrun=0;s_diag_at=xTaskGetTickCount();
-    s_read_max=s_decode_max=s_poll_max=0;
     audio_pcm_reset(&s_pcm,s_ring);
+    reset_diagnostics();
     return true;
 }
 /* 只保留fLaC+STREAMINFO供解码器使用；流式跳过PICTURE/SEEKTABLE等块。
@@ -280,6 +310,7 @@ static esp_err_t open_session(command_t c)
     if(ret!=ESP_OK)return ret;
     s_current=c;
     atomic_store(&s_detached,false);
+    s_mp3_session=!info.is_flac;
     esp_audio_simple_dec_cfg_t cfg={.dec_type=info.is_flac?ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:ESP_AUDIO_SIMPLE_DEC_TYPE_MP3};
     esp_audio_err_t err=esp_audio_simple_dec_open(&cfg,&s_decoder);
     if(err!=ESP_AUDIO_ERR_OK)return ESP_ERR_NOT_SUPPORTED;
@@ -408,7 +439,7 @@ static esp_err_t configure_tx(void)
 }
 /* 保留通道也保留了DMA存储。每次启动先用静音覆盖全部8块，避免上一首
  * 残留样本在新的DMA回调补齐前发出；不能直接清空含待解码数据的s_input。
- * s_io仅为同步读取的staging，此处无SD读取正在进行，可借用其前3840字节。 */
+ * s_io仅为同步读取的staging，此处无SD读取正在进行，可借用其前2048字节。 */
 static esp_err_t clear_dma(void)
 {
     if(s_dma_primed)return ESP_OK;
@@ -452,17 +483,27 @@ static esp_err_t start_tx(void)
     portENTER_CRITICAL(&s_cmd_mux);
     if(s_cmd.serial==s_current.serial && s_cmd.play)atomic_store(&s_playing,true);
     portEXIT_CRITICAL(&s_cmd_mux);
-    s_diag_at=xTaskGetTickCount();
+    reset_diagnostics();
     return ESP_OK;
+}
+/* 解码结果一旦可用就交给 ring，避免慢解码返回后先绕回 I2C/日志/UI
+ * 轮询一圈。未放入的尾部继续保存在有上限的 PSRAM 输出块，绝不整曲缓存。 */
+static size_t push_decoded(void)
+{
+    size_t frame_bytes=s_format.channel*(s_format.bits_per_sample/8);
+    size_t frames=(s_pcm_bytes-s_pcm_offset)/frame_bytes;
+    TickType_t before=xTaskGetTickCount();
+    size_t pushed=audio_pcm_push(&s_pcm,s_output+s_pcm_offset,frames,
+                                 s_format.bits_per_sample,s_format.channel);
+    s_push_ticks+=record_max(&s_push_max,before);
+    s_pcm_offset+=pushed*frame_bytes;
+    return pushed;
 }
 static esp_err_t decode_step(bool *progress)
 {
     *progress=false;
     if(s_pcm_offset<s_pcm_bytes) {
-        size_t frame_bytes=s_format.channel*(s_format.bits_per_sample/8);
-        size_t frames=(s_pcm_bytes-s_pcm_offset)/frame_bytes;
-        size_t pushed=audio_pcm_push(&s_pcm,s_output+s_pcm_offset,frames,s_format.bits_per_sample,s_format.channel);
-        s_pcm_offset+=pushed*frame_bytes;*progress=pushed!=0;
+        *progress=push_decoded()!=0;
         return ESP_OK;
     }
     /* 带eos=true的最后输入交给parser，全部消费且输出送入ring后再结束。 */
@@ -482,14 +523,17 @@ static esp_err_t decode_step(bool *progress)
     }
     if(!s_raw.len && !s_input_eof) {
         TickType_t before=xTaskGetTickCount();
-        esp_err_t r=read_input();record_max(&s_read_max,before);
+        esp_err_t r=read_input();s_read_ticks+=record_max(&s_read_max,before);
         if(r!=ESP_OK)return r;
     }
     s_raw.consumed=0;
     esp_audio_simple_dec_out_t out={.buffer=s_output,.len=s_output_capacity};
     TickType_t before=xTaskGetTickCount();
     esp_audio_err_t err=esp_audio_simple_dec_process(s_decoder,&s_raw,&out);
-    record_max(&s_decode_max,before);
+    TickType_t elapsed=xTaskGetTickCount()-before;
+    s_decode_ticks+=elapsed;
+    bool peak=elapsed>=s_decode_max;
+    if(peak) {s_decode_max=elapsed;s_decode_peak_frames=0;}
     if(err==ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
         if(out.needed_size<=s_output_capacity || out.needed_size>OUTPUT_MAX_BYTES)return ESP_ERR_INVALID_SIZE;
         uint8_t *grown=heap_caps_realloc(s_output,out.needed_size,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
@@ -508,14 +552,18 @@ static esp_err_t decode_step(bool *progress)
         } else if(format.sample_rate!=s_format.sample_rate || format.channel!=s_format.channel ||
                   format.bits_per_sample!=s_format.bits_per_sample)return ESP_ERR_NOT_SUPPORTED;
         if(out.decoded_size%(s_format.channel*(s_format.bits_per_sample/8)))return ESP_ERR_INVALID_SIZE;
+        size_t frames=out.decoded_size/(s_format.channel*(s_format.bits_per_sample/8));
+        s_decoded_frames+=frames;
+        if(peak)s_decode_peak_frames=frames;
         s_pcm_bytes=out.decoded_size;s_pcm_offset=0;
+        push_decoded();
     }
     *progress=s_raw.consumed||out.decoded_size;
     if(!*progress) {
         if(s_input_eof && !s_raw.len) {s_decode_eof=true;return ESP_OK;}
         if(!s_input_eof && s_raw.len<INPUT_BYTES) {
             before=xTaskGetTickCount();
-            esp_err_t r=read_input();record_max(&s_read_max,before);return r;
+            esp_err_t r=read_input();s_read_ticks+=record_max(&s_read_max,before);return r;
         }
         return ESP_ERR_INVALID_RESPONSE; /* malformed data must not busy-loop */
     }
@@ -563,7 +611,7 @@ static void output_step(void)
     }
     /* 低水位时优先补PCM；I2C耳机轮询等音频储备充足后再执行。
      * IRQ仍能通知任务；首次初始化和暂停时不受水位限制。 */
-    if(!s_tx_on || audio_pcm_queued(&s_pcm)>=AUDIO_PCM_LOW_BYTES)poll_headphone();
+    if(!s_tx_on || audio_pcm_queued(&s_pcm)>=AUDIO_PCM_HIGH_BYTES)poll_headphone();
     update_position();report_diagnostics();
     command_t c=command();
     if(c.serial!=s_current.serial) {
@@ -593,7 +641,7 @@ static void output_step(void)
         audio_output_select(c.index,c.generation,true);return;
     }
     size_t queued=audio_pcm_queued(&s_pcm);
-    /* 冷启动、切歌和暂停恢复先积累48KiB，再打开DAC。短歌曲在EOF时
+    /* 冷启动、切歌和暂停恢复先达到高水位，再打开DAC。短歌曲在EOF时
      * 允许不足此水位启动，不能因达不到预缓冲量永远不播放。 */
     if(!s_tx_on && queued && (queued>=AUDIO_PCM_HIGH_BYTES || s_decode_eof)) {
         esp_err_t ret=start_tx();if(ret!=ESP_OK) {fail_current(ret,c);return;}
@@ -607,13 +655,15 @@ static void output_step(void)
             applied=volume;
         }
     }
-    /* 高低水位滞回：储备充足时释放CPU，DMA消耗到半满后再补PCM。
-     * 通知带计数，判断与阻塞之间到达的DMA/选歌/关机通知不会丢失。
-     * taskYIELD只让同优先级任务运行，不能替代这里的阻塞。 */
+    /* 保留接近满队列的储备，只在满队列附近阻塞，提前由 DMA 通知唤醒。
+     * 96kHz 下 32KiB 只够约 43ms，而实测一次解码可达 67ms，不能继续等到
+     * 半满再补充。通知带计数，DMA/选歌/关机事件不会在检查与等待间丢失。 */
     if(s_tx_on && queued>=AUDIO_PCM_HIGH_BYTES) {
         ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(100));return;
     }
+    TickType_t step_before=xTaskGetTickCount();
     bool progress;esp_err_t ret=decode_step(&progress);
+    record_max(&s_step_max,step_before);
     if(ret!=ESP_OK && ret!=ESP_ERR_TIMEOUT) {fail_current(ret,c);return;}
     if(!progress || ret==ESP_ERR_TIMEOUT)
         ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(2));
@@ -662,7 +712,7 @@ esp_err_t audio_output_init(void)
     s_output=heap_caps_malloc(s_output_capacity,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if(!s_io || !s_ring || !s_input || !s_output)goto fail;
     audio_pcm_reset(&s_pcm,s_ring);
-    if(esp_mp3_dec_register()!=ESP_AUDIO_ERR_OK || esp_flac_dec_register()!=ESP_AUDIO_ERR_OK) {
+    if(audio_mp3_register()!=ESP_AUDIO_ERR_OK || esp_flac_dec_register()!=ESP_AUDIO_ERR_OK) {
         ret=ESP_ERR_NOT_SUPPORTED;goto fail;
     }
     ret=sd_card_set_audio_detach_callback(detach_file);

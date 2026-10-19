@@ -12,7 +12,7 @@ static TickType_t ticks;
 static uint32_t generation=1,rate=192000;
 static unsigned bits=32,channels=2,opens,closes,polls,configures;
 static unsigned played_configs,channels_created,channels_deleted,clock_reconfigs;
-static unsigned direct_reads,preload_cursor,sd_lock_failures;
+static unsigned direct_reads,preload_cursor,sd_lock_failures,init_nomem_attempts;
 static bool fresh_request_in_prepare,enable_fail_once;
 static uint32_t last_rate;
 static ui_device_state_t device_state;
@@ -21,7 +21,8 @@ static uint8_t dma[AUDIO_DMA_COUNT][AUDIO_DMA_FRAMES*8];
 static void(*detach_callback)(void);
 static const char *fixture="audio-worker-fixture.bin";
 static uint64_t fixture_size=42+4+5*1024*1024+(192000*8/8192*8192);
-static bool fixture_flac=true,mock_mp3;
+static bool fixture_flac=true,mock_mp3,mock_flac_burst;
+static unsigned burst_calls;
 static unsigned decode_cost_ms;
 /* Simulate actual sample-clock cadence, not eight descriptors per C call.
  * This model fails when the worker sleeps 100ms without a DMA notification. */
@@ -107,7 +108,9 @@ esp_err_t cs43131_poll(bool *hp)
 esp_err_t i2s_new_channel(const i2s_chan_config_t *c,i2s_chan_handle_t *tx,i2s_chan_handle_t *rx)
 {assert(!rx && c->role==I2S_ROLE_SLAVE && !c->auto_clear_before_cb && !c->auto_clear_after_cb);*tx=(void*)1;memset(dma,0,sizeof(dma));++channels_created;return ESP_OK;}
 esp_err_t i2s_channel_init_std_mode(i2s_chan_handle_t tx,const i2s_std_config_t *c)
-{assert(tx && c->gpio_cfg.bclk==51 && c->gpio_cfg.ws==50 && c->gpio_cfg.dout==49 && c->gpio_cfg.mclk==-1);++configures;return ESP_OK;}
+{assert(tx && c->gpio_cfg.bclk==51 && c->gpio_cfg.ws==50 && c->gpio_cfg.dout==49 && c->gpio_cfg.mclk==-1);
+ if(init_nomem_attempts) {--init_nomem_attempts;return ESP_ERR_NO_MEM;}
+ ++configures;return ESP_OK;}
 esp_err_t i2s_channel_reconfig_std_clock(i2s_chan_handle_t tx,const i2s_std_clk_config_t *c)
 {assert(tx && c && !tx_enabled);last_rate=c->sample_rate_hz;++clock_reconfigs;return ESP_OK;}
 esp_err_t i2s_channel_preload_data(i2s_chan_handle_t tx,const void *src,size_t size,size_t *loaded)
@@ -129,7 +132,8 @@ esp_err_t i2s_channel_enable(i2s_chan_handle_t tx) {
 }
 esp_err_t i2s_channel_disable(i2s_chan_handle_t tx) {assert(tx && tx_enabled);tx_enabled=false;preload_cursor=0;return ESP_OK;}
 esp_err_t i2s_del_channel(i2s_chan_handle_t tx) {assert(tx && !tx_enabled);++channels_deleted;return ESP_OK;}
-esp_audio_err_t esp_mp3_dec_register(void) {return ESP_AUDIO_ERR_OK;}
+esp_audio_err_t audio_mp3_register(void) {return ESP_AUDIO_ERR_OK;}
+audio_mp3_stats_t audio_mp3_take_stats(void) {return (audio_mp3_stats_t){0};}
 esp_audio_err_t esp_flac_dec_register(void) {return ESP_AUDIO_ERR_OK;}
 esp_audio_err_t esp_audio_simple_dec_open(esp_audio_simple_dec_cfg_t *cfg,esp_audio_simple_dec_handle_t *h)
 {assert(cfg->dec_type==(fixture_flac?ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:ESP_AUDIO_SIMPLE_DEC_TYPE_MP3) && !s_decoder);*h=(void*)5;decoder_header_seen=!fixture_flac;++opens;return ESP_AUDIO_ERR_OK;}
@@ -144,6 +148,16 @@ esp_audio_err_t esp_audio_simple_dec_process(esp_audio_simple_dec_handle_t h,esp
     if(!decoder_header_seen) {
         assert(in->len>=42 && !memcmp(in->buffer,"fLaC",4) && (in->buffer[4]&0x80));
         in->consumed=42;out->decoded_size=0;decoder_header_seen=true;return ESP_AUDIO_ERR_OK;
+    }
+    /* A real-time-capable decoder can still have a 67ms burst. Each compressed
+     * block here yields8192 frames (85.3ms at96k), with one slow block in three. */
+    if(mock_flac_burst) {
+        const unsigned samples=8192,encoded=512,bytes=samples*channels*(bits/8);
+        if(out->len<bytes) {out->needed_size=bytes;return ESP_AUDIO_ERR_BUFF_NOT_ENOUGH;}
+        assert(in->len>=encoded);
+        advance_ms(++burst_calls%3==0?67:8);
+        memset(out->buffer,0x35,bytes);out->decoded_size=bytes;in->consumed=encoded;
+        return ESP_AUDIO_ERR_OK;
     }
     advance_ms(decode_cost_ms);
     if(mock_mp3) {
@@ -187,7 +201,11 @@ int main(void)
     assert(!tx_enabled && !audio_output_is_active());steps(20);assert(audio_output_time_ms()==paused);
     audio_output_toggle();steps(24);assert(audio_output_is_playing() && audio_output_time_ms()>=paused);
     puts("PASS real worker boot restore,192k32bit pause/resume and bounded5MiB FLAC PICTURE skip");
-    ticks+=100;quiesce_in_poll=true;output_iteration(); /* request arrives during I2C while BUSY */
+    ticks+=100;quiesce_in_poll=true;
+    /* The producer may defer polling until high water. Wait for the actual
+     * I2C hook, rather than assuming the next worker step will poll. */
+    for(unsigned i=0;i<300 && quiesce_in_poll;++i) {output_iteration();advance_ms(1);}
+    assert(!quiesce_in_poll); /* request arrived during I2C while BUSY */
     assert(!(atomic_load(&s_quiesce)&QUIESCE_ACK));
     output_iteration();assert(audio_output_quiesce(true) && !tx_enabled && !s_file);
     unsigned old_polls=polls;steps(3);assert(polls==old_polls);
@@ -301,7 +319,30 @@ int main(void)
         printf("PASS paced %luHz/%ubit/%s: startup reserve, no pre-EOF underrun, blocked producer and exact samples\n",
             (unsigned long)rate,bits,mock_mp3?"MP3 model":"FLAC model");
     }
-    /* A short track never reaches48KiB; it must still start and drain. */
+    /* Bursty96k/24bit decoding must be started with enough INTERNAL reserve.
+     * This fails with the old48/32KiB refill thresholds even though average
+     * decode throughput is faster than real time. It is not a real codec run. */
+    mock_mp3=false;mock_flac_burst=true;fixture_flac=true;
+    rate=96000;bits=24;channels=2;burst_calls=0;
+    fixture="audio-burst-fixture.bin";
+    FILE *burst=fopen(fixture,"wb");assert(burst);
+    uint8_t burst_header[42]={0};memcpy(burst_header,"fLaC",4);
+    burst_header[4]=0x80;burst_header[7]=34;
+    assert(fwrite(burst_header,1,42,burst)==42);
+    for(unsigned i=0;i<24*512;++i)assert(fputc(0x35,burst)!=EOF);
+    fclose(burst);fixture_size=42+24*512;
+    audio_output_select(0,generation,true);
+    bool burst_started=false;
+    for(unsigned i=0;i<5000 && !atomic_load(&s_finished);++i) {
+        output_iteration();advance_ms(1);
+        if(tx_enabled)burst_started=true;
+        if(!s_decode_eof)assert(!atomic_load(&s_pcm.underrun_frames));
+    }
+    assert(burst_started && burst_calls==24 && audio_output_take_finished());
+    assert(audio_output_time_ms()==24U*8192*1000/rate);
+    assert(close_session());remove(fixture);mock_flac_burst=false;
+    puts("PASS96k24bit67ms burst decode, early refill, no pre-EOF underrun and exact DMA clock");
+    /* A short track never reaches high water; it must still start and drain. */
     mock_mp3=false;fixture_flac=true;rate=44100;bits=16;decode_cost_ms=1;
     fixture="audio-short-fixture.bin";FILE *short_file=fopen(fixture,"wb");assert(short_file);
     uint8_t h[42]={0};memcpy(h,"fLaC",4);h[4]=0x80;h[7]=34;
@@ -316,6 +357,23 @@ int main(void)
     assert(channels_created==1 && channels_deleted==0 && clock_reconfigs>0 && direct_reads>0);
     assert(i2s_del_channel(s_tx)==ESP_OK);
     puts("PASS one reserved I2S channel, clock changes while stopped, clean DMA reuse and request version during failure");
+    s_tx=NULL;s_tx_rate=0;
+    /* The board reported repeated init_std_mode DMA allocation failure. Each
+     * attempt must dispose of the half-initialized channel; a later successful
+     * attempt must never reconfigure an uninitialized handle. This exercises
+     * error/retry behavior, not available SRAM or actual hardware allocation. */
+    unsigned created_before=channels_created,deleted_before=channels_deleted;
+    unsigned reconfigs_before=clock_reconfigs;
+    init_nomem_attempts=3;
+    for(unsigned i=0;i<3;++i) {
+        assert(create_tx(48000)==ESP_ERR_NO_MEM);
+        assert(!s_tx && !s_tx_rate && !tx_enabled);
+        assert(channels_created==created_before+i+1 && channels_deleted==deleted_before+i+1);
+    }
+    assert(create_tx(48000)==ESP_OK && s_tx && s_tx_rate==48000);
+    assert(clock_reconfigs==reconfigs_before && !init_nomem_attempts);
+    assert(i2s_del_channel(s_tx)==ESP_OK);s_tx=NULL;s_tx_rate=0;
+    puts("PASS repeated DMA init out-of-memory releases channels and permits clean retry");
     heap_caps_free(s_io);heap_caps_free(s_ring);heap_caps_free(s_input);heap_caps_free(s_output);
     assert(wait_calls>0 && dma_wakes>0);
     puts("PASS actual sample-clock DMA cadence wakes blocked producer; startup prebuffer, backpressure and exact EOS");

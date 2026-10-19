@@ -48,7 +48,7 @@ DCDC4=1.8V沿用已验证的PMIC启动配置。完整电源网络（VP、VA、VC
 | 压缩输入 | PSRAM | 32KiB |
 | 解码PCM单块 | PSRAM | 初始32KiB，按needed_size增长，最大512KiB |
 | SPSC PCM环形队列 | 内部SRAM | 64KiB |
-| I2S DMA | 内部SRAM | 8块×480帧×8字节，30KiB，另有驱动结构 |
+| I2S DMA | 内部SRAM | 8块×256帧×8字节，16KiB，另有驱动结构 |
 | FLAC虚拟文件头 | 固定静态 | 42字节，另用4字节解析块头 |
 
 512KiB对应FLAC最多65535采样帧、双声道32bit输出的上界，超过上限停止播放。解码器内部状态和任务/驱动结构另计，不能将上表当作整机总内存实测。任何大小的歌曲都按固定块读取，文件大小与偏移/累计已播采样数采用64位。
@@ -57,7 +57,7 @@ FLAC仅将fLaC+STREAMINFO交给解码器：使用有界seek跳过其他元数据
 
 `main/audio_pcm.c`将解码器返回的16/24/32bit小端PCM无损左对齐到32bit，单声道复制至两槽；不偷偷截成16bit，不进行隐式重采样。当前仅接受上表离散采样率和1/2声道，其他格式停止并打印错误。DSD/DoP及低采样率重采样不在当前实现范围。
 
-ISR每次最多复制一个3840字节DMA块，只作有界复制/清零和无锁32位计数。不读取文件、I2C、LVGL、不分配内存。内部环形队列与8个DMA地址对应的有效帧计数区分“已排队”和“已实际完成DMA发送”；欠载补零不累计播放位置。驱动回调前/后清零均关闭，回调自行完整覆盖有效数据并将欠载尾部清零，避免重复清零整块。已核对v5.5.4：只要注册on_sent，回调后仍执行cache writeback；不能开启after_cb清零覆盖刚写入的数据。`sdkconfig`及默认配置启用`CONFIG_I2S_ISR_IRAM_SAFE=y`，使Flash/NVS写入暂停缓存时I2S中断仍可运行；回调和PCM搬运函数在IRAM、队列和计数在内部SRAM，未在ISR读取PSRAM。该措施不能代替持续吞吐和Flash写入时的实板听测。计数自然回绕由任务以差值累加为64位。
+ISR每次最多复制一个2048字节DMA块，只作有界复制/清零和无锁32位计数。不读取文件、I2C、LVGL、不分配内存。内部环形队列与8个DMA地址对应的有效帧计数区分“已排队”和“已实际完成DMA发送”；欠载补零不累计播放位置。驱动回调前/后清零均关闭，回调自行完整覆盖有效数据并将欠载尾部清零，避免重复清零整块。已核对v5.5.4：只要注册on_sent，回调后仍执行cache writeback；不能开启after_cb清零覆盖刚写入的数据。`sdkconfig`及默认配置启用`CONFIG_I2S_ISR_IRAM_SAFE=y`，使Flash/NVS写入暂停缓存时I2S中断仍可运行；回调和PCM搬运函数在IRAM、队列和计数在内部SRAM，未在ISR读取PSRAM。该措施不能代替持续吞吐和Flash写入时的实板听测。计数自然回绕由任务以差值累加为64位。
 
 ## UI、音量与耳机
 
@@ -139,3 +139,211 @@ preflight: passed=代码结构检查、v5.5.4固件构建、14/14主机回归、
 preflight: passed=请求状态与异步元数据回归、对齐SD读取回归、I2S复用回归、14/14主机测试、v5.5.4固件构建；narrowed=播放按钮状态竞争和SD非对齐读取路径已修正；unresolved=真实MP3/FLAC解码耗时、SD卡实际吞吐和剩余卡顿贡献；unrun=本轮固件上板听测。
 
 
+
+## 2026-10-19 实板欠载反馈与突发解码优化
+
+已按用户要求先提交原有可播放版本：`9582f43 fix(audio): recover I2S DMA startup and SD scan`。
+该基线修正了 SD 启动扫描、I2S 初次配置/失败清理；DMA 实际配置为 8×256 帧，
+不能再按早期性能试验的 8×480 帧估算内部内存。本节后续优化留待实板验证。
+
+用户提供的实板窗口：48kHz/16bit PCM（此前这首曲目为 MP3）欠载 74449 帧，
+最大 read/decode/poll=8/42/2ms；96kHz/24bit FLAC 欠载 118528 帧，最大值9/67/3ms；
+44.1kHz/16bit FLAC 欠载0、最大8/13/3ms；另一首48kHz/16bit FLAC欠载0、最大11/15/3ms。
+后两首的听感分别为偶有卡顿、完全流畅。零欠载只证明该日志窗口的 PCM 供给，
+不证明全曲无异常；不能把全部曲目都误记为 FLAC。
+
+确认并修正的路径：
+
+- 原 ring 唤醒水位为 32KiB（高水位48KiB），96kHz/32bit stereo 只有
+  32768÷8÷96000≈42.7ms 储备，短于已报告的单次67ms解码。
+  保持64KiB内部ring、16KiB DMA不变，将低水位调为60KiB、高水位62KiB，
+  每次由DMA通知唤醒，避免在满队列轮询。低水位的ring储备约80ms/96kHz；
+  这是理论音频时长，不是实测调度延迟上界，也不保证192kHz的所有解码突发均可覆盖。
+- 解码输出一旦完成，在同一次 `decode_step()` 立刻转换并入ring；未消费尾部仍在
+  原有32..512KiB有界PSRAM块中。不再为本次可用PCM多绕一次I2C/状态轮询。
+- `audio_pcm.c` 将16/24bit stereo及16/24/32bit mono按连续ring区段转换；
+  位宽/声道分支移出样本循环，直接写入对齐32bit槽，32bit stereo继续两段复制。
+  输入允许非对齐，不超读24bit输入，保留全部有效位、单声道复制和左右声道顺序。
+- 耳机轮询仅在高水位储备充足时执行；任务优先级、核心归属、UI和电源策略保持原样。
+  当解码长期慢于实时、队列始终达不到高水位时，耳机状态发布可能推迟。
+- 未更换/升级解码库，未修改managed组件或已安装SDK。官方头文件说明
+  `use_frame_dec=true`要求完整帧输入，不能直接对当前任意长度32KiB数据块开启。
+
+串口每约5秒输出两行：
+
+```text
+Audio: ... queued=...B, min=...B, underrun=... frames/...ms, max read/decode/push/step/poll=... ms
+Audio work: read/decode/push=... ms, decoded=... ms, peak decode=... frames/... ms
+```
+
+- `min`：DMA消费后观察到的最低内部ring水位，窗口切换时原子重置；不是某次打印瞬间的水位。
+  ISR与窗口边界重合的样本可落在任一窗口，不为诊断在ISR内加锁/循环。
+- `read/decode/push`最大值与累计值：墙钟耗时，含任务被抢占的时间，不是CPU利用率。
+  `push`含PCM转换和入ring；`step`含单次解码生产步骤，可能同时包含读取与解码。
+- `decoded`：本窗口成功解码产生的采样帧换算音频时长；跨窗口存在预缓冲/尾部差异，
+  应观察多个连续窗口，不将单窗口的累计耗时比值当作严格的CPU或解码器基准。
+- `peak decode`：最大单次decoder调用的产出帧数及耗时；若最大调用只解析/缓存而未输出，帧数为0。
+  必须把耗时与产出音频时长比较，不能只凭67ms便断定平均解码速度不足。
+- 启动/恢复时重置诊断窗口，避免把首帧配置I2S/启动DAC等准备时间当作稳定播放性能。
+  EOF末尾补零仍可能计入欠载，建议采集中段连续日志。
+
+验证：
+
+- 主机CTest14/14通过。新增六种PCM位宽/声道组合，非对齐输入、跨ring末尾、逐样本位精确
+  参考校验以及DMA最低水位；保留暂停、热拔插、独立睡眠/关机屏障、精确EOS等回归。
+- 新增96kHz/24bit突发模型：每块512字节压缩数据产出8192采样帧，三次中一次耗时67ms，
+  其他两次8ms。新水位在EOF前无欠载；在build目录的测试副本仅恢复旧48/32KiB水位，
+  同一个用例触发欠载断言，证明用例能检出该缺陷。该模型不是运行真实FLAC库。
+- 媒体主机回归通过：300MiB稀疏文件、32bit/192kHz元数据、1301首曲库、封面/LRC等。
+- 使用既有ESP-IDF v5.5.4配置的Ninja构建通过；本地未重新运行完整配置步骤。
+  实板四首歌曲听测、真实decoder吞吐/平均耗时、192kHz持续播放仍待复测。
+
+
+## MP3 专项暂存与计时：此前实验（2026-10-19）
+
+本节保留实验记录。用户随后上板确认暂存已生效但未改善卡顿；暂存代码已移除，
+暂存及后续片内放置均已撤回，当前实现以后文“片内放置导致DMA不足的修复”为准。
+
+用户本轮确认：四首测试曲目中唯一仍明显卡顿的是48kHz MP3，其余三首FLAC
+听感已正常。96kHz/24bit FLAC第二个约5秒窗口欠载为0、最低ring为6144B，
+第一个窗口仍有256帧欠载，不能据此宣称全曲完全无欠载。
+MP3日志约5008ms内产出4656ms、约5012ms内产出4560ms音频，
+累计read/decode/push约13/4977/9ms与11/4983/6ms，说明当前生产速度持续
+落后于消费，单纯扩大缓冲只能延后耗尽。这里decode仍含simple parser，
+所有时间均为包含抢占的墙钟时间，并非CPU运行时间或已证实的算法瓶颈。
+
+针对该路径新增 `main/audio_mp3.c/.h`，通过已固定的esp_audio_codec 2.6.2
+公开 `esp_audio_dec_register()` 接口注册MP3包装，内部调用原
+`esp_mp3_dec_open/decode/reset/close()`；保留simple parser、完整帧边界、
+bit reservoir及原有音频精度。没有启用要求完整帧输入的旁路模式，
+没有修改库私有分配器、managed组件或SDK，也未替换FLAC路径。
+
+- MP3会话额外暂存为2048B压缩帧+4608B PCM，共6656B（6.5KiB）内部SRAM，
+  64B对齐。目的是尝试减少底层帧解码直接访问PSRAM的开销；实际收益待上板测量，
+  不代表已确认PSRAM是瓶颈。
+- 首帧先让官方decoder完成延迟分配，再由 `configure_tx()` 优先分配必需I2S DMA；
+  成功后才允许后续MP3 decode尝试分配暂存。会话关闭释放；分配不足只记录一次并
+  沿用原缓冲，不额外导致播放失败。64KiB ring、8x256-frame DMA保持不变。
+- 输入超过2048B直接交给原decoder，不截断；正常PCM逐字节复制回调用者缓冲。
+  若后续库要求大于4608B输出，遵循BUFF_NOT_ENOUGH/consumed约定，
+  仅在尚未消费输入且调用者原缓冲已足够时重试，并让该会话后续直接输出。
+- 每约5秒在原两行后增加：
+
+```text
+MP3 core: calls=..., work=... ms, max=... ms, direct in/out=.../...
+```
+
+`work/max`仅覆盖底层 `esp_mp3_dec_decode()`，仍包括抢占、按系统tick量化；
+`calls`包括缓冲协商重试，`direct in/out`为未使用暂存的调用次数，
+包含首帧、过大帧、暂存分配不足等。与 `Audio work` 的decode对照可以缩小
+parser与底层decoder的耗时范围，但不能当成CPU profiler或纯算法基准。
+下一次上板应对同一MP3连续播放15～20秒，保留连续三组完整日志，关注
+`decoded`能否跟上窗口时长、欠载是否停止增长，以及core占比。
+
+验证：ESP-IDF v5.5.4固件构建成功；主机CTest 15/15通过，包含新的真实包装
+加decoder double测试：非对齐输入/输出、字节一致性、大输入直通、DMA就绪前
+不分配暂存、分配失败、输出扩容协商/重试、错误及释放。主机测试不运行P4
+预编译MP3算法，不能证明实际提速、全部文件兼容或板上无卡顿。
+
+
+## MP3 运算代码与查找表的片内放置：已撤回实验（2026-10-19）
+
+以下保留实验记录。用户实板报告全部音频发生I2S DMA分配失败后已整项撤回，
+后文“片内放置导致DMA不足的修复”描述当前实现；配置项、链接片段及核验脚本
+已从工程移除，不要按本节重新启用。
+
+用户新日志连续8个窗口显示：约5秒窗口只产出3912..4080ms音频，
+`MP3 core`耗时约4856..4892ms，调用163..170次；每次输出1152帧、48kHz
+相当于24ms音频，底层调用均值约29..30ms，最大35..37ms。
+`direct in/out=0/0`证实此前暂存生效，但其吞吐没有改善；
+读取只有5..12ms、push只有2..12ms，不能再把持续缺口归因于SD读取或仅扩大队列。
+core仍包含抢占，日志定位的是底层调用范围，不证明全部时间都是算法计算。
+
+当前检查确认CPU配置400MHz、编译性能优化已开启；音频worker优先级5/core0，
+LVGL为core1。原镜像的Layer III实现 `pvmp3_*` 及其只读表使用默认PSRAM
+代码/数据路径。新的尝试使用ESP-IDF v5.5.4正式支持的LDFRAGMENTS/noflash机制：
+
+- `main/audio_mp3_hot.lf`只移动官方库的29个PacketVideo Layer III对象，
+  包括滤波、变换、Huffman、反量化等循环及只读查找表；没有移动整个codec archive。
+  `esp_mp3_dec`封装及其同文件的Layer I/II替代实现保留默认位置，避免额外占用约20KiB。
+- 链接map核验：运算代码21482B、常量11876B，合计33358B（约32.6KiB）输入段；
+  计入布局对齐后当前heap起点比此前增加33392B。这是静态SRAM代价，不是动态工作区大小。
+  此前6656B帧暂存及包装上下文已经移除，MP3播放期间相对暂存版净增约26KiB SRAM，
+  不会为整首MP3分配内存。官方动态工作区的分配策略没有被拦截/修改。
+- `audio_mp3.c`仅保留透明计时包装；open/reset/close直接注册官方函数，
+  decode直接透传handle和原始结构体，无暂存复制、二次解码或错误恢复分支。
+  原库版本、算法、bit reservoir、simple parser及PCM精度不变。
+- 配置项 `CONFIG_PLAYER_MP3_INTERNAL_MEMORY=y` 默认开启；在menuconfig的
+  `Player audio performance`中关闭，可对比默认PSRAM路径并回收这部分静态SRAM。
+  这不是“整个decoder可在cache关闭时运行”的保证；封装、堆、libc/parser依赖仍采用默认放置。
+- FLAC代码仍在默认外部区，64KiB内部ring、8x256-frame/16KiB DMA、
+  SD流式读取及UI布局/手势/动画没有调整。
+
+最新日志仍每约5秒三行；取消与已移除暂存有关的direct计数：
+
+```text
+Audio: ... queued=...B, min=...B, underrun=... frames/...ms, max read/decode/push/step/poll=... ms
+Audio work: read/decode/push=... ms, decoded=... ms, peak decode=... frames/... ms
+MP3 core: calls=..., work=... ms, max=... ms
+```
+
+此修改旨在减少解码代码和查找表的外部缓存失效/PSRAM访问开销。
+SRAM中的输入输出未能解决问题，并不能排除代码/表访问争用；但当前也没有
+板上采样证明缓存争用就是根因。真实提速幅度及卡顿是否消失须由同一MP3复测。
+
+验证：完整重新配置并使用ESP-IDF5.5.4构建成功，主机CTest15/15通过。
+MP3专项测试覆盖官方生命周期直接委派、输入输出指针/容量透传、错误/扩容语义、
+统计重置和tick回绕，未在主机执行P4预编译解码器。实际map核验29个对象均在
+0x4FF...内部SRAM，FLAC入口仍为0x480...默认外部区。
+
+以后升级codec或SDK时，必须重新核验对象名称和最终map，避免配置存在但未实际移动：
+
+```text
+python scripts/check_mp3_placement.py build/esp32p4-idf5_co5300-mipi_esp-lvgl-port_lvgl9.map
+# 配置关闭的对照构建加 --external。
+```
+
+官方依据：ESP-IDF Linker Script Generation / Specifying Placements（对象粒度noflash、
+LDFRAGMENTS）；本地5.5.4 `esp_system/app.lf`的noflash将text映射iram0_text、
+rodata映射dram0_data。此处只使用项目自有链接片段，未编辑SDK或managed组件。
+
+
+## 片内放置导致DMA不足的修复（2026-10-19，当前实现）
+
+用户实板日志确认此前片内放置实验引入严重播放回归：MP3和96kHz FLAC都在
+`i2s_channel_init_std_mode()`分配DMA时返回`ESP_ERR_NO_MEM`。连续多次点击仍失败，
+这次没有出现旧的半初始化句柄`INVALID_STATE`错误。
+
+SD是另一条日志链：先以40MHz成功挂载，在建立曲库磁盘索引时发生0x107写/读超时，
+既有恢复流程降为20MHz重挂载后成功扫描5首歌，封面/歌词也加载成功。因此这份日志
+证明后续不能播放的直接原因是I2S内存分配失败，不能将初次SD超时也当作已证实的
+SRAM故障、电气问题或SD损坏。SD频率、恢复流程和文件布局保持原样。
+
+本轮处理：
+
+- 移除`main/CMakeLists.txt`的MP3 LDFRAGMENTS注册，删除仅服务该实验的
+  `audio_mp3_hot.lf`、`main/Kconfig.projbuild`和`check_mp3_placement.py`，
+  从活动sdkconfig移除`PLAYER_MP3_INTERNAL_MEMORY`，避免旧y值继续生效。
+- 官方MP3代码和表恢复默认外部存储放置，回收此前静态占用的约32.6KiB内部SRAM；
+  不恢复已证实无收益的6.5KiB帧暂存。`audio_mp3.c`只保留透明计时，无额外解码工作区。
+- 保留此前改善FLAC突发的64KiB ring/60KiB补充水位/62KiB高水位和立即入队，
+  DMA保持8x256-frame共16KiB；UI、SD、DAC和PMIC策略不修改。
+- 保留I2S初始化失败后删除/清空句柄的处理，新增主机回归：连续三次DMA初始化
+  NO_MEM必须逐次释放半初始化通道，随后恢复资源时能干净重试，不重配无效句柄。
+
+SDK依据已核对本地5.5.4 `esp_driver_i2s/i2s_common.c`：DMA缓冲经
+`i2s_dma_calloc()`分配，失败返回NO_MEM并清理部分资源。最新官方文档新增的
+`dma_buffer_in_psram`接口不等于当前5.5.4具备此路径；本轮未引入PSRAM DMA或
+放宽IRAM安全约束。静态链接放置通过构建不能证明板上动态DMA余量充足。
+
+本轮目标是撤除已确认有害的内存占用并恢复原有可播放条件，不宣称MP3吞吐已解决。
+验证结果：完整ESP-IDF5.5.4固件重新配置/构建通过，CTest15/15通过。
+最终map核验29个MP3运算/表对象均恢复0x480...外部区，无遗留自定义放置配置；
+heap起点从实验版0x4ff7c120恢复为0x4ff73ea0，实际回收33408B静态SRAM
+（包含布局差异）。这些检查证明占用已撤除和错误重试逻辑正常，不证明实板
+DMA可用总量/最大连续块或音频已恢复。实际上板播放和初次40MHz SD超时
+是否复现仍须复测。
+
+## ?????????2026-10-19?
+
+??????????????MP3???????48kHz???5????3168..3312ms?????132..138?????4969..4998ms???39ms???5..11ms???6..9ms???????????SRAM???????????MP3??????????????????SD?????????????????I2S????DMA???

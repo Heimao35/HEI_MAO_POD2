@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "audio_pcm.h"
-static uint8_t ring[AUDIO_RING_BYTES],dma[AUDIO_DMA_COUNT][AUDIO_DMA_FRAMES*8];
+_Alignas(4) static uint8_t ring[AUDIO_RING_BYTES],dma[AUDIO_DMA_COUNT][AUDIO_DMA_FRAMES*8];
 static audio_pcm_t stream;
 static void reset(void) {audio_pcm_reset(&stream,ring);memset(dma,0,sizeof(dma));atomic_store(&stream.feed,true);}
 int main(void)
@@ -63,6 +63,30 @@ int main(void)
     assert(atomic_load(&stream.underrun_frames)==AUDIO_DMA_FRAMES-5);
     atomic_store(&stream.feed,false);audio_pcm_dma(&stream,dma[0],sizeof(dma[0]));
     assert(atomic_load(&stream.underrun_frames)==AUDIO_DMA_FRAMES-5);
+    /* Compare all supported source formats with a byte-wise reference. Start
+     * with just two frames left in the ring and unaligned input, so conversion
+     * must cross the wrap without losing low bits, sign, or channel order. */
+    for(unsigned bit=16;bit<=32;bit+=8)for(unsigned ch=1;ch<=2;++ch) {
+        reset();atomic_store(&stream.head,AUDIO_RING_BYTES-16);
+        atomic_store(&stream.tail,AUDIO_RING_BYTES-16);
+        uint8_t source[1+33*2*4];
+        for(unsigned i=0;i<sizeof(source);++i)source[i]=(uint8_t)(i*71+139);
+        assert(audio_pcm_push(&stream,source+1,33,bit,ch)==33);
+        audio_pcm_dma(&stream,dma[0],sizeof(dma[0]));
+        for(unsigned f=0;f<33;++f)for(unsigned c=0;c<2;++c) {
+            const uint8_t *sample=source+1+(f*ch+(ch==1?0:c))*(bit/8);
+            uint32_t value=0;
+            for(unsigned b=0;b<bit/8;++b)value|=(uint32_t)sample[b]<<(8*b);
+            value<<=32-bit;
+            uint32_t got;memcpy(&got,dma[0]+f*8+c*4,4);
+            assert(got==value);
+        }
+        assert(!audio_pcm_queued(&stream) && atomic_load(&stream.submitted)==33);
+        assert(atomic_exchange(&stream.min_queued_bytes,AUDIO_RING_BYTES)==0);
+        atomic_store(&stream.feed,false);audio_pcm_dma(&stream,dma[0],sizeof(dma[0]));
+        assert(atomic_load(&stream.min_queued_bytes)==AUDIO_RING_BYTES);
+    }
+    puts("PASS all16/24/32bit mono/stereo conversions: unaligned input, wrap, sign and DMA low-water diagnostics");
     free(large);puts("PASS32bit two-span copy wraps bit-exactly; partial DMA zeros stale tail, pause not an underrun");
     return 0;
 }

@@ -148,3 +148,15 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(audio_output_tests PRIVATE -static-libgcc)
 endif()
 add_test(NAME audio_output COMMAND audio_output_tests)
+
+# Official MP3 decoder timing wrapper: transparent forwarding with a frame codec double.
+add_executable(audio_mp3_tests test_audio_mp3.c)
+target_include_directories(audio_mp3_tests PRIVATE ../audio_host/stubs ../media_host/stubs
+  "${REPO}/main" "${REPO}/managed_components/espressif__esp_audio_codec/include"
+  "${REPO}/managed_components/espressif__esp_audio_codec/include/decoder"
+  "${REPO}/managed_components/espressif__esp_audio_codec/include/decoder/impl")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(audio_mp3_tests PRIVATE -O1 -Wall -Wextra)
+  target_link_options(audio_mp3_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME audio_mp3 COMMAND audio_mp3_tests)
