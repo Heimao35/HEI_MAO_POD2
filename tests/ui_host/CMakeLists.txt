@@ -149,7 +149,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME audio_output COMMAND audio_output_tests)
 
-# Official MP3 decoder timing wrapper: transparent forwarding with a frame codec double.
+# Actual minimp3 backend: real frame streams compared against independently decoded PCM.
 add_executable(audio_mp3_tests test_audio_mp3.c)
 target_include_directories(audio_mp3_tests PRIVATE ../audio_host/stubs ../media_host/stubs
   "${REPO}/main" "${REPO}/managed_components/espressif__esp_audio_codec/include"
@@ -158,5 +158,9 @@ target_include_directories(audio_mp3_tests PRIVATE ../audio_host/stubs ../media_
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(audio_mp3_tests PRIVATE -O1 -Wall -Wextra)
   target_link_options(audio_mp3_tests PRIVATE -static-libgcc)
+endif()
+target_compile_definitions(audio_mp3_tests PRIVATE MP3_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures/mp3")
+if(NOT MSVC)
+  target_link_libraries(audio_mp3_tests PRIVATE m)
 endif()
 add_test(NAME audio_mp3 COMMAND audio_mp3_tests)

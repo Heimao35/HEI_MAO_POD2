@@ -1,66 +1,142 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "esp_heap_caps.h"
+/* Intercept the actual adapter allocation: no internal-memory fallback is allowed. */
+#undef heap_caps_malloc
+#undef heap_caps_free
+static unsigned allocs,frees,live,peak;
+static int fail_alloc;
+static void *mp3_test_alloc(size_t n,unsigned caps)
+{
+    assert(caps==(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+    assert(n<=12*1024);
+    if(fail_alloc)return NULL;
+    void *p=test_heap_alloc(64,n);assert(p);
+    ++allocs;++live;if(live>peak)peak=live;
+    return p;
+}
+static void mp3_test_free(void *p) {assert(p && live);--live;++frees;test_heap_free(p);}
+#define heap_caps_malloc mp3_test_alloc
+#define heap_caps_free mp3_test_free
 #include "../../main/audio_mp3.c"
 
 static const esp_audio_dec_ops_t *registered;
 static TickType_t ticks;
-static esp_audio_err_t register_result=ESP_AUDIO_ERR_OK,decode_result=ESP_AUDIO_ERR_OK;
-static esp_audio_dec_in_raw_t *expected_raw;
-static esp_audio_dec_out_frame_t *expected_out;
-static esp_audio_dec_info_t *expected_info;
-static unsigned calls;
-TickType_t xTaskGetTickCount(void) {return ticks;}
+static esp_audio_err_t register_result=ESP_AUDIO_ERR_OK;
+TickType_t xTaskGetTickCount(void) {return ticks++;}
 esp_audio_err_t esp_audio_dec_register(esp_audio_type_t type,const esp_audio_dec_ops_t *ops)
 {assert(type==ESP_AUDIO_TYPE_MP3);registered=ops;return register_result;}
-esp_audio_err_t esp_mp3_dec_open(void *cfg,uint32_t size,void **h)
-{assert(!cfg && !size);*h=(void*)7;return ESP_AUDIO_ERR_OK;}
-esp_audio_err_t esp_mp3_dec_reset(void *h)
-{assert(h==(void*)7);return ESP_AUDIO_ERR_OK;}
-esp_audio_err_t esp_mp3_dec_close(void *h)
-{assert(h==(void*)7);return ESP_AUDIO_ERR_OK;}
-esp_audio_err_t esp_mp3_dec_decode(void *h,esp_audio_dec_in_raw_t *raw,
-                                   esp_audio_dec_out_frame_t *out,esp_audio_dec_info_t *info)
+
+static uint8_t *load(const char *name,const char *ext,size_t *size)
 {
-    assert(h==(void*)7 && raw==expected_raw && out==expected_out && info==expected_info);
-    ++calls;ticks+=3;
-    /* The timing wrapper must preserve ALL official output/error semantics. */
-    raw->consumed=decode_result==ESP_AUDIO_ERR_OK?raw->len:0;
-    out->needed_size=4608;out->decoded_size=decode_result==ESP_AUDIO_ERR_OK?4:0;
-    if(out->decoded_size) {out->buffer[0]=1;out->buffer[1]=2;out->buffer[2]=3;out->buffer[3]=4;}
-    *info=(esp_audio_dec_info_t){.sample_rate=48000,.bits_per_sample=16,.channel=2};
-    return decode_result;
+    char path[512];snprintf(path,sizeof(path),"%s/%s.%s",MP3_FIXTURE_DIR,name,ext);
+    FILE *f=fopen(path,"rb");assert(f);assert(!fseek(f,0,SEEK_END));
+    long n=ftell(f);assert(n>0);rewind(f);
+    uint8_t *data=malloc((size_t)n);assert(data);
+    assert(fread(data,1,(size_t)n,f)==(size_t)n);fclose(f);*size=(size_t)n;return data;
+}
+/* Independent MPEG header length calculation imitates the existing simple parser:
+ * feed EXACTLY one full compressed frame, rather than minimp3's own stream finder. */
+static size_t frame_bytes(const uint8_t *p,size_t left)
+{
+    assert(left>=4 && p[0]==0xff && (p[1]&0xe0)==0xe0);
+    unsigned version=(p[1]>>3)&3,layer=(p[1]>>1)&3;
+    assert(version!=1 && layer==1);
+    static const unsigned rate[]={44100,48000,32000};
+    static const unsigned br1[]={0,32,40,48,56,64,80,96,112,128,160,192,224,256,320};
+    static const unsigned br2[]={0,8,16,24,32,40,48,56,64,80,96,112,128,144,160};
+    unsigned ri=(p[2]>>2)&3,bi=p[2]>>4;assert(ri<3 && bi>0 && bi<15);
+    unsigned hz=rate[ri]/(version==3?1:version==2?2:4);
+    size_t n=(version==3?144000:72000)*(version==3?br1[bi]:br2[bi])/hz+((p[2]>>1)&1);
+    assert(n<=left);return n;
+}
+static size_t decode_all(void *h,uint8_t *input,size_t bytes,uint8_t *result,int split,
+                          unsigned rate,unsigned channels)
+{
+    size_t off=0,produced=0;unsigned before=allocs;
+    while(off<bytes) {
+        size_t n=split?frame_bytes(input+off,bytes-off):bytes-off;
+        /* Use intentionally unaligned source/output buffers. */
+        uint8_t source[16385],pcm[4609];assert(n<sizeof(source));memcpy(source+1,input+off,n);
+        memset(pcm,0xa5,sizeof(pcm));
+        esp_audio_dec_in_raw_t raw={.buffer=source+1,.len=(uint32_t)n};
+        esp_audio_dec_out_frame_t out={.buffer=pcm+1,.len=4608};
+        esp_audio_dec_info_t info={0};
+        assert(registered->decode(h,&raw,&out,&info)==ESP_AUDIO_ERR_OK);
+        assert(raw.consumed && raw.consumed<=n && out.decoded_size<=4608);
+        assert(info.sample_rate==rate && info.channel==channels && info.bits_per_sample==16);
+        assert(pcm[0]==0xa5 && out.decoded_size==info.frame_size);
+        memcpy(result+produced,pcm+1,out.decoded_size);produced+=out.decoded_size;off+=raw.consumed;
+    }
+    assert(allocs==before);return produced;
+}
+static void fixture(const char *name,unsigned rate,unsigned channels)
+{
+    size_t bytes,refbytes;uint8_t *input=load(name,"mp3",&bytes),*ref=load(name,"pcm",&refbytes);
+    uint8_t *actual=malloc(refbytes+4608),*stream=malloc(refbytes+4608);assert(actual && stream);
+    void *h=NULL;assert(registered->open(NULL,0,&h)==ESP_AUDIO_ERR_OK && h);
+    /* Capacity negotiation must NOT advance reservoir/synthesis state. */
+    uint8_t small[8];esp_audio_dec_in_raw_t raw={.buffer=input,.len=(uint32_t)frame_bytes(input,bytes)};
+    esp_audio_dec_out_frame_t out={.buffer=small,.len=sizeof(small)};esp_audio_dec_info_t info={0};
+    for(unsigned i=0;i<3;++i) {
+        raw.consumed=123;out.decoded_size=456;
+        assert(registered->decode(h,&raw,&out,&info)==ESP_AUDIO_ERR_BUFF_NOT_ENOUGH);
+        assert(!raw.consumed && !out.decoded_size && out.needed_size==4608);
+    }
+    size_t n=decode_all(h,input,bytes,actual,1,rate,channels);assert(n==refbytes);
+    /* Independent FFmpeg reference: decoder rounding differences <= 3 LSB. */
+    int peakdiff=0;double sq=0;
+    for(size_t i=0;i<n;i+=2) {
+        int a=(int16_t)(actual[i]|actual[i+1]<<8),b=(int16_t)(ref[i]|ref[i+1]<<8);
+        int d=a-b;int ad=d<0?-d:d;if(ad>peakdiff)peakdiff=ad;sq+=(double)d*d;
+    }
+    printf("%s: PCM=%luB, peak difference=%d, rms=%g LSB\n",name,(unsigned long)n,peakdiff,sqrt(sq/(n/2)));
+    assert(peakdiff<=3 && sq/(n/2)<1.0);
+    /* Explicit reset removes previous song state; output matches on every repeat.
+     * Leaving the same handle alive throughout each track exercises reservoir continuity. */
+    for(unsigned i=0;i<4;++i) {
+        assert(registered->reset(h)==ESP_AUDIO_ERR_OK);
+        assert(decode_all(h,input,bytes,stream,0,rate,channels)==n);
+        assert(!memcmp(actual,stream,n));
+    }
+    assert(registered->close(h)==ESP_AUDIO_ERR_OK && !live);
+    free(input);free(ref);free(actual);free(stream);
 }
 int main(void)
 {
-    register_result=ESP_AUDIO_ERR_MEM_LACK;
-    assert(audio_mp3_register()==ESP_AUDIO_ERR_MEM_LACK);
-    register_result=ESP_AUDIO_ERR_OK;
-    assert(audio_mp3_register()==ESP_AUDIO_ERR_OK && registered);
-    assert(registered->open==esp_mp3_dec_open && registered->reset==esp_mp3_dec_reset &&
-           registered->close==esp_mp3_dec_close);
-    void *h=NULL;assert(registered->open(NULL,0,&h)==ESP_AUDIO_ERR_OK && h==(void*)7);
-    uint8_t in[3073]={0},out[8194]={0};
-    esp_audio_dec_in_raw_t raw={.buffer=in+1,.len=3072};
-    esp_audio_dec_out_frame_t frame={.buffer=out+1,.len=8192};
-    esp_audio_dec_info_t info={0};
-    expected_raw=&raw;expected_out=&frame;expected_info=&info;
-    assert(registered->decode(h,&raw,&frame,&info)==ESP_AUDIO_ERR_OK);
-    assert(raw.buffer==in+1 && raw.len==3072 && raw.consumed==3072);
-    assert(frame.buffer==out+1 && frame.len==8192 && frame.decoded_size==4);
-    assert(!out[0] && !out[5] && out[1]==1 && out[4]==4 && info.sample_rate==48000);
-    decode_result=ESP_AUDIO_ERR_BUFF_NOT_ENOUGH;
-    assert(registered->decode(h,&raw,&frame,&info)==decode_result);
-    assert(raw.consumed==0 && frame.needed_size==4608 && !frame.decoded_size);
-    decode_result=ESP_AUDIO_ERR_FAIL;
-    assert(registered->decode(h,&raw,&frame,&info)==decode_result);
-    /* Unsigned tick subtraction must also handle a tick-counter wrap. */
-    ticks=(TickType_t)-2;
-    assert(registered->decode(h,&raw,&frame,&info)==decode_result);
-    audio_mp3_stats_t stats=audio_mp3_take_stats();
-    assert(stats.calls==4 && calls==4 && stats.core_ticks==12 && stats.max_core_ticks==3);
-    assert(!audio_mp3_take_stats().calls);
-    assert(registered->reset(h)==ESP_AUDIO_ERR_OK && registered->close(h)==ESP_AUDIO_ERR_OK);
-    puts("PASS transparent MP3 lifecycle/buffer/error forwarding and core-only timing with tick wrap");
+    register_result=ESP_AUDIO_ERR_MEM_LACK;assert(audio_mp3_register()==register_result);
+    register_result=ESP_AUDIO_ERR_OK;assert(audio_mp3_register()==ESP_AUDIO_ERR_OK && registered);
+    void *h=(void*)7;fail_alloc=1;
+    assert(registered->open(NULL,0,&h)==ESP_AUDIO_ERR_MEM_LACK && !h);fail_alloc=0;
+    assert(registered->open(NULL,0,NULL)==ESP_AUDIO_ERR_INVALID_PARAMETER);
+    assert(registered->reset(NULL)==ESP_AUDIO_ERR_INVALID_PARAMETER);
+    assert(registered->close(NULL)==ESP_AUDIO_ERR_INVALID_PARAMETER);
+    fixture("48k_stereo_cbr",48000,2);
+    fixture("44k_stereo_vbr",44100,2);
+    fixture("32k_mono",32000,1);
+    fixture("24k_mono_mpeg2",24000,1);
+    assert(peak==1 && allocs==frees && !live);
+    assert(registered->open(NULL,0,&h)==ESP_AUDIO_ERR_OK);
+    uint8_t zeros[4608]={0},garbage[16]={0};
+    esp_audio_dec_in_raw_t raw={.buffer=garbage,.len=16};
+    esp_audio_dec_out_frame_t out={.buffer=zeros,.len=sizeof(zeros)};esp_audio_dec_info_t info={0};
+    assert(registered->decode(NULL,&raw,&out,&info)==ESP_AUDIO_ERR_INVALID_PARAMETER);
+    raw.frame_recover=ESP_AUDIO_DEC_RECOVERY_PLC;
+    assert(registered->decode(h,&raw,&out,&info)==ESP_AUDIO_ERR_NOT_SUPPORT);
+    raw.frame_recover=ESP_AUDIO_DEC_RECOVERY_NONE;raw.buffer=NULL;
+    assert(registered->decode(h,&raw,&out,&info)==ESP_AUDIO_ERR_INVALID_PARAMETER);
+    raw.len=0;assert(registered->decode(h,&raw,&out,&info)==ESP_AUDIO_ERR_OK && !raw.consumed);
+    raw.buffer=garbage;raw.len=sizeof(garbage);
+    /* Garbage must not fabricate PCM or access outside the buffers. */
+    assert(registered->decode(h,&raw,&out,&info)!=ESP_AUDIO_ERR_BUFF_NOT_ENOUGH);
+    assert(!out.decoded_size && raw.consumed<=sizeof(garbage));
+    assert(registered->close(h)==ESP_AUDIO_ERR_OK);
+    audio_mp3_stats_t stats=audio_mp3_take_stats();assert(stats.calls && stats.core_ticks==stats.calls);
+    assert(stats.max_core_ticks==1 && !audio_mp3_take_stats().calls);
+    assert(allocs==frees && !live);
+    puts("PASS real MP3 frame/stream decode, FFmpeg PCM reference, reservoir/reset, bounded PSRAM, negotiation/errors");
     return 0;
 }

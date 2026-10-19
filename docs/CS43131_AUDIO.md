@@ -41,12 +41,13 @@ DCDC4=1.8V沿用已验证的PMIC启动配置。完整电源网络（VP、VA、VC
 
 ## 流式播放和内存
 
-`main/audio_output.c`为唯一解码/DAC/I2S任务，优先级5、固定core0、24KiB栈。只显式注册现有`esp_audio_codec`的MP3/FLAC解码器；不新增外部解码依赖、不修改managed组件。
+`main/audio_output.c`为唯一解码/DAC/I2S任务，优先级5、固定core0、24KiB栈。通过`esp_audio_dec_register()`注册MP3/FLAC frame decoder；当前MP3使用工程内固定版本的minimp3，FLAC及simple parser仍使用`esp_audio_codec 2.6.2`。不修改managed组件。详见文末MP3后端替换记录。
 
 | 用途 | 存储 | 上限/大小 |
 |---|---|---|
 | 压缩输入 | PSRAM | 32KiB |
 | 解码PCM单块 | PSRAM | 初始32KiB，按needed_size增长，最大512KiB |
+| MP3状态/单帧暂存 | PSRAM | 11276B，打开时单次申请、关闭时释放，逐帧不分配 |
 | SPSC PCM环形队列 | 内部SRAM | 64KiB |
 | I2S DMA | 内部SRAM | 8块×256帧×8字节，16KiB，另有驱动结构 |
 | FLAC虚拟文件头 | 固定静态 | 42字节，另用4字节解析块头 |
@@ -344,6 +345,64 @@ heap起点从实验版0x4ff7c120恢复为0x4ff73ea0，实际回收33408B静态SR
 DMA可用总量/最大连续块或音频已恢复。实际上板播放和初次40MHz SD超时
 是否复现仍须复测。
 
-## ?????????2026-10-19?
+## 撤回后的实板反馈（2026-10-19）
 
-??????????????MP3???????48kHz???5????3168..3312ms?????132..138?????4969..4998ms???39ms???5..11ms???6..9ms???????????SRAM???????????MP3??????????????????SD?????????????????I2S????DMA???
+用户确认系统已恢复，仍然只有MP3播放卡顿。最新48kHz日志每5秒仅产出3168..3312ms音频，底层132..138次调用合计4969..4998ms、最大39ms；读盘5..11ms、推送6..9ms。恢复反馈说明撤回静态SRAM放置后可以播放，不说明MP3持续吞吐达标，也不能用于确定此前初始SD超时的原因。后续优化应避免再次挤占I2S所需片内DMA空间。
+
+## MP3 后端替换验证（2026-10-19，当前实现）
+
+按用户要求，先将已恢复、可播放的版本提交为`9b0272f`，再进行本轮优化。
+用户最新MP3日志每约5秒产出约3.2秒音频，约5秒都落在底层解码调用内；
+这说明当前路径持续低于实时率。计时包含抢占，尚不能区分纯算法与调度/缓存影响。
+此前6656B片内暂存无改善，33KiB静态片内放置导致DMA不足，均不再使用。
+
+本轮仅替换MP3 frame decoder，采用上游minimp3：
+
+- 来源：`https://github.com/lieff/minimp3`，固定commit
+  `ea99364f61c14656440e8d77e9c233ccf3124633`，CC0-1.0。
+  `main/third_party/minimp3/`保留原始header、LICENSE、README及UPSTREAM.txt。
+  header SHA256=`57e437c5c1f0e8b243885d3929c8973b5e6c778451e0100ab4251d19915cb3ad`。
+- `audio_mp3.c`经公开`esp_audio_dec_register(ESP_AUDIO_TYPE_MP3, ...)`替换底层。
+  `esp_audio_simple_dec`继续使用原有parser进行帧聚合/边界识别；ID3跳过、
+  SD有界读取、FLAC、I2S、DAC、播放时间、UI、锁屏和电源路径保持原实现。
+- 编译`MINIMP3_ONLY_MP3`/`MINIMP3_NO_SIMD`，P4工程原有`ilp32f`工具链
+  直接生成单精度FPU运算；未启用fast-math、降采样或减少声道。
+  MP3输出16bit（与原后端相同），FLAC的16/24/32bit精度不受影响。
+- 每会话仅一块11276B PSRAM，包含reservoir/overlap/滤波状态及4608B单帧PCM。
+  无片内分配回退，无大歌曲/大目录相关分配，逐帧无malloc。
+  最多复制一帧PCM以支持字节未对齐的公共输出buffer。
+- 容量不足时先返回4608B `needed_size`，不消耗输入/改变decoder状态；
+  暂停不reset，续播保留reservoir；切歌close释放，显式reset清除旧状态。
+  reservoir不足的帧允许消耗输入但不输出PCM，不能补假播放进度。
+- 保留`MP3 core`计时格式。打开时额外输出
+  `MP3 backend: minimp3, PSRAM state=11276B`，用于确认烧录版本。
+  core计时仍是包含抢占的tick墙钟值，不是CPU占用率。
+
+验证：
+
+- 四组本项目生成的真实MP3（48k stereo CBR128、44.1k stereo VBR、32k mono、
+  24k mono MPEG2）按完整单帧和连续流两种方式解码，长度与独立FFmpeg参考一致，
+  最大样本差1 LSB。24k仅验证decoder能力，不改变DAC不支持该速率的策略。
+- 主机测试实际执行相同标量minimp3算法，检查连续reservoir、reset后重播、
+  容量不足三次重试不丢帧、输出未对齐、错误/空输入、PSRAM单块申请与配对释放。
+  所有15项CTest通过。测试音频为合成正弦，来源/生成方式在fixture README中。
+- ESP-IDF v5.5.4固件构建通过，binary大小`0x136820`。ELF中MP3代码/常量
+  保持外部区，无原PacketVideo MP3运算符号，内部`_heap_start`仍`0x4ff73ea0`。
+  没有新增静态SRAM占用，也未增大64KiB ring/16KiB DMA/24KiB任务栈。
+- 同一P4编译命令加`-fstack-usage`：`mp3dec_decode_frame`栈帧16624B，
+  adapter80B，主要下级函数最大144B。此为编译器静态栈帧分析，完整调用链和
+  中断上下文仍需原24KiB任务栈及板上运行验证，不能当作实测最高水位。
+
+尚未验证此后端在当前板的真实持续吞吐、用户MP3兼容性和听感；不宣称卡顿已解决。
+复测同一MP3至少20秒，记录backend确认行及连续三组Audio/Audio work/MP3 core。
+稳定播放时`decoded`应接近窗口时长，`underrun`不应持续累计；同时确认既有FLAC正常。
+
+## minimp3 实板验收（2026-10-19）
+
+用户确认当前测试的FLAC和MP3播放卡顿均已消除，实际体验无明显问题。
+48kHz/16bit/stereo MP3连续九个约5秒窗口中，underrun全部为0；
+最小队列53624..58744B，decoded为4992..5016ms/5003..5009ms窗口，
+底层调用累计233..257ms/窗口、单次最大2ms。解码产出已跟上播放进度，
+与此前每5秒只产出约3.2秒相比有明显改善。
+这些数据是当前板和测试文件的验收反馈，不代表全部MP3文件兼容或192kHz
+高负载长期稳定性；core仍是含抢占的墙钟计时，不作为独占CPU占用率。
