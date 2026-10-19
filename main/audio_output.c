@@ -589,7 +589,19 @@ static void poll_headphone(void)
     TickType_t before=xTaskGetTickCount();
     esp_err_t ret=cs43131_poll(&plugged);record_max(&s_poll_max,before);
     if(ret==ESP_OK) {
-        if(plugged!=s_hp) {s_hp=plugged;s_hp_dirty=true;}
+        if(plugged!=s_hp) {
+            bool unplugged=s_hp && !plugged;
+            s_hp=plugged;s_hp_dirty=true;
+            /* 只响应成功读取后的“已插入 -> 已拔出”，初次检测为未插入
+             * 不算拔出事件。复用明确暂停请求，撤销正在播放或等待准备的
+             * 意图；本轮 output_step 随后走原暂停路径，保留解码器/进度。
+             * 必须在 LVGL 锁外处理，界面繁忙不能推迟暂停。插入只更新
+             * 状态栏，绝不恢复播放，也不唤醒屏幕或展开任何控件。 */
+            if(unplugged) {
+                audio_output_set_playing(false);
+                ESP_LOGI(TAG,"Headphone removed; playback paused");
+            }
+        }
     } else if(s_tx_on)fail_current(ret,polled);
     /* UI只是状态观察者：锁忙时延后发布；不在锁内读I2C或调整布局。 */
     if(s_hp_dirty && lvgl_port_lock(1)) {

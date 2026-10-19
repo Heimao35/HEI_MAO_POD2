@@ -13,7 +13,7 @@ static uint32_t generation=1,rate=192000;
 static unsigned bits=32,channels=2,opens,closes,polls,configures;
 static unsigned played_configs,channels_created,channels_deleted,clock_reconfigs;
 static unsigned direct_reads,preload_cursor,sd_lock_failures,init_nomem_attempts;
-static bool fresh_request_in_prepare,enable_fail_once;
+static bool fresh_request_in_prepare,enable_fail_once,ui_lock_unavailable;
 static uint32_t last_rate;
 static ui_device_state_t device_state;
 static i2s_event_callbacks_t dma_callbacks;
@@ -69,7 +69,7 @@ esp_err_t gpio_config(const gpio_config_t *c) {assert(c->pin_bit_mask==1ULL<<53)
 esp_err_t gpio_isr_handler_add(gpio_num_t pin,void(*cb)(void*),void *arg) {(void)cb;(void)arg;assert(pin==53);return ESP_OK;}
 esp_err_t gpio_isr_handler_remove(gpio_num_t p) {(void)p;return ESP_OK;}
 int gpio_get_level(gpio_num_t pin) {assert(pin==53);return 0;}
-bool lvgl_port_lock(uint32_t wait) {(void)wait;assert(!sd_locked && !ui_locked);ui_locked=true;return true;}
+bool lvgl_port_lock(uint32_t wait) {(void)wait;assert(!sd_locked && !ui_locked);if(ui_lock_unavailable)return false;ui_locked=true;return true;}
 void lvgl_port_unlock(void) {assert(ui_locked);ui_locked=false;}
 ui_device_state_t *ui_get_device_state(void) {assert(ui_locked);return &device_state;}
 bool sd_card_io_lock(TickType_t wait)
@@ -201,6 +201,34 @@ int main(void)
     assert(!tx_enabled && !audio_output_is_active());steps(20);assert(audio_output_time_ms()==paused);
     audio_output_toggle();steps(24);assert(audio_output_is_playing() && audio_output_time_ms()>=paused);
     puts("PASS real worker boot restore,192k32bit pause/resume and bounded5MiB FLAC PICTURE skip");
+    /* A real headphone transition must pause the worker even if LVGL cannot
+     * publish its icon yet. Keep decoder/PCM state for explicit play later. */
+    esp_audio_simple_dec_handle_t held_decoder=s_decoder;
+    hp_present=false;ui_lock_unavailable=true;
+    for(unsigned i=0;i<300 && audio_output_is_play_requested();++i)steps(1);
+    assert(!audio_output_is_play_requested() && !audio_output_is_playing());
+    assert(!tx_enabled && !audio_output_is_active() && !s_file && s_decoder==held_decoder);
+    assert(!s_hp && s_hp_dirty && device_state.headphone_inserted);
+    uint32_t unplug_position=audio_output_time_ms();
+    steps(20);assert(audio_output_time_ms()==unplug_position && !audio_output_take_finished());
+    ui_lock_unavailable=false;steps(3);
+    assert(!s_hp_dirty && !device_state.headphone_inserted);
+    unsigned paused_request=command().request;
+    hp_present=true;steps(5);
+    assert(device_state.headphone_inserted && !audio_output_is_play_requested() && !tx_enabled);
+    assert(command().request==paused_request && audio_output_time_ms()==unplug_position);
+    audio_output_set_playing(true);steps(24);
+    assert(tx_enabled && audio_output_is_playing() && s_decoder==held_decoder);
+    assert(audio_output_time_ms()>=unplug_position);
+    /* Cancel pending preparation too; reconnect still requires explicit play. */
+    audio_output_set_playing(false);steps(3);
+    audio_output_set_playing(true);hp_present=false;s_poll_at=ticks-pdMS_TO_TICKS(100);
+    steps(1);
+    assert(!audio_output_is_play_requested() && !tx_enabled && !s_file);
+    hp_present=true;steps(5);
+    assert(device_state.headphone_inserted && !audio_output_is_play_requested() && !tx_enabled);
+    audio_output_set_playing(true);steps(24);assert(tx_enabled && audio_output_is_playing());
+    puts("PASS headphone removal pauses active/pending playback despite busy UI; insertion never autoplays; explicit resume retains state");
     ticks+=100;quiesce_in_poll=true;
     /* The producer may defer polling until high water. Wait for the actual
      * I2C hook, rather than assuming the next worker step will poll. */
