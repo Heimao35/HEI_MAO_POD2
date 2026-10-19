@@ -256,7 +256,15 @@ int main(void)
     rate=44100;audio_output_select(0,generation,true);steps(24);assert(tx_enabled && last_rate==44100);
     puts("PASS unmount closes stream before VFS teardown; unsupported rate pauses without false EOS");
     for(unsigned i=0;i<3000 && !atomic_load(&s_finished);++i)steps(1);
+    steps(2); /* decoder is now idle; unconsumed EOS must still prevent sleep */
+    assert(!atomic_load(&s_active) && !audio_output_is_play_requested());
+    assert(audio_output_is_active());
     assert(audio_output_take_finished() && !audio_output_take_finished() && !tx_enabled);
+    assert(!audio_output_is_active());
+    atomic_store(&s_finished,true);audio_output_set_playing(false);
+    assert(!audio_output_take_finished() && !audio_output_is_active());
+    atomic_store(&s_finished,true);audio_output_toggle();
+    assert(!audio_output_take_finished());audio_output_set_playing(false);
     assert(audio_output_time_ms()==(uint64_t)(192000*8/8192*8192/8)*1000/rate);
     assert(opens>=closes);
     assert(close_session());remove(fixture);

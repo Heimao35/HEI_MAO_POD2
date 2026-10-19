@@ -54,6 +54,10 @@ typedef struct {
  * 再由适配器排队加载；不播放切歌动画、不调用后端、不开始播放。 */
 void ui_music_player_restore_selection(uint32_t index);
 void ui_music_player_bind(const ui_music_backend_t *backend);
+/** 自然结束处理共用入口，须持有 LVGL 锁。亮屏定时器传 true 保留原
+ * 动画；熄屏媒体任务传 false，不依赖暂停的 LVGL 动画/定时器完成。
+ * 只处理后端自然结束，不根据时间估计或错误主动开始播放。 */
+void ui_music_player_service_finished(bool animate);
 void ui_music_player_set_library(uint32_t count, const char *status);
 void ui_music_player_set_page(const music_page_t *page);
 void ui_music_player_show_song(uint32_t index, const char *title,

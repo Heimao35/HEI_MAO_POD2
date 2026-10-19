@@ -8,7 +8,7 @@ esp_err_t music_player_adapter_init(void);
  * 已成功扫描的曲库（包括空曲库）保持不变，由后台合并重复请求。 */
 void music_player_adapter_request_scan_if_needed(void);
 
-/* Audio preparation and DMA output remain active for the entire interval;
+/* Audio preparation, DMA, pending EOS and media worker handoff stay active;
  * screen power must never enter Light-sleep while this snapshot is true. */
 bool music_player_adapter_is_playing(void);
 

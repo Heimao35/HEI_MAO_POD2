@@ -135,7 +135,7 @@ void audio_output_toggle(void)
     portENTER_CRITICAL(&s_cmd_mux);
     ++s_cmd.request;
     if(s_cmd.index!=UINT32_MAX)s_cmd.play=!s_cmd.play;
-    if(s_cmd.play)atomic_store(&s_finished,false);
+    atomic_store(&s_finished,false);
     portEXIT_CRITICAL(&s_cmd_mux);notify();
 }
 void audio_output_set_playing(bool play)
@@ -143,7 +143,7 @@ void audio_output_set_playing(bool play)
     portENTER_CRITICAL(&s_cmd_mux);
     ++s_cmd.request;
     s_cmd.play=play && s_cmd.index!=UINT32_MAX;
-    if(s_cmd.play)atomic_store(&s_finished,false);
+    atomic_store(&s_finished,false);
     portEXIT_CRITICAL(&s_cmd_mux);notify();
 }
 void audio_output_set_volume(uint8_t volume)
@@ -153,7 +153,11 @@ uint32_t audio_output_duration_sec(void) {return atomic_load(&s_duration);}
 bool audio_output_is_play_requested(void) {return command().play;}
 bool audio_output_is_playing(void) {return atomic_load(&s_playing) && command().play;}
 bool audio_output_is_active(void)
-{return s_task && (atomic_load(&s_active)||command().play);}
+{
+    /* 自然结束等待续播的事件也需要 CPU；显式播放/暂停/选歌均清除此
+     * 事件。不能在媒体 worker 尚未接力前误把曲间空隙当成空闲睡眠。 */
+    return s_task && (atomic_load(&s_active)||command().play||atomic_load(&s_finished));
+}
 bool audio_output_take_finished(void) {return atomic_exchange(&s_finished,false);}
 static bool request_quiescence(unsigned owner,bool pause)
 {

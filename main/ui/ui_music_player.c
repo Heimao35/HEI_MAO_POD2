@@ -557,11 +557,12 @@ static void update_playlist_highlight(void)
         if (!s_pl_items[i]) continue;
         lv_obj_t *icon = playlist_item_icon(s_pl_items[i]);
         lv_obj_t *title = playlist_item_title(s_pl_items[i]);
-        /* 当前条目的图标始终与主页面控制台一致；未选中的条目仍使用
-         * PAUSE。与文字一起在选中行反色，保持原有白底黑字主题。 */
+        /* 仅当前且正在播放的歌曲显示 PAUSE（双竖线），与主控制台同步；
+         * 当前歌曲已暂停以及其余所有歌曲均显示 PLAY（小三角）。
+         * 这里只更新图标文字及原有选中色，不改变条目布局或点击选歌逻辑。 */
         if (icon) {
             lv_label_set_text(icon, i == (uint32_t)s_current_idx ?
-                                   playback_action_symbol() : LV_SYMBOL_PAUSE);
+                                   playback_action_symbol() : LV_SYMBOL_PLAY);
             lv_obj_set_style_text_color(icon,
                 i == (uint32_t)s_current_idx ? UI_COLOR_ON_ACCENT : UI_COLOR_TEXT, 0);
         }
@@ -1068,7 +1069,8 @@ void ui_music_player_set_library(uint32_t count, const char *status)
                  * 图标固定留出 28px，歌名右移后仍保持单行横向滚动；
                  * 不改变列表父容器的滚动和展开/收起动画参数。 */
                 lv_obj_t *icon = lv_label_create(item);
-                lv_label_set_text(icon, LV_SYMBOL_PAUSE);
+                /* 新建条目先显示播放三角，末尾统一按真实播放状态刷新当前行。 */
+                lv_label_set_text(icon, LV_SYMBOL_PLAY);
                 lv_obj_set_style_text_color(icon, UI_COLOR_TEXT, 0);
                 lv_obj_set_style_text_font(icon, ui_font_22(), 0);
                 lv_obj_set_width(icon, 28);
@@ -1224,16 +1226,38 @@ static uint32_t lyric_line_char_index(uint32_t line)
     return char_index;
 }
 
+void ui_music_player_service_finished(bool animate)
+{
+    /* 两个调用方共用当前索引/单曲循环状态及同一 LVGL 锁，结束事件只能
+     * 被消费一次。亮屏仍延后至封面动画结束，保持原切歌效果；熄屏时
+     * LVGL 已暂停，不能等待动画回调清除 s_cover_animating。 */
+    uint32_t count=ui_song_count();
+    if(!count || !s_backend.select || !s_backend.take_finished ||
+       (animate && s_cover_animating) || !s_backend.take_finished()) return;
+    if(animate) {
+        if(s_single_loop) request_song((uint32_t)s_current_idx);
+        else ui_music_player_next_animated();
+        return;
+    }
+    /* 熄屏只同步保留的页面状态，不启动左右切歌动画、不触发活动时间或
+     * 唤醒屏幕。取消尚未走完的左右动画并回收旧封面/歌词快照，防止
+     * 唤醒后旧回调把新曲封面覆盖；纵向布局和用户的歌词/封面选择不变。 */
+    lv_anim_delete(s_cover_area,cover_anim_x_cb);
+    lv_anim_delete(s_outgoing_area,cover_anim_x_cb);
+    cover_slide_out_ready(NULL);
+    s_cover_animating=false;
+    lv_obj_set_x(s_cover_area,((int32_t)UI_HOR_RES-COVER_SIZE)/2);
+    uint32_t index=s_single_loop?(uint32_t)s_current_idx:((uint32_t)s_current_idx+1)%count;
+    switch_to_song((int)index);
+    request_song(index);
+}
+
 static void player_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
-    /* 自然结束后才自动切歌；解码错误/拔卡只暂停，不误触发循环。继续使用
-     * 现有上下首动画与列表选中逻辑，不改布局、触摸区域或进度条交互方式。
-     * 动画未完成时延后消费事件，防止结束事件被动画保护条件丢弃。 */
-    if (!s_cover_animating && s_backend.take_finished && s_backend.take_finished()) {
-        if (s_single_loop) request_song((uint32_t)s_current_idx);
-        else ui_music_player_next_animated();
-    }
+    /* 自然结束与熄屏媒体 worker 共用入口；解码错误/拔卡不会产生 EOS。
+     * 亮屏保持原封面切换动画与列表选中规则。 */
+    ui_music_player_service_finished(true);
     if (s_backend.get_time_ms && s_backend.get_duration_sec) {
         uint32_t time_ms = s_backend.get_time_ms();
         uint32_t duration_sec = s_backend.get_duration_sec();

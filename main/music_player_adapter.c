@@ -3,6 +3,7 @@
 #include "music_library.h"
 #include "audio_player.h"
 #include "audio_output.h"
+#include "screen_power.h"
 #include "cover_loader.h"
 #include "music_background.h"
 #include "lyric_parser.h"
@@ -111,7 +112,13 @@ static uint32_t get_duration_sec(void)
     uint32_t duration=audio_output_duration_sec();
     return duration?duration:atomic_load(&s_duration_sec);
 }
-bool music_player_adapter_is_playing(void) { return audio_output_is_active(); }
+bool music_player_adapter_is_playing(void)
+{
+    /* EOS 尚未消费时音频层仍报告活动；媒体 worker 消费 EOS 到发布下一首
+     * 播放请求之间由 BUSY 接力，避免屏幕任务趁这段间隙进入 Light-sleep。
+     * 元数据/SD 工作本就需要 CPU，结束后恢复原来的空闲睡眠行为。 */
+    return audio_output_is_active() || (atomic_load(&s_worker_state)&MEDIA_BUSY)!=0;
+}
 static bool is_playing(void) { return audio_output_is_playing(); }
 
 static uint32_t get_lyric_line(uint32_t time_ms)
@@ -446,6 +453,14 @@ static void media_worker_step(void)
         }
         return;
     }
+
+    /* 熄屏会暂停 LVGL 定时器，媒体 worker 继续在现有 500ms 调度内
+     * 处理自然结束。只在当前挂载代次有效、未关机暂停、持有 LVGL 锁时
+     * 调用共用逻辑；亮屏继续由原 UI 定时器负责切歌动画。无 SD/I2C 等待。 */
+    lvgl_port_lock(0);
+    if(!media_paused() && media_available() && sd_card_get_generation()==generation &&
+       screen_power_is_dark()) ui_music_player_service_finished(false);
+    lvgl_port_unlock();
 
     /* 成功曲库照常处理选歌；与 UI 使用相同的 LVGL 锁取得一致的请求快照。 */
     lvgl_port_lock(0);

@@ -14,6 +14,7 @@ uint32_t audio_output_duration_sec(void);
 bool audio_output_is_playing(void);
 /* 已接收的播放意图，包含准备阶段；用于按钮显示/取消，进度仍只读DMA。 */
 bool audio_output_is_play_requested(void);
+/* Includes pending natural EOS until playlist continuation consumes it. */
 bool audio_output_is_active(void);
 bool audio_output_take_finished(void);
 /* 外部关机/Light-sleep屏障，不改变用户暂停偏好。true表示已停DMA、关闭

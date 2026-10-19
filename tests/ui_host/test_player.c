@@ -96,6 +96,16 @@ static void select_test(uint32_t index)
 static uint32_t get_clock(void) { return clock_ms; }
 static uint32_t get_duration(void) { return 300; }
 static uint32_t get_line(uint32_t ms) { (void)ms; return lyric_line; }
+/* Check every row, so a stale pause icon on any inactive song is caught. */
+static void assert_playlist_actions(unsigned current, bool playing)
+{
+    for (unsigned i=0;i<s_pl_item_count;i++) {
+        const char *expected=i==current && playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY;
+        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[i])),expected));
+    }
+    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[current])),
+                   lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+}
 static lv_point_t input_point;
 static lv_indev_state_t input_state;
 static void read_pointer(lv_indev_t *indev, lv_indev_data_t *data)
@@ -178,35 +188,29 @@ int main(void)
     lv_label_get_letter_pos(s_title_lbl,0,&first);
     assert(first.x>100); /* A short title really gets a centered letter position. */
     assert(lv_obj_has_flag(s_playlist_empty_lbl,LV_OBJ_FLAG_HIDDEN));
-    for (unsigned i=0;i<s_pl_item_count;i++) {
-        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[i])),
-                       i==0 ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE));
-    }
-    /* The active row must use the exact same action icon as the console. */
+    assert_playlist_actions(0,false);
+    /* Only the playing row shows PAUSE; all inactive rows remain PLAY through
+     * local toggles, timer refreshes, backend updates and selection changes. */
     for (unsigned i=0;i<4;i++) {
         toggle_btn_cb(NULL);
-        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),
-                       lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
-        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),LV_SYMBOL_PAUSE));
+        assert_playlist_actions(0,i%2==0);
         advance(240); /* No backend play-state: the UI action remains stable. */
-        assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),
-                       lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+        assert_playlist_actions(0,i%2==0);
     }
     ui_music_player_update_progress(0,300,true);
-    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),LV_SYMBOL_PAUSE));
+    assert_playlist_actions(0,true);
     ui_music_player_update_progress(0,300,false);
-    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),LV_SYMBOL_PLAY));
+    assert_playlist_actions(0,false);
     switch_to_song(1);
-    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[0])),LV_SYMBOL_PAUSE));
-    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),
-                   lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+    assert_playlist_actions(1,false);
     ui_music_player_update_progress(0,300,true);
-    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),LV_SYMBOL_PAUSE));
-    assert(!strcmp(lv_label_get_text(playlist_item_icon(s_pl_items[1])),
-                   lv_label_get_text(lv_obj_get_child(s_btn_toggle,0))));
+    assert_playlist_actions(1,true);
+    ui_music_player_update_progress(0,300,false);
+    assert_playlist_actions(1,false);
     switch_to_song(0);
     ui_music_player_show_song(0,"Short",NULL,300);
-    puts("PASS playlist icons match console on backend updates, toggles, timer ticks and song changes");
+    assert_playlist_actions(0,false);
+    puts("PASS only playing playlist row shows PAUSE; paused/inactive rows show PLAY");
     lv_obj_t *row_title=playlist_item_title(s_pl_items[0]);
     lv_obj_update_layout(s_playlist);
     lv_area_t icon_bounds, title_bounds;
@@ -510,6 +514,37 @@ int main(void)
     player_timer_cb(NULL);assert(!test_finished && requests==before_eos+1);
     advance(1500);
     puts("PASS explicit asynchronous play intent, single-loop EOS and deferred sequential EOS animation");
+    /* No timer-handler/animation advances during these calls: model the
+     * stopped LVGL task while the screen remains physically dark. */
+    ui_music_player_set_library(3,"ready");ui_music_player_restore_selection(2);
+    s_single_loop=false;test_finished=true;before_eos=requests;
+    ui_music_player_service_finished(false);
+    assert(!test_finished && requests==before_eos+1 && selected==0 && s_current_idx==0);
+    assert(!s_cover_animating && !lv_anim_get(s_cover_area,cover_anim_x_cb));
+    ui_music_player_service_finished(false);assert(requests==before_eos+1); /* one-shot */
+    test_finished=true;ui_music_player_service_finished(false);
+    assert(selected==1 && s_current_idx==1 && !s_cover_animating);
+    s_single_loop=true;test_finished=true;before_eos=requests;
+    ui_music_player_service_finished(false);
+    assert(selected==1 && requests==before_eos+1 && !s_cover_animating);
+    /* Current mode is read at EOS: a mode toggle immediately affects the next
+     * dark completion, without an independent or stale copy in the worker. */
+    mode_btn_cb(NULL);assert(!s_single_loop);
+    test_finished=true;ui_music_player_service_finished(false);assert(selected==2);
+    /* A cover slide paused halfway by screen-off must not block continuation
+     * forever, and wake must not replay its stale completion into the new art. */
+    ui_music_player_next_animated();assert(s_cover_animating && lv_anim_get(s_cover_area,cover_anim_x_cb));
+    test_finished=true;ui_music_player_service_finished(false);
+    assert(!s_cover_animating && !s_outgoing_pixels);
+    assert(!lv_anim_get(s_cover_area,cover_anim_x_cb) && !lv_anim_get(s_outgoing_area,cover_anim_x_cb));
+    assert(lv_obj_has_flag(s_outgoing_area,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_get_style_x(s_cover_area,0)==(UI_HOR_RES-COVER_SIZE)/2);
+    ui_music_player_set_library(1,"ready");test_finished=true;before_eos=requests;
+    ui_music_player_service_finished(false);assert(selected==0 && requests==before_eos+1);
+    ui_music_player_set_library(0,"empty");test_finished=true;before_eos=requests;
+    ui_music_player_service_finished(false);assert(test_finished && requests==before_eos);
+    test_finished=false;
+    puts("PASS dark sequential/repeat/single-song EOS without LVGL ticks, active slide cleanup and empty library");
     puts("ALL PLAYER UI TESTS PASSED");
     return 0;
 }

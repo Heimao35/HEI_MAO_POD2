@@ -6,9 +6,11 @@
 
 /* Real audio hardware lives in its own tested worker; adapter only posts controls. */
 static unsigned audio_selects;
+static bool dark_screen, eos_ready, repeat_current;
+static unsigned dark_eos_calls, dark_eos_taken;
 static bool last_autoplay;
 void audio_output_select(uint32_t index,uint32_t gen,bool autoplay)
-{(void)index;(void)gen;++audio_selects;last_autoplay=autoplay;}
+{(void)index;(void)gen;++audio_selects;last_autoplay=autoplay;eos_ready=false;}
 void audio_output_toggle(void) {}
 void audio_output_set_playing(bool playing) {(void)playing;}
 uint32_t audio_output_time_ms(void) {return 0;}
@@ -22,6 +24,7 @@ void ui_music_player_set_callbacks(ui_music_ctrl_cb_t p,ui_music_ctrl_cb_t n,ui_
 {(void)p;(void)n;(void)m;assert(t==audio_output_toggle);}
 
 static bool ui_locked, sd_locked, mounted = true;
+bool screen_power_is_dark(void) { return dark_screen; }
 static uint32_t generation = 1, count = 4, ui_index;
 static uint32_t decoded, published, shown, lyric_published, cover_before_probe;
 static uint8_t covers[4];
@@ -185,6 +188,18 @@ void ui_music_player_set_library(uint32_t songs, const char *status)
 }
 void ui_music_player_set_page(const music_page_t *page) { (void)page; }
 void ui_music_player_bind(const ui_music_backend_t *backend) { (void)backend; }
+/* UI policy and actual retained LVGL objects are covered by player_ui_tests;
+ * this scheduling double asserts dark EOS is delegated only under UI lock. */
+void ui_music_player_service_finished(bool animate)
+{
+    assert(ui_locked && !sd_locked && dark_screen && !animate);
+    ++dark_eos_calls;
+    if(!eos_ready) return;
+    assert(music_player_adapter_is_playing()); /* BUSY covers EOS/request handoff. */
+    eos_ready=false;++dark_eos_taken;
+    ui_index=repeat_current?ui_index:(ui_index+1)%count;
+    select_song(ui_index);
+}
 esp_err_t audio_player_probe(const char *path, audio_file_info_t *info)
 {
     (void)path; assert(sd_locked && !ui_locked);
@@ -235,6 +250,7 @@ static void prepare_scan_test(uint32_t songs)
     scan_song_count=songs; count=0; ui_index=0;
     replace_card_in_scan=false;
     boot_anim_starts=0;
+    dark_screen=eos_ready=repeat_current=false;dark_eos_calls=dark_eos_taken=0;
     saved_folder[0]=saved_audio[0]=0;
     atomic_store(&s_scan_requested,false);
     atomic_store(&s_requested_index,UINT32_MAX);
@@ -352,6 +368,33 @@ static void run_scan_tests(void)
     reset();
 }
 
+static void run_dark_eos_tests(void)
+{
+    prepare_scan_test(4);media_worker_step();media_worker_step();
+    dark_screen=true;eos_ready=true;
+    atomic_store(&s_worker_state,MEDIA_BUSY);
+    unsigned selected_before=audio_selects;
+    media_worker_step();
+    atomic_store(&s_worker_state,0);
+    assert(dark_eos_taken==1 && audio_selects==selected_before+1 && ui_index==1);
+    assert(last_autoplay && dark_screen && atomic_load(&s_requested_index)==UINT32_MAX);
+    repeat_current=true;eos_ready=true;selected_before=audio_selects;
+    atomic_store(&s_worker_state,MEDIA_BUSY);media_worker_step();atomic_store(&s_worker_state,0);
+    assert(dark_eos_taken==2 && audio_selects==selected_before+1 && ui_index==1 && last_autoplay);
+    eos_ready=true;dark_screen=false;unsigned handled=dark_eos_calls;
+    media_worker_step();assert(dark_eos_calls==handled && eos_ready);
+    dark_screen=true;
+    assert(music_player_adapter_pause(true));
+    media_worker_step();assert(dark_eos_calls==handled && eos_ready);
+    assert(music_player_adapter_pause(false));
+    eos_ready=false;media_worker_step(); /* Pause/error without natural EOS never selects. */
+    selected_before=audio_selects;media_worker_step();assert(audio_selects==selected_before);
+    mounted=false;test_set_inserted(false);eos_ready=true;handled=dark_eos_calls;
+    media_worker_step();assert(dark_eos_calls==handled && !eos_ready && !last_autoplay);
+    dark_screen=false;reset();
+    puts("PASS dark media-worker EOS handoff, current-repeat, awake UI ownership, pause and card-removal gates");
+}
+
 int main(void)
 {
     static char text[LYRIC_TEXT_BYTES+1];
@@ -410,6 +453,7 @@ int main(void)
     puts("PASS background follows foreground, cache hit, selection/card-change rejection and missing cover");
     run_scan_tests();
     run_restore_tests();
+    run_dark_eos_tests();
     puts("ALL ADAPTER TESTS PASSED");
     return 0;
 }

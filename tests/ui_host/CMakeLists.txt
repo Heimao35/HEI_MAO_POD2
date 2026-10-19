@@ -26,7 +26,7 @@ add_test(NAME player_ui COMMAND player_ui_tests)
 
 # Exercise production media scheduling separately from the LVGL object tests.
 add_executable(player_adapter_tests test_adapter.c ../media_host/support.c)
-target_include_directories(player_adapter_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_include_directories(player_adapter_tests PRIVATE stubs ../media_host/stubs ../screen_host/stubs "${REPO}/main")
 target_link_libraries(player_adapter_tests PRIVATE lvgl_host)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(player_adapter_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable -Wno-unused-but-set-variable -Wno-missing-braces -Wno-missing-field-initializers -ffunction-sections -fdata-sections)
