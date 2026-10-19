@@ -1,6 +1,6 @@
 #include "ui_lockscreen.h"
 #include "ui_statusbar.h"
-#include "sd_card.h"
+#include "lock_animation.h"
 #include "music_player_adapter.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -13,16 +13,15 @@
 
 static const char *TAG = "lockscr";
 
-#define MJPEG_PATH SD_SYS_DIR "/MEDIA/lock_scr/000.mjpeg"
-#define FRAME_W    460
-#define FRAME_H    460
+#define FRAME_W    LOCK_ANIMATION_WIDTH
+#define FRAME_H    LOCK_ANIMATION_HEIGHT
 #define FRAME_BPP  2
 #define FRAME_BUF_SZ (FRAME_W * FRAME_H * FRAME_BPP)
 #define PAD16(x)   (((x) + 15) & ~15)
 #define PADDED_W   PAD16(FRAME_W)
 #define PADDED_H   PAD16(FRAME_H)
 #define DECODE_BUF_SZ (PADDED_W * PADDED_H * FRAME_BPP)
-#define ANIM_FPS   24
+#define ANIM_FPS   LOCK_ANIMATION_FPS
 
 static lv_obj_t *s_lock_page  = NULL;
 static lv_obj_t *s_bg_canvas  = NULL;
@@ -30,7 +29,7 @@ static lv_obj_t *s_time_label = NULL;
 static lv_obj_t *s_date_label = NULL;
 static atomic_bool s_visible = true;
 /* 单一常驻任务独占 JPEG 解码器和缓冲区。每次重播递增代次，旧任务
- * 即使仍在读 SD/解码，也不能再发布旧帧；避免快速锁屏/解锁重叠写图。 */
+ * 即使仍在解码，也不能再发布旧帧；避免快速锁屏/解锁重叠写图。 */
 static atomic_bool s_anim_busy;
 static atomic_bool s_anim_allowed = true;
 static atomic_uint s_anim_requested;
@@ -42,63 +41,15 @@ static portMUX_TYPE s_anim_request_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t *s_rgb_buf = NULL;
 static uint8_t *s_decode_buf = NULL;
 
-static const uint8_t SOI_MARKER[] = {0xFF, 0xD8};
-static const uint8_t EOI_MARKER[] = {0xFF, 0xD9};
-
-static int find_marker(const uint8_t *buf, int len, const uint8_t *marker)
-{
-    for (int i = 0; i < len - 1; i++) {
-        if (buf[i] == marker[0] && buf[i + 1] == marker[1]) return i;
-    }
-    return -1;
-}
-
 static void play_mjpeg(unsigned generation)
 {
-
-    /* Share SD handle lifetime protection with the music worker. */
-    if (!sd_card_io_lock(portMAX_DELAY)) {
-        return;
-    }
-    if (!sd_card_is_mounted() || !sd_card_is_present()) {
-        sd_card_io_unlock();
-        return;
-    }
-    FILE *fp = fopen(MJPEG_PATH, "rb");
-    if (!fp) {
-        sd_card_io_unlock();
-        ESP_LOGW(TAG, "No boot animation file: %s", MJPEG_PATH);
-        return;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (file_size <= 0 || file_size > 4 * 1024 * 1024) {
-        ESP_LOGW(TAG, "MJPEG file size invalid: %ld", file_size);
-        fclose(fp);
-        sd_card_io_unlock();
-        return;
-    }
-
-    uint8_t *file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
-    if (!file_buf) {
-        ESP_LOGE(TAG, "Failed to alloc %ld bytes for MJPEG", file_size);
-        fclose(fp);
-        sd_card_io_unlock();
-        return;
-    }
-
-    size_t actually_read = fread(file_buf, 1, file_size, fp);
-    fclose(fp);
-    sd_card_io_unlock();
-
-    if ((long)actually_read != file_size) {
-        ESP_LOGW(TAG, "MJPEG read incomplete: %u / %ld", (unsigned)actually_read, file_size);
-        heap_caps_free(file_buf);
-        return;
-    }
+    /* 启动阶段已完成SD导入、Flash校验和只读PSRAM缓存发布；重播只取缓存。
+     * 不能在这里检查SD文件/更新时间：即使只是一次大文件读取，也会阻塞
+     * 正在补充音频数据的同一个SD锁。无缓存时保留时间/日期和原有手势。
+     * 每次调用的position从0开始；缓存直到关机都不变，无需新分配文件缓冲。 */
+    size_t position=0, frame_len=0;
+    const uint8_t *frame=NULL;
+    if (!lock_animation_next_frame(&position,&frame,&frame_len)) return;
 
     jpeg_decoder_handle_t decoder = NULL;
     jpeg_decode_engine_cfg_t eng_cfg = {
@@ -107,7 +58,6 @@ static void play_mjpeg(unsigned generation)
     };
     if (jpeg_new_decoder_engine(&eng_cfg, &decoder) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create JPEG decoder");
-        heap_caps_free(file_buf);
         return;
     }
 
@@ -117,22 +67,11 @@ static void play_mjpeg(unsigned generation)
     };
 
     TickType_t frame_ticks = pdMS_TO_TICKS(1000 / ANIM_FPS);
-    int pos = 0;
-    int total = (int)actually_read;
-
-    while (atomic_load(&s_visible) && generation == atomic_load(&s_anim_generation) && pos < total - 1) {
-        int soi = find_marker(file_buf + pos, total - pos, SOI_MARKER);
-        if (soi < 0) break;
-        soi += pos;
-        int eoi = find_marker(file_buf + soi + 2, total - soi - 2, EOI_MARKER);
-        if (eoi < 0) break;
-        eoi += soi + 2;
-        int frame_len = eoi + 2 - soi;
-
+    while (atomic_load(&s_visible) && generation == atomic_load(&s_anim_generation)) {
         TickType_t t0 = xTaskGetTickCount();
         uint32_t out_size = 0;
         esp_err_t ret = jpeg_decoder_process(decoder, &dec_cfg,
-                                              file_buf + soi, frame_len,
+                                              frame, (uint32_t)frame_len,
                                               s_decode_buf, DECODE_BUF_SZ,
                                               &out_size);
         if (ret == ESP_OK) {
@@ -155,15 +94,13 @@ static void play_mjpeg(unsigned generation)
             ESP_LOGW(TAG, "JPEG decode err: %s", esp_err_to_name(ret));
         }
 
-        pos = eoi + 2;
-
         TickType_t elapsed = xTaskGetTickCount() - t0;
         if (elapsed < frame_ticks) {
             vTaskDelay(frame_ticks - elapsed);
         }
+        if (!lock_animation_next_frame(&position,&frame,&frame_len)) break;
     }
 
-    heap_caps_free(file_buf);
     jpeg_del_decoder_engine(decoder);
     ESP_LOGI(TAG, "Lock animation finished");
 }
@@ -298,7 +235,7 @@ void ui_lockscreen_show(void)
     s_visible = true;
     atomic_store(&s_anim_allowed, true);
     /* 清空上一轮尾帧并立即更新时间；新请求从 MJPEG 的首帧重新解码。
-     * 文件读取留给常驻 worker，不在显示/触摸回调中等待 SD 卡。 */
+     * 常驻worker只读取启动时发布的动画缓存，不在触摸/显示路径访问SD或Flash。 */
     if (s_rgb_buf) memset(s_rgb_buf, 0, FRAME_BUF_SZ);
     lv_obj_invalidate(s_bg_canvas);
     ui_lockscreen_update();
@@ -329,7 +266,7 @@ bool ui_lockscreen_is_visible(void)
 
 void ui_lockscreen_start_boot_anim(void)
 {
-    /* 可由 SD worker 调用；只投递标量请求，不访问 LVGL 对象或文件。 */
+    /* 启动资源就绪或页面重播时只投递标量请求，不访问LVGL对象或文件。 */
     portENTER_CRITICAL(&s_anim_request_lock);
     bool allowed = s_anim_task && atomic_load(&s_visible) && atomic_load(&s_anim_allowed);
     if (allowed) {
@@ -342,7 +279,7 @@ void ui_lockscreen_start_boot_anim(void)
 
 void ui_lockscreen_stop_anim(void)
 {
-    /* 熄屏/解锁后屏蔽 SD worker 迟到的开机动画请求；再次 show 才开放。 */
+    /* 熄屏/解锁后屏蔽迟到的开机动画请求；再次show才开放。 */
     portENTER_CRITICAL(&s_anim_request_lock);
     atomic_store(&s_anim_allowed, false);
     atomic_store(&s_anim_requested, 0);

@@ -295,6 +295,7 @@ static void run_scan_tests(void)
     prepare_scan_test(0);
     media_worker_step();
     assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==1 && last_library_count==0);
+    assert(boot_anim_starts==0); /* Flash resource startup owns animation, not SD scans. */
     updates=library_updates;
     for (unsigned i=0;i<4;i++) {
         music_player_adapter_request_scan_if_needed(); media_worker_step();

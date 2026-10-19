@@ -191,3 +191,13 @@ if(EXISTS "${REPO}/build/player_jpeg/jpeg_delete_under_test.inc")
   endif()
   add_test(NAME jpeg_cleanup COMMAND jpeg_cleanup_tests)
 endif()
+
+# Actual two-slot animation persistence and parser with NOR Flash/SD substitutes.
+add_executable(lock_animation_tests test_lock_animation.c)
+target_compile_definitions(lock_animation_tests PRIVATE ANIMATION_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/fixtures/animation")
+target_include_directories(lock_animation_tests PRIVATE ../animation_host/stubs ../media_host/stubs "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(lock_animation_tests PRIVATE -O1 -Wall -Wextra)
+  target_link_options(lock_animation_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME lock_animation COMMAND lock_animation_tests)

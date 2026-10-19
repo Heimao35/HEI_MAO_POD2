@@ -5,3 +5,6 @@ phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, ,        8M,
 storage,  data, spiffs,  ,        7M,
 fontfs,   data, spiffs,  ,        2M,
+# Runtime animation store: two slots, each 4MiB payload + 4KiB header.
+# Appended after fontfs; all existing partition addresses remain unchanged.
+lockanim, data, 0x40, 0x1110000, 0x802000,

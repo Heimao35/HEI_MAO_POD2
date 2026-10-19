@@ -1,5 +1,6 @@
 idf_component_register(SRCS "main.c"
                               "sd_card.c"
+                              "lock_animation.c"
                               "pmic_axp2101.c"
                               "screen_power.c"
                               "ambient_light.c"
@@ -30,7 +31,7 @@ idf_component_register(SRCS "main.c"
                               "ui/ui_manager.c"
                               "ui/ui_power_dialog.c"
                     INCLUDE_DIRS "." "ui"
-                    PRIV_REQUIRES fatfs sdmmc esp_driver_jpeg
+                    PRIV_REQUIRES fatfs sdmmc esp_driver_jpeg esp_partition
                                   esp_lcd esp_lcd_touch_cst820
                                   esp_hw_support driver
                                   esp_lvgl_port

@@ -5,19 +5,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <direct.h>
-#define MKDIR(path) _mkdir(path)
-#else
-#include <sys/stat.h>
-#define MKDIR(path) mkdir(path, 0700)
-#endif
-#define SD_MOUNT_POINT "."
 /* Clock layout is not under test; avoid adding a 48px host font dependency. */
 #define lv_font_montserrat_48 lv_font_montserrat_26
 #include "../../main/ui/ui_lockscreen.c"
 
-static bool ui_locked, sd_locked, mounted = true, present = true;
+static bool ui_locked, sd_locked, mounted = true, present = true, asset_available=true;
+static unsigned sd_accesses;
 static unsigned task_creations, notifications, scans, decodes, engines, deletes;
 static bool cancel_during_decode, fail_engine;
 static bool show_status_time;
@@ -31,10 +24,19 @@ ui_device_state_t *ui_get_device_state(void) { return &state; }
 void ui_statusbar_show_time(bool value) { show_status_time=value; }
 lv_obj_t *ui_statusbar_get_obj(void) { return bar; }
 void music_player_adapter_request_scan_if_needed(void) { ++scans; }
-bool sd_card_io_lock(TickType_t wait) { (void)wait; assert(!ui_locked && !sd_locked); sd_locked=true; return true; }
+bool sd_card_io_lock(TickType_t wait) { (void)wait; ++sd_accesses; assert(!"lock replay must never access SD"); return false; }
 void sd_card_io_unlock(void) { assert(sd_locked); sd_locked=false; }
 bool sd_card_is_mounted(void) { return mounted; }
 bool sd_card_is_present(void) { return present; }
+/* Asset service is tested separately with real Flash import/reboot faults.
+ * This test retains the actual UI/JPEG worker and checks cache-only replay. */
+bool lock_animation_next_frame(size_t *position,const uint8_t **frame,size_t *bytes)
+{
+    static const uint8_t data[]={0xFF,0xD8,0xFF,0xD9};
+    assert(!ui_locked && !sd_locked);
+    if (!asset_available || *position) return false;
+    *frame=data; *bytes=sizeof(data); *position=sizeof(data); return true;
+}
 TickType_t xTaskGetTickCount(void) { return ticks++; }
 void xTaskNotifyGive(TaskHandle_t task) { assert(task == (void *)1); ++notifications; }
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t delay) { (void)clear; (void)delay; return 0; }
@@ -128,9 +130,9 @@ int main(void)
     assert(scans==1 && task_creations==1);
     puts("PASS unlocked entry keeps ease-out slide; wake replays only MJPEG without recreating UI or rescanning SD");
 
-    MKDIR(SD_SYS_DIR); MKDIR(SD_SYS_DIR "/MEDIA"); MKDIR(SD_SYS_DIR "/MEDIA/lock_scr");
-    FILE *fp=fopen(MJPEG_PATH,"wb"); assert(fp);
-    const uint8_t frame[]={0xFF,0xD8,0xFF,0xD9}; assert(fwrite(frame,1,sizeof(frame),fp)==sizeof(frame)); fclose(fp);
+    asset_available=false; ui_lockscreen_show(); run_requested();
+    assert(ui_lockscreen_anim_is_idle() && !engines && !sd_accesses);
+    asset_available=true;
     /* SDK partial cleanup must return an error to this existing application
      * branch. Keep the SD lock/worker idle and allow the next entry to retry. */
     fail_engine=true; ui_lockscreen_show(); run_requested();
@@ -148,11 +150,12 @@ int main(void)
     puts("PASS each entry resets old tail frame; canceled decoder cannot publish; dark state rejects late SD replay");
 
     ui_lockscreen_show(); cancel_during_decode=false; mounted=false; run_requested();
-    assert(!sd_locked && decodes==2 && ui_lockscreen_anim_is_idle());
-    mounted=true; present=false; ui_lockscreen_show(); run_requested(); assert(!sd_locked && decodes==2);
-    present=true; assert(remove(MJPEG_PATH)==0); ui_lockscreen_show(); run_requested();
-    assert(!sd_locked && engines==deletes && task_creations==1);
-    puts("PASS absent SD/animation releases I/O lifetime lock; no accumulating tasks or decoder engines");
+    assert(!sd_locked && decodes==3 && ui_lockscreen_anim_is_idle());
+    mounted=true; present=false; ui_lockscreen_show(); run_requested();
+    assert(!sd_locked && decodes==4 && engines==deletes && !sd_accesses);
+    asset_available=false; ui_lockscreen_show(); run_requested();
+    assert(decodes==4 && ui_lockscreen_anim_is_idle() && engines==deletes && task_creations==1);
+    puts("PASS Flash cache replays without mounted/present SD, no SD lock, no worker or engine accumulation");
     lv_deinit(); free(s_rgb_buf); free(s_decode_buf);
     puts("ALL LOCKSCREEN TESTS PASSED"); return 0;
 }

@@ -26,6 +26,7 @@
 #include "ui_adj_panel.h"
 #include "ui_lockscreen.h"
 #include "sd_card.h"
+#include "lock_animation.h"
 #include "pmic_axp2101.h"
 #include "music_player_adapter.h"
 #include "audio_output.h"
@@ -335,6 +336,14 @@ void app_main(void)
     /* 放在 UI 初始化之后，确保 lockscreen 等 UI 对象已创建 */
     esp_err_t sd_ret = sd_card_init();
     if (sd_ret != ESP_OK) ESP_LOGE(TAG, "SD init failed: %s", esp_err_to_name(sd_ret));
+
+    /* 动画资源只在本次启动导入一次，此时音频/屏幕电源任务尚未启动。
+     * 全部SD读取和Flash擦写均在LVGL锁外，且不受曲库扫描是否成功影响。
+     * 导入完成即从Flash持久资源的只读缓存重播，无卡也可使用上次动画。
+     * 运行中更换SD文件不会触发导入；用户替换000.mjpeg后重新开机更新。 */
+    esp_err_t animation_ret=lock_animation_init();
+    if (animation_ret!=ESP_OK) ESP_LOGW(TAG,"Lock animation unavailable: %s",esp_err_to_name(animation_ret));
+    ui_lockscreen_start_boot_anim();
 
     /* 解码/I2S与封面/LRC加载使用不同任务，避免JPEG/LVGL阻塞音频。
      * DAC任务自行等待PMIC供电就绪，全部初始化与文件/I2C在LVGL锁外。 */

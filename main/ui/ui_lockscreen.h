@@ -4,7 +4,7 @@
  *
  * 上电默认展示此页面。用户在页面任意位置上滑可解锁退出。
  * 锁屏页面显示：
- *   - 用户设置的背景图片（后续可能支持 MJPEG 动态背景）
+ *   - Flash持久保存、开机载入只读缓存的MJPEG动态背景
  *   - 大字体时间（中上方）
  *   - 小字体日期（时间下方）
  *   - 状态栏仍显示但不显示时间
@@ -52,7 +52,7 @@ void ui_lockscreen_hide(void);
 bool ui_lockscreen_is_visible(void);
 
 /**
- * @brief 从头重播锁屏 MJPEG 动画（开机 SD 就绪、再次锁屏、熄屏唤醒均调用）
+ * @brief 从头重播锁屏 MJPEG 动画（开机Flash资源就绪、再次锁屏、熄屏唤醒均调用）
  */
 void ui_lockscreen_start_boot_anim(void);
 /** 取消旧代次，不等待 I/O；电源任务在锁外等待 idle 后才允许浅睡眠。 */

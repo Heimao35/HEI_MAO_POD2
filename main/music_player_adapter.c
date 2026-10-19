@@ -7,7 +7,6 @@
 #include "music_background.h"
 #include "lyric_parser.h"
 #include "sd_card.h"
-#include "ui/ui_lockscreen.h"
 #include "ui/ui_music_player.h"
 #include "esp_heap_caps.h"
 #include "esp_lvgl_port.h"
@@ -41,7 +40,6 @@ static unsigned s_scan_attempts;
 static TickType_t s_scan_retry_start;
 static TickType_t s_scan_retry_delay;
 static atomic_bool s_scan_requested;
-static bool s_boot_anim_pending;
 static atomic_uint_fast32_t s_requested_index;
 /* select 和发布都在 LVGL 锁内：序号用于拒绝先前点击的迟到结果。
  * 请求槽只保留最新索引，既有界，也允许同一首反复请求（包括单曲库）。 */
@@ -353,7 +351,6 @@ static void media_worker_step(void)
             s_seen_generation = UINT32_MAX;
             s_scan_state = MUSIC_SCAN_PENDING;
             s_scan_attempts = 0;
-            s_boot_anim_pending = false;
             cover_loader_invalidate();
             music_background_invalidate();
             lvgl_port_lock(0);
@@ -373,7 +370,6 @@ static void media_worker_step(void)
         s_seen_generation = generation;
         s_scan_state = MUSIC_SCAN_PENDING;
         s_scan_attempts = 0;
-        s_boot_anim_pending = false;
         music_library_reset();
         cover_loader_invalidate();
         music_background_invalidate();
@@ -433,7 +429,6 @@ static void media_worker_step(void)
         s_scan_state = MUSIC_SCAN_READY;
         uint32_t count = music_library_get_count();
         bool capped = music_library_is_truncated();
-        s_boot_anim_pending = true;
         publish_library_status(generation, count, count ?
                                (capped ? "歌曲列表已达上限" : "正在加载歌曲...") : "未找到歌曲");
         if (count) {
@@ -449,11 +444,6 @@ static void media_worker_step(void)
             }
             lvgl_port_unlock();
         }
-        else if (s_boot_anim_pending && ui_lockscreen_is_visible()) {
-            /* 空曲库也算扫描成功；没有首首歌曲可等待时，立即启动动画。 */
-            s_boot_anim_pending = false;
-            ui_lockscreen_start_boot_anim();
-        }
         return;
     }
 
@@ -464,12 +454,8 @@ static void media_worker_step(void)
     lvgl_port_unlock();
     if (index < music_library_get_count() && load_selected_song(index, generation, serial)) {
         prefetch_neighbors(index, generation, serial);
-        /* 首首歌曲的封面、歌词和音频元数据已经读取完成后再启动动画，
-         * 避免动画任务与首首歌曲加载再次争用 SD I/O 锁。 */
-        if (s_boot_anim_pending && ui_lockscreen_is_visible()) {
-            s_boot_anim_pending = false;
-            ui_lockscreen_start_boot_anim();
-        }
+        /* 锁屏动画已由app_main在Flash资源就绪后独立启动。
+         * 扫描/换卡/首曲预读不再重播动画，不让动画依赖SD曲库状态。 */
     }
 }
 
