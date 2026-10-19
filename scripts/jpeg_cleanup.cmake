@@ -1,0 +1,30 @@
+# Compile a generated copy of the pinned driver; never patch the installed SDK.
+if(NOT IDF_VERSION_MAJOR EQUAL 5 OR NOT IDF_VERSION_MINOR EQUAL 5 OR NOT IDF_VERSION_PATCH EQUAL 4)
+    message(FATAL_ERROR "Review JPEG cleanup fix before upgrading ESP-IDF v5.5.4")
+endif()
+idf_component_get_property(player_jpeg_lib esp_driver_jpeg COMPONENT_LIB)
+get_target_property(player_jpeg_sources ${player_jpeg_lib} SOURCES)
+set(player_jpeg_found FALSE)
+foreach(player_jpeg_source IN LISTS player_jpeg_sources)
+    if(player_jpeg_source MATCHES "(^|/)jpeg_decode\\.c$")
+        list(REMOVE_ITEM player_jpeg_sources "${player_jpeg_source}")
+        set(player_jpeg_found TRUE)
+    endif()
+endforeach()
+if(NOT player_jpeg_found)
+    message(FATAL_ERROR "JPEG cleanup fix: cannot find original driver source")
+endif()
+set(player_jpeg_sdk "$ENV{IDF_PATH}/components/esp_driver_jpeg/jpeg_decode.c")
+set(player_jpeg_generated "${CMAKE_BINARY_DIR}/player_jpeg/jpeg_decode.c")
+execute_process(COMMAND "${PYTHON}" "${CMAKE_SOURCE_DIR}/scripts/patch_jpeg_cleanup.py"
+    "${player_jpeg_sdk}" "${player_jpeg_generated}"
+    "${CMAKE_BINARY_DIR}/player_jpeg/jpeg_delete_under_test.inc"
+    RESULT_VARIABLE player_jpeg_patch_result)
+if(NOT player_jpeg_patch_result EQUAL 0)
+    message(FATAL_ERROR "JPEG cleanup fix generation failed")
+endif()
+set_property(TARGET ${player_jpeg_lib} PROPERTY SOURCES "${player_jpeg_sources}")
+target_sources(${player_jpeg_lib} PRIVATE "${player_jpeg_generated}")
+target_include_directories(${player_jpeg_lib} PRIVATE "$ENV{IDF_PATH}/components/esp_driver_jpeg")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${player_jpeg_sdk}" "${CMAKE_SOURCE_DIR}/scripts/patch_jpeg_cleanup.py")

@@ -19,7 +19,7 @@
 
 static bool ui_locked, sd_locked, mounted = true, present = true;
 static unsigned task_creations, notifications, scans, decodes, engines, deletes;
-static bool cancel_during_decode;
+static bool cancel_during_decode, fail_engine;
 static bool show_status_time;
 static TickType_t ticks;
 static lv_obj_t *bar;
@@ -44,7 +44,11 @@ BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack, voi
 void *jpeg_alloc_decoder_mem(size_t size, const jpeg_decode_memory_alloc_cfg_t *cfg, size_t *actual)
 { assert(cfg->buffer_direction == JPEG_DEC_ALLOC_OUTPUT_BUFFER); *actual=size; return calloc(1,size); }
 esp_err_t jpeg_new_decoder_engine(const jpeg_decode_engine_cfg_t *cfg, jpeg_decoder_handle_t *decoder)
-{ assert(!sd_locked && cfg->timeout_ms==100); ++engines; *decoder=(void *)2; return ESP_OK; }
+{
+    assert(!sd_locked && cfg->timeout_ms==100);
+    if (fail_engine) { *decoder=NULL; return ESP_FAIL; }
+    ++engines; *decoder=(void *)2; return ESP_OK;
+}
 esp_err_t jpeg_del_decoder_engine(jpeg_decoder_handle_t decoder)
 { assert(decoder==(void *)2); ++deletes; return ESP_OK; }
 esp_err_t jpeg_decoder_process(jpeg_decoder_handle_t decoder, const jpeg_decode_cfg_t *cfg,
@@ -127,6 +131,13 @@ int main(void)
     MKDIR(SD_SYS_DIR); MKDIR(SD_SYS_DIR "/MEDIA"); MKDIR(SD_SYS_DIR "/MEDIA/lock_scr");
     FILE *fp=fopen(MJPEG_PATH,"wb"); assert(fp);
     const uint8_t frame[]={0xFF,0xD8,0xFF,0xD9}; assert(fwrite(frame,1,sizeof(frame),fp)==sizeof(frame)); fclose(fp);
+    /* SDK partial cleanup must return an error to this existing application
+     * branch. Keep the SD lock/worker idle and allow the next entry to retry. */
+    fail_engine=true; ui_lockscreen_show(); run_requested();
+    assert(!sd_locked && !ui_locked && !engines && !deletes && !decodes);
+    assert(ui_lockscreen_anim_is_idle());
+    fail_engine=false;
+    puts("PASS decoder allocation failure exits safely and allows the next lock replay");
     ui_lockscreen_show(); run_requested();
     assert(decodes==1 && s_rgb_buf[0]==0x5A && s_rgb_buf[FRAME_BUF_SZ-1]==0x5A);
     assert(engines==deletes && ui_lockscreen_anim_is_idle());

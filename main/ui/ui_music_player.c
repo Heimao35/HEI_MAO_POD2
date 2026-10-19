@@ -1035,14 +1035,17 @@ void ui_music_player_set_library(uint32_t count, const char *status)
     lv_obj_clean(s_playlist);
     s_playlist_empty_lbl = NULL;
     playlist_create_empty_label();
-    free(s_pl_items);
+    /* 指针数组和条目对象使用同一个LVGL分配器；固件分配器固定在PSRAM，
+     * 不让随歌曲数量增长的小块UI内存挤占JPEG/I2S内部DMA空间。
+     * 重建范围和列表几何/滚动/点击回调完全保持原实现。 */
+    lv_free(s_pl_items);
     s_pl_items = NULL;
     s_pl_item_count = 0;
     s_library_count = count;
     s_current_idx = 0;
 
     if (count > 0) {
-        s_pl_items = calloc(count, sizeof(*s_pl_items));
+        s_pl_items = lv_calloc(count, sizeof(*s_pl_items));
         if (!s_pl_items) {
             s_library_count = 0;
             lv_label_set_text(s_title_lbl, "歌曲列表内存错误");

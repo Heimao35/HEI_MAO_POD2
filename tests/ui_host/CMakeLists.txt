@@ -164,3 +164,30 @@ if(NOT MSVC)
   target_link_libraries(audio_mp3_tests PRIVATE m)
 endif()
 add_test(NAME audio_mp3 COMMAND audio_mp3_tests)
+
+# Reuse the real LVGL/player suite with the firmware PSRAM allocator. The
+# executable supplies ALL memory core symbols so CLIB's archive object is unused.
+add_executable(ui_memory_tests test_ui_memory.c)
+target_include_directories(ui_memory_tests PRIVATE ../memory_host/stubs stubs ../media_host/stubs "${REPO}/main")
+target_compile_definitions(ui_memory_tests PRIVATE LV_USE_STDLIB_MALLOC=255)
+target_link_libraries(ui_memory_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(ui_memory_tests PRIVATE -O1 -Wall -Wextra -ffunction-sections -fdata-sections)
+  target_link_options(ui_memory_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+  if(NOT WIN32)
+    target_link_libraries(ui_memory_tests PRIVATE m)
+  endif()
+endif()
+add_test(NAME ui_memory COMMAND ui_memory_tests)
+
+# Firmware configure generates this from the pinned SDK function, not a test copy.
+if(EXISTS "${REPO}/build/player_jpeg/jpeg_delete_under_test.inc")
+  add_executable(jpeg_cleanup_tests test_jpeg_cleanup.c)
+  target_compile_definitions(jpeg_cleanup_tests PRIVATE
+    JPEG_DELETE_UNDER_TEST="${REPO}/build/player_jpeg/jpeg_delete_under_test.inc")
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(jpeg_cleanup_tests PRIVATE -O1 -Wall -Wextra)
+    target_link_options(jpeg_cleanup_tests PRIVATE -static-libgcc)
+  endif()
+  add_test(NAME jpeg_cleanup COMMAND jpeg_cleanup_tests)
+endif()

@@ -1,7 +1,9 @@
 #ifndef LV_CONF_H
 #define LV_CONF_H
 #define LV_COLOR_DEPTH 16
+#ifndef LV_USE_STDLIB_MALLOC
 #define LV_USE_STDLIB_MALLOC 1
+#endif
 #define LV_FONT_MONTSERRAT_12 1
 #define LV_FONT_MONTSERRAT_16 1
 #define LV_FONT_MONTSERRAT_18 1
