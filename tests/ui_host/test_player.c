@@ -79,7 +79,11 @@ void music_background_release(const uint8_t *pixels)
     assert(!"unexpected background");
 }
 static uint32_t selected = UINT32_MAX, requests, clock_ms, lyric_line;
-static bool cached_cover;
+static bool cached_cover,test_finished,test_play_intent;
+static bool take_finished_test(void) {bool value=test_finished;test_finished=false;return value;}
+static void set_playing_test(bool playing) {test_play_intent=playing;}
+static bool play_requested_test(void) {return test_play_intent;}
+static bool output_not_started_test(void) {return false;}
 static void select_test(uint32_t index)
 {
     selected = index; ++requests;
@@ -467,6 +471,41 @@ int main(void)
     ui_music_player_set_library(0,NULL);
     puts("PASS empty playlist status, no SD, scan results and reinserted card");
     for (unsigned i=0;i<3;i++) assert(!background_refs[i]);
+    /* EOS复用既有动画；异步准备期的按钮传递明确目标状态。 */
+    ui_music_player_set_library(3,"ready");
+    ui_music_player_restore_selection(0);
+    s_backend.take_finished=take_finished_test;
+    s_backend.set_playing=set_playing_test;
+    s_is_playing=false;toggle_btn_cb(NULL);assert(test_play_intent);
+    s_is_playing=false;toggle_btn_cb(NULL);assert(test_play_intent);
+    /* A real request can remain pending while the decoder/artwork is cold.
+     * Timer and late metadata must not turn the button back to PLAY. */
+    s_backend.is_play_requested=play_requested_test;
+    s_backend.is_playing=output_not_started_test;
+    test_play_intent=true;s_is_playing=false;
+    clock_ms=2345;player_timer_cb(NULL);
+    assert(s_is_playing && !strcmp(lv_label_get_text(lv_obj_get_child(s_btn_toggle,0)),LV_SYMBOL_PAUSE));
+    ui_music_player_show_song(0,"late artwork",NULL,300);
+    assert(test_play_intent && s_is_playing);
+    assert(lv_bar_get_value(s_progress)>0); /* late art did not reset real progress */
+    s_is_playing=false; /* model a stale local frame immediately after selecting */
+    toggle_btn_cb(NULL);assert(!test_play_intent && !s_is_playing);
+    player_timer_cb(NULL);assert(!s_is_playing);
+    toggle_btn_cb(NULL);assert(test_play_intent);
+    player_timer_cb(NULL);assert(s_is_playing);
+    test_play_intent=false;player_timer_cb(NULL);assert(!s_is_playing); /* failure/EOF */
+    s_backend.is_play_requested=NULL;s_backend.is_playing=NULL;
+    puts("PASS pending playback survives timer and late metadata; rapid click cancels current request");
+    s_single_loop=true;
+    unsigned before_eos=requests;
+    test_finished=true;player_timer_cb(NULL);
+    assert(requests==before_eos+1 && !test_finished);
+    s_cover_animating=true;test_finished=true;before_eos=requests;
+    player_timer_cb(NULL);assert(test_finished && requests==before_eos);
+    s_cover_animating=false;s_single_loop=false;
+    player_timer_cb(NULL);assert(!test_finished && requests==before_eos+1);
+    advance(1500);
+    puts("PASS explicit asynchronous play intent, single-loop EOS and deferred sequential EOS animation");
     puts("ALL PLAYER UI TESTS PASSED");
     return 0;
 }

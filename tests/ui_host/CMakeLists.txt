@@ -123,3 +123,28 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(ambient_light_tests PRIVATE -static-libgcc)
 endif()
 add_test(NAME ambient_light COMMAND ambient_light_tests)
+
+# Real PCM packing/ring/DMA accounting and DAC register sequences with hardware doubles.
+add_executable(audio_pcm_tests test_audio_pcm.c "${REPO}/main/audio_pcm.c")
+add_executable(cs43131_tests test_cs43131.c)
+foreach(name audio_pcm cs43131)
+  target_include_directories(${name}_tests PRIVATE ../audio_host/stubs ../media_host/stubs "${REPO}/main")
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${name}_tests PRIVATE -O1 -Wall -Wextra)
+    target_link_options(${name}_tests PRIVATE -static-libgcc)
+  endif()
+  add_test(NAME ${name} COMMAND ${name}_tests)
+endforeach()
+
+add_executable(audio_output_tests test_audio_output.c "${REPO}/main/audio_pcm.c")
+target_include_directories(audio_output_tests PRIVATE ../audio_host/stubs stubs ../media_host/stubs
+  "${REPO}/main" "${REPO}/managed_components/espressif__esp_audio_codec/include"
+  "${REPO}/managed_components/espressif__esp_audio_codec/include/simple_dec"
+  "${REPO}/managed_components/espressif__esp_audio_codec/include/decoder"
+  "${REPO}/managed_components/espressif__esp_audio_codec/include/decoder/impl")
+target_link_libraries(audio_output_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(audio_output_tests PRIVATE -O1 -Wall -Wextra)
+  target_link_options(audio_output_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME audio_output COMMAND audio_output_tests)

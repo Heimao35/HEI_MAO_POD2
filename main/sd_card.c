@@ -22,6 +22,17 @@ static atomic_bool s_mounted = false;
 static atomic_uint s_generation = 0;
 static SemaphoreHandle_t s_io_mutex;
 static SemaphoreHandle_t s_evt_sem = NULL;
+static void (*s_audio_detach)(void);
+static atomic_bool s_safe_remount_requested;
+static atomic_bool s_safe_speed;
+
+esp_err_t sd_card_set_audio_detach_callback(void (*callback)(void))
+{
+    if (!sd_card_io_lock(pdMS_TO_TICKS(1000))) return ESP_ERR_TIMEOUT;
+    s_audio_detach=callback;
+    sd_card_io_unlock();
+    return ESP_OK;
+}
 
 static bool card_inserted(void)
 {
@@ -57,7 +68,10 @@ static esp_err_t do_mount(void)
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    /* Normal cards mount at 40 MHz. After a scan-time I/O timeout,
+     * the recovery remount uses 20 MHz to provide additional timing margin. */
+    host.max_freq_khz = atomic_load(&s_safe_speed) ?
+                        SDMMC_FREQ_DEFAULT : SDMMC_FREQ_HIGHSPEED;
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 4;
@@ -98,6 +112,9 @@ static void do_unmount(void)
     if (!sd_card_io_lock(portMAX_DELAY)) return;
     if (!s_mounted) { sd_card_io_unlock(); return; }
 
+    /* 音频唯一长开文件在同一SD锁内关闭，再销毁VFS；播放器不再持有
+     * 失效FILE指针。回调只能关闭文件/发布原子标志，不等待UI或DAC。 */
+    if (s_audio_detach) s_audio_detach();
     esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
     s_card = NULL;
     s_mounted = false;
@@ -124,15 +141,27 @@ static void sd_detect_task(void *arg)
     (void)arg;
     for (;;) {
         xSemaphoreTake(s_evt_sem, pdMS_TO_TICKS(1000));
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+        bool safe_remount = atomic_exchange(&s_safe_remount_requested, false);
+        if (!safe_remount) vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
 
         bool inserted = card_inserted();
+        if (safe_remount && s_mounted) {
+            /* The caller only posts this request. VFS and SDMMC cleanup stay
+             * in the detect task, outside the scan worker and its SD lock. */
+            ESP_LOGW(TAG, "Recovering SD card after an I/O timeout");
+            do_unmount();
+            vTaskDelay(pdMS_TO_TICKS(20));
+            inserted = card_inserted();
+        }
         if (inserted && !s_mounted) {
             ESP_LOGI(TAG, "Card inserted, mounting...");
             do_mount();
         } else if (!inserted && s_mounted) {
             ESP_LOGI(TAG, "Card removed, unmounting...");
             do_unmount();
+            /* A physical reinsertion is a new card/session: retry its normal
+             * 40 MHz operating point instead of retaining a prior recovery mode. */
+            atomic_store(&s_safe_speed, false);
         }
     }
 }
@@ -142,6 +171,8 @@ esp_err_t sd_card_init(void)
     if (s_io_mutex) return ESP_ERR_INVALID_STATE;
     s_io_mutex = xSemaphoreCreateMutex();
     s_evt_sem = xSemaphoreCreateBinary();
+    atomic_store(&s_safe_remount_requested, false);
+    atomic_store(&s_safe_speed, false);
     if (!s_io_mutex || !s_evt_sem) {
         if (s_io_mutex) vSemaphoreDelete(s_io_mutex);
         if (s_evt_sem) vSemaphoreDelete(s_evt_sem);
@@ -176,7 +207,16 @@ bool sd_card_is_mounted(void)
 
 void sd_card_poll_detect(void)
 {
-    /* kept for API compat, no longer needed with interrupt-based detection */
+    /* Compatibility API: wake the detect task, never block the caller. */
+    if (s_evt_sem) xSemaphoreGive(s_evt_sem);
+}
+
+void sd_card_request_safe_remount(void)
+{
+    if (!s_evt_sem) return;
+    atomic_store(&s_safe_speed, true);
+    atomic_store(&s_safe_remount_requested, true);
+    xSemaphoreGive(s_evt_sem);
 }
 
 bool sd_card_is_present(void) { return card_inserted(); }

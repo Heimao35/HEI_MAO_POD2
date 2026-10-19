@@ -4,6 +4,23 @@
 #include <stdio.h>
 #include "../../main/music_player_adapter.c"
 
+/* Real audio hardware lives in its own tested worker; adapter only posts controls. */
+static unsigned audio_selects;
+static bool last_autoplay;
+void audio_output_select(uint32_t index,uint32_t gen,bool autoplay)
+{(void)index;(void)gen;++audio_selects;last_autoplay=autoplay;}
+void audio_output_toggle(void) {}
+void audio_output_set_playing(bool playing) {(void)playing;}
+uint32_t audio_output_time_ms(void) {return 0;}
+uint32_t audio_output_duration_sec(void) {return 0;}
+bool audio_output_is_playing(void) {return false;}
+bool audio_output_is_play_requested(void) {return false;}
+bool audio_output_is_active(void) {return false;}
+bool audio_output_take_finished(void) {return false;}
+bool audio_output_quiesce(bool pause) {(void)pause;return true;}
+void ui_music_player_set_callbacks(ui_music_ctrl_cb_t p,ui_music_ctrl_cb_t n,ui_music_ctrl_cb_t t,ui_music_ctrl_cb_t m)
+{(void)p;(void)n;(void)m;assert(t==audio_output_toggle);}
+
 static bool ui_locked, sd_locked, mounted = true;
 static uint32_t generation = 1, count = 4, ui_index;
 static uint32_t decoded, published, shown, lyric_published, cover_before_probe;
@@ -19,6 +36,7 @@ static unsigned background_refs[4];
 static uint32_t background_generated, background_published, background_cached_selects;
 static TickType_t test_ticks;
 static unsigned lock_failures, scan_failures, scan_calls, notify_calls, library_updates;
+static unsigned safe_remount_requests;
 static uint32_t scan_song_count=4, last_library_count;
 static bool replace_card_in_scan;
 static char last_library_status[128];
@@ -47,6 +65,7 @@ bool sd_card_io_lock(TickType_t ticks)
     sd_locked=true; return true;
 }
 void sd_card_io_unlock(void) { assert(sd_locked); sd_locked=false; }
+void sd_card_request_safe_remount(void) { ++safe_remount_requests; }
 void xTaskNotifyGive(TaskHandle_t task) { assert(task); ++notify_calls; }
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t ticks)
 { (void)clear; (void)ticks; return 0; }
@@ -212,6 +231,7 @@ static void prepare_scan_test(uint32_t songs)
     s_scan_retry_start=0;
     test_ticks=0;
     lock_failures=scan_failures=scan_calls=notify_calls=library_updates=0;
+    safe_remount_requests=0;
     scan_song_count=songs; count=0; ui_index=0;
     replace_card_in_scan=false;
     boot_anim_starts=0;
@@ -226,10 +246,11 @@ static void run_restore_tests(void)
     prepare_scan_test(4);
     strcpy(saved_folder,"song2"); strcpy(saved_audio,"a2");
     media_worker_step();
-    assert(ui_index==2 && atomic_load(&s_requested_index)==2);
+    assert(ui_index==2 && atomic_load(&s_requested_index)==2 && !last_autoplay);
     media_worker_step();
     assert(shown==1 && s_selected_index==2 && !strcmp(saved_folder,"song2"));
     lvgl_port_lock(0); ui_index=3; select_song(3); lvgl_port_unlock();
+    assert(last_autoplay);
     assert(music_player_adapter_pause(true));
     assert(music_player_adapter_capture_selection()==ESP_OK);
     assert(!strcmp(saved_folder,"song3") && !strcmp(saved_audio,"a3"));
@@ -292,6 +313,7 @@ static void run_scan_tests(void)
         }
     }
     assert(s_scan_state==MUSIC_SCAN_READY && scan_calls==3 && s_scan_attempts==3);
+    assert(safe_remount_requests==1);
     puts("PASS transient filesystem scan failures recover through bounded backoff");
 
     prepare_scan_test(4);

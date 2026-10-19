@@ -16,6 +16,7 @@ typedef struct {
 
 /* Metadata only: opens/closes the file, never decodes or loads audio payload.
  * FLAC STREAMINFO uses 64-bit sample counts and retains 32-bit/192-kHz formats.
- * MP3 duration is deliberately unknown until a real demuxer/decoder is added.
+ * MP3 uses Xing/VBRI frame counts when present, otherwise its real header bitrate
+ * provides an estimate; DMA sample counts provide the actual playback position.
  * Call on the media worker while holding the SD I/O lock. */
 esp_err_t audio_player_probe(const char *path, audio_file_info_t *info);

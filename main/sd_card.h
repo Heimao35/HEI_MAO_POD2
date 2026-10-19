@@ -24,6 +24,11 @@ uint32_t  sd_card_get_generation(void);
 bool      sd_card_io_lock(TickType_t timeout);
 void      sd_card_io_unlock(void);
 void      sd_card_poll_detect(void);
+/* Request a detect-task-owned remount after an SD I/O timeout.
+ * The next mount uses the conservative SD clock. */
+void      sd_card_request_safe_remount(void);
+/* 一次注册；卸载持有SD锁时关闭音频流。回调内不可重新取锁或访问UI。 */
+esp_err_t sd_card_set_audio_detach_callback(void (*callback)(void));
 
 #ifdef __cplusplus
 }

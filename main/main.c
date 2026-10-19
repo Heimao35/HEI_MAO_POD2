@@ -28,6 +28,7 @@
 #include "sd_card.h"
 #include "pmic_axp2101.h"
 #include "music_player_adapter.h"
+#include "audio_output.h"
 #include "ui_fonts.h"
 
 /* LCD size */
@@ -235,7 +236,10 @@ static esp_err_t app_touch_init(void)
 static esp_err_t app_lvgl_init(void)
 {
     /* Initialize LVGL */
-    const lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    lvgl_port_cfg_t lvgl_cfg = ESP_LVGL_PORT_INIT_CONFIG();
+    /* 音频解码和I2S中断固定core0，UI固定core1，避免MP3和高采样率解码
+     * 的短时突发抢占渲染。只改变任务归属，页面布局、手势、动画保持原样。 */
+    lvgl_cfg.task_affinity = 1;
     ESP_RETURN_ON_ERROR(lvgl_port_init(&lvgl_cfg), TAG, "LVGL port initialization failed");
 
     /* Add LCD screen */
@@ -311,8 +315,10 @@ void app_main(void)
     ui_manager_init();
     ui_adj_panel_update(); /* 同步恢复的音量/亮度及静音/自动亮度图标。 */
 
-    /* 注册亮度回调，滑条拖动时实际调节屏幕亮度 */
-    ui_adj_panel_set_callbacks(screen_power_set_brightness, NULL);
+    /* 注册亮度/音量回调：UI只投递请求，显示/音频任务分别写硬件。 */
+    ui_adj_panel_set_callbacks(screen_power_set_brightness, audio_output_set_volume);
+    /* 恢复的静音/音量先投递给音频worker，DAC上电始终保持静音到时钟和PCM就绪。 */
+    audio_output_set_volume(ui_get_device_state()->muted?0:ui_get_device_state()->volume);
     ui_adj_panel_set_auto_brightness_callback(screen_power_set_auto_brightness);
 
     lvgl_port_unlock();
@@ -330,7 +336,12 @@ void app_main(void)
     esp_err_t sd_ret = sd_card_init();
     if (sd_ret != ESP_OK) ESP_LOGE(TAG, "SD init failed: %s", esp_err_to_name(sd_ret));
 
-    /* Background SD catalogue/cover/LRC loader. No fake decoder or DAC task. */
+    /* 解码/I2S与封面/LRC加载使用不同任务，避免JPEG/LVGL阻塞音频。
+     * DAC任务自行等待PMIC供电就绪，全部初始化与文件/I2C在LVGL锁外。 */
+    esp_err_t audio_ret=audio_output_init();
+    if(audio_ret!=ESP_OK)ESP_LOGE(TAG,"Audio output init failed: %s",esp_err_to_name(audio_ret));
+
+    /* Background SD catalogue/cover/LRC loader. */
     esp_err_t ret = music_player_adapter_init();
     if (ret != ESP_OK) ESP_LOGE(TAG, "Music integration failed: %s", esp_err_to_name(ret));
 

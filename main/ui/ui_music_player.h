@@ -41,6 +41,13 @@ typedef struct {
     uint32_t (*get_duration_sec)(void);
     uint32_t (*get_lyric_line)(uint32_t time_ms);
     bool (*is_playing)(void);
+    /* 后台准备/预缓冲期间仍保留用户的播放意图。按钮展示与再次点击使用它，
+     * 实际进度仍由DMA完成计数驱动；错误、暂停和自然结束后此状态归false。 */
+    bool (*is_play_requested)(void);
+    /* 显式传递按钮目标状态，避免异步准备中二次toggle反转尚未生效的请求。 */
+    void (*set_playing)(bool playing);
+    /* DMA自然播放结束事件。UI定时器消费后复用现有切歌动画/单曲模式。 */
+    bool (*take_finished)(void);
 } ui_music_backend_t;
 
 /* 开机/重新挂载后恢复歌曲选择。须持有 LVGL 锁，先同步 UI 当前索引，

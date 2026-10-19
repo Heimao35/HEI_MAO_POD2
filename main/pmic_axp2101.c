@@ -132,7 +132,8 @@ static i2c_master_dev_handle_t s_device;
 static bool s_configured;
 /* Rail startup has an independent lifetime from battery sampling. A monitor
  * retry must not cycle chips that have already been powered successfully. */
-static bool s_outputs_ready;
+static atomic_bool s_outputs_ready;
+bool pmic_axp2101_outputs_ready(void) { return atomic_load(&s_outputs_ready); }
 static bool s_output_fault_logged;
 static bool s_fault_logged;
 

@@ -58,3 +58,6 @@ CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK=y
 CONFIG_LV_USE_FS_POSIX=y
 CONFIG_LV_FS_POSIX_LETTER=70
 CONFIG_LV_FS_POSIX_PATH="/fontfs/"
+
+# Audio DMA callback/ring are in internal RAM; keep feeding during NVS Flash writes.
+CONFIG_I2S_ISR_IRAM_SAFE=y

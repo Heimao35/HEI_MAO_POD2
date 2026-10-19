@@ -2,6 +2,7 @@
 #include "player_settings.h"
 #include "music_library.h"
 #include "audio_player.h"
+#include "audio_output.h"
 #include "cover_loader.h"
 #include "music_background.h"
 #include "lyric_parser.h"
@@ -22,8 +23,6 @@ static const char *TAG = "music_adapter";
 static TaskHandle_t s_worker;
 static SemaphoreHandle_t s_parser_mutex;
 static atomic_uint_fast32_t s_duration_sec;
-static atomic_uint_fast32_t s_time_ms;
-static atomic_bool s_playing;
 static char *s_lyrics_text;
 static music_page_t s_page;
 /* 见过一次挂载不代表扫描成功：状态、重试和挂载代次必须分别记录。
@@ -70,6 +69,7 @@ void music_player_adapter_request_scan_if_needed(void)
 static atomic_uint s_worker_state;
 static bool media_paused(void) { return (atomic_load(&s_worker_state) & MEDIA_PAUSED) != 0; }
 static uint32_t s_selected_index = UINT32_MAX; /* LVGL lock */
+static bool s_restore_only; /* only boot restore is paused; user selection plays */
 bool music_player_adapter_pause(bool pause)
 {
     unsigned previous;
@@ -78,7 +78,8 @@ bool music_player_adapter_pause(bool pause)
         previous = atomic_fetch_and(&s_worker_state, (unsigned)~MEDIA_PAUSED);
         notify_worker();
     }
-    return (previous & MEDIA_BUSY) == 0;
+    bool audio_idle=audio_output_quiesce(pause);
+    return (previous & MEDIA_BUSY) == 0 && audio_idle;
 }
 
 static bool media_available(void);
@@ -88,12 +89,11 @@ static void select_song(uint32_t index)
     /* UI callbacks post one scalar index; the media task performs all file I/O. */
     if (media_paused()) return;
     s_selected_index = index;
+    audio_output_select(index,sd_card_get_generation(),!s_restore_only);
     ++s_request_serial;
     atomic_store(&s_requested_index, index);
     atomic_store(&s_lyrics_ready, false);
     atomic_store(&s_duration_sec, 0);
-    atomic_store(&s_time_ms, 0);
-    atomic_store(&s_playing, false);
     /* 调用方持有 LVGL 锁：仅查内存缓存，不等待 SD 或 JPEG。
      * 命中则本帧开始滑入真实封面，未命中则保持 UI 已清空的区域。 */
     const uint8_t *cover = cover_loader_acquire(sd_card_get_generation(), index);
@@ -107,10 +107,14 @@ static void select_song(uint32_t index)
     notify_worker();
 }
 
-static uint32_t get_time_ms(void) { return atomic_load(&s_time_ms); }
-static uint32_t get_duration_sec(void) { return atomic_load(&s_duration_sec); }
-bool music_player_adapter_is_playing(void) { return atomic_load(&s_playing); }
-static bool is_playing(void) { return music_player_adapter_is_playing(); }
+static uint32_t get_time_ms(void) { return audio_output_time_ms(); }
+static uint32_t get_duration_sec(void)
+{
+    uint32_t duration=audio_output_duration_sec();
+    return duration?duration:atomic_load(&s_duration_sec);
+}
+bool music_player_adapter_is_playing(void) { return audio_output_is_active(); }
+static bool is_playing(void) { return audio_output_is_playing(); }
 
 static uint32_t get_lyric_line(uint32_t time_ms)
 {
@@ -222,8 +226,6 @@ static bool load_selected_song(uint32_t index, uint32_t generation, uint32_t ser
         uint32_t duration = audio_ret == ESP_OK && info.metadata_known ?
                             (uint32_t)(info.duration_ms / 1000) : 0;
         atomic_store(&s_duration_sec, duration);
-        atomic_store(&s_time_ms, 0);
-        atomic_store(&s_playing, false);
         ui_music_player_show_song(index, item_ret == ESP_OK ? item.name : "歌曲不可用",
                                   cover, duration);
         ui_music_player_set_lyrics(lyric_ret == ESP_OK && s_lyrics_text ? s_lyrics_text : "",
@@ -357,11 +359,10 @@ static void media_worker_step(void)
             lvgl_port_lock(0);
             ++s_request_serial;
             s_selected_index=UINT32_MAX;
+            audio_output_select(UINT32_MAX,generation,false);
             atomic_store(&s_requested_index, UINT32_MAX);
             atomic_store(&s_lyrics_ready, false);
             atomic_store(&s_duration_sec, 0);
-            atomic_store(&s_time_ms, 0);
-            atomic_store(&s_playing, false);
             ui_music_player_set_library(0, "请插入 SD 卡");
             lvgl_port_unlock();
         }
@@ -379,11 +380,10 @@ static void media_worker_step(void)
         lvgl_port_lock(0);
         ++s_request_serial;
         s_selected_index=UINT32_MAX;
+        audio_output_select(UINT32_MAX,generation,false);
         atomic_store(&s_requested_index, UINT32_MAX);
         atomic_store(&s_lyrics_ready, false);
         atomic_store(&s_duration_sec, 0);
-        atomic_store(&s_time_ms, 0);
-        atomic_store(&s_playing, false);
         lvgl_port_unlock();
         publish_library_status(generation, 0, "正在扫描 SD 卡...");
     }
@@ -413,6 +413,10 @@ static void media_worker_step(void)
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Music scan attempt %u/%u failed: %s", s_scan_attempts,
                      MUSIC_SCAN_MAX_ATTEMPTS, esp_err_to_name(ret));
+            /* A first index-write timeout is followed by repeated EIO on the
+             * same controller. Request a detect-task-owned remount; it retries
+             * at 20 MHz without recursively clearing VFS under this SD lock. */
+            if (s_scan_attempts == 1) sd_card_request_safe_remount();
             if (s_scan_attempts < MUSIC_SCAN_MAX_ATTEMPTS) {
                 s_scan_state = MUSIC_SCAN_WAIT_RETRY;
                 s_scan_retry_start = xTaskGetTickCount();
@@ -439,7 +443,9 @@ static void media_worker_step(void)
             if (media_available() && sd_card_get_generation() == generation &&
                 atomic_load(&s_requested_index) == UINT32_MAX && !media_paused()) {
                 ui_music_player_restore_selection(restored);
+                s_restore_only=true;
                 select_song(restored);
+                s_restore_only=false;
             }
             lvgl_port_unlock();
         }
@@ -501,6 +507,9 @@ esp_err_t music_player_adapter_init(void)
         .get_duration_sec = get_duration_sec,
         .get_lyric_line = get_lyric_line,
         .is_playing = is_playing,
+        .set_playing = audio_output_set_playing,
+        .is_play_requested = audio_output_is_play_requested,
+        .take_finished = audio_output_take_finished,
     };
     atomic_store(&s_requested_index, UINT32_MAX);
     lvgl_port_lock(0);

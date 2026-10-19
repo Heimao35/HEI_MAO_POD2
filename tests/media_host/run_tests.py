@@ -124,6 +124,35 @@ def tests(lib):
     assert lib.test_live_bytes() == 0
     print("PASS 300-MiB sparse FLAC, 32-bit/192-kHz metadata, 36-bit sample count, MP3 unknown duration")
 
+    frame = bytearray(417)  # real MPEG1 LayerIII128kbps44100Hz stereo header
+    frame[:4] = bytes.fromhex("fffb9000")
+    frame[36:40] = b"Xing"
+    frame[40:44] = (1).to_bytes(4,"big")
+    frame[44:48] = (1000).to_bytes(4,"big")
+    Path("xing.mp3").write_bytes(frame)
+    assert lib.audio_player_probe(b"xing.mp3", C.byref(info)) == 0
+    assert (info.sample_rate,info.channels,info.total_samples)==(44100,2,1152000)
+    assert info.duration_ms == 1152000*1000//44100
+    frame[36:54] = b"\0"*18
+    frame[36:40] = b"VBRI"
+    frame[50:54] = (777).to_bytes(4,"big")
+    Path("vbri.mp3").write_bytes(frame)
+    assert lib.audio_player_probe(b"vbri.mp3", C.byref(info)) == 0
+    assert info.total_samples==777*1152
+    frame[36:54] = b"\0"*18
+    Path("cbr.mp3").write_bytes(frame*10)
+    assert lib.audio_player_probe(b"cbr.mp3", C.byref(info)) == 0
+    assert info.metadata_known and info.duration_ms==4170*8//128
+    tag_bytes = 16*1024*1024
+    encoded_size = bytes((tag_bytes>>21&127,tag_bytes>>14&127,tag_bytes>>7&127,tag_bytes&127))
+    with open("large-tag.mp3","wb") as f:
+        f.write(b"ID3\x04\0\0"+encoded_size)
+        f.seek(10+tag_bytes)
+        f.write(frame)
+    assert lib.audio_player_probe(b"large-tag.mp3", C.byref(info)) == 0
+    assert info.metadata_known and info.sample_rate==44100
+    print("PASS MP3 Xing/VBRI frame counts, actual-bitrate estimate and16MiB ID3 skip without loading tag")
+
     # Real cover_loader.c with a fake JPEG engine: no claim of hardware decode validation.
     lib.cover_loader_load.argtypes = [C.c_char_p, C.c_uint32, C.c_uint32, C.POINTER(C.c_void_p)]
     lib.cover_loader_acquire.argtypes = [C.c_uint32, C.c_uint32]

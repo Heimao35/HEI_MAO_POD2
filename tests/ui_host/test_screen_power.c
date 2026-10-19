@@ -96,6 +96,7 @@ bool ui_lockscreen_anim_is_idle(void) { return anim_idle; }
 void ui_manager_lock(void)
 { assert(ui_locked); locked = true; ++locks; lv_display_trigger_activity(s_display); }
 bool music_player_adapter_is_playing(void) { return playing; }
+bool audio_output_sleep(bool pause) {(void)pause;return true;}
 bool pmic_axp2101_pause_monitor(bool pause)
 { assert(!ui_locked); pmic_paused = pause; return pmic_idle; }
 bool sd_card_io_lock(TickType_t ticks)

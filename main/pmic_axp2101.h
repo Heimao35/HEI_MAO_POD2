@@ -29,3 +29,6 @@ esp_err_t pmic_axp2101_poweroff(void);
 /* AXP2101整机POWOFF/POWON（0x10[1]），与关机共用PMIC所有者任务。
  * 在LVGL锁外调用；成功只代表I2C命令成功，不是供电波形验证。 */
 esp_err_t pmic_axp2101_restart(void);
+
+/* RAM快照：DAC必须等待两路供电配置验证成功后才释放RESET。 */
+bool pmic_axp2101_outputs_ready(void);

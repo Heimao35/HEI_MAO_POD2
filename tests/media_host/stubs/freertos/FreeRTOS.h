@@ -12,3 +12,5 @@ typedef unsigned UBaseType_t;
 #define pdPASS 1
 #define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(ms) (ms)
+
+#define portTICK_PERIOD_MS 1

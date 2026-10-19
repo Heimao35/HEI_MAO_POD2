@@ -1,5 +1,6 @@
 #include "screen_power.h"
 #include "ambient_light.h"
+#include "audio_output.h"
 #include "ui/ui_adj_panel.h"
 #include "system_power.h"
 #include "display_dpi_sleep.h"
@@ -204,6 +205,7 @@ static void check_lock_timeout(void)
 
 static void restore_ui(void)
 {
+    audio_output_sleep(false); /* 触摸/按键唤醒释放睡眠所有权，独立于关机。 */
     if (lvgl_port_lock(0)) {
         /* 触摸唤醒只负责亮屏；等待本次手指释放后再接受手势，防止同一
          * 次上滑既唤醒又解锁。锁屏对象一直保留，show 仅重播 MJPEG，
@@ -263,18 +265,22 @@ static void dark_idle(void)
      * uses bounded Light-sleep intervals, retaining PSRAM/UI and allowing SD
      * hotplug and PMIC monitoring to run between intervals. Never Deep-sleep:
      * it cannot resume the existing UI and is inappropriate for this lock. */
-    if (s_touch_probe_pending || system_power_is_active() || music_player_adapter_is_playing() || !ui_lockscreen_anim_is_idle()) return;
-    /* The production adapter may have a real decoder worker in the future.
-     * Its SD accesses are covered by the same mutex; this check only makes
-     * the present metadata-only path explicit. */
+    if (s_touch_probe_pending || system_power_is_active() || music_player_adapter_is_playing() || !ui_lockscreen_anim_is_idle()) { audio_output_sleep(false); return; }
+    /* 实际音频已接入：播放/准备期间保持CPU运行；空闲睡眠还需让
+     * DAC耳机监测任务确认停稳，避免I2C事务跨越显式Light-sleep。 */
     /* 低电平候选已在screen_power_step中读触摸数据。仍为低时不进入
      * ANY_LOW睡眠，避免立刻被同一电平唤醒；也不再给自己排无条件亮屏
      * 事件/通知，防止持续低电平导致I2C忙循环。 */
-    if (gpio_get_level(TOUCH_IRQ_GPIO) == 0) return;
+    if (gpio_get_level(TOUCH_IRQ_GPIO) == 0) { audio_output_sleep(false); return; }
     /* A pending PMIC notification first needs the monitor to drain it. VBUS,
      * charging and SOC events can wake the CPU without turning on the screen. */
-    if (gpio_get_level(PMIC_IRQ_GPIO) == 0) return;
+    if (gpio_get_level(PMIC_IRQ_GPIO) == 0) { audio_output_sleep(false); return; }
     if (!pmic_axp2101_pause_monitor(true)) {
+        pmic_axp2101_pause_monitor(false);
+        return;
+    }
+    if (!audio_output_sleep(true)) {
+        /* 保留请求直到worker确认，避免每轮立即撤销导致永远收不到ACK。 */
         pmic_axp2101_pause_monitor(false);
         return;
     }
@@ -306,6 +312,7 @@ static void dark_idle(void)
         }
         sd_card_io_unlock();
     }
+    audio_output_sleep(false);
     pmic_axp2101_pause_monitor(false);
 }
 

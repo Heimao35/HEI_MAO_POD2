@@ -276,7 +276,10 @@ static void next_btn_cb(lv_event_t *e)
 static void toggle_btn_cb(lv_event_t *e)
 {
     (void)e;
-    s_is_playing = !s_is_playing;
+    /* 用户可能在下一次200ms状态刷新前再次点击，或在首帧封面发布前点击。
+     * 从后端已接受的请求取反，不能依赖可能过期的本地按钮状态。 */
+    bool requested=s_backend.is_play_requested?s_backend.is_play_requested():s_is_playing;
+    s_is_playing = !requested;
     lv_obj_t *icon = lv_obj_get_child(s_btn_toggle, 0);
     if (icon) {
         lv_label_set_text(icon, playback_action_symbol());
@@ -285,7 +288,10 @@ static void toggle_btn_cb(lv_event_t *e)
     /* 当前条目与控制台共用播放/暂停图标。局部点击也要立即刷新，
      * 不能等待后端定时器，因为此时 s_is_playing 已更新。 */
     update_playlist_highlight();
-    if (s_cb_toggle) s_cb_toggle();
+    /* 只提交目标状态；DAC/I2S在后台执行。加载中点击“播放”仍然是播放
+     * 请求，不反转后台已经排队但尚未开始输出的状态。既有按钮样式不变。 */
+    if (s_backend.set_playing) s_backend.set_playing(s_is_playing);
+    else if (s_cb_toggle) s_cb_toggle();
 }
 
 /**
@@ -1139,7 +1145,12 @@ void ui_music_player_show_song(uint32_t index, const char *title,
     if (!ui_music_player_can_show_song(index)) return;
     if (title) lv_label_set_text(s_title_lbl, title);
     ui_music_player_set_cover(index, cover);
-    ui_music_player_update_progress(0, duration_sec, false);
+    /* 封面/LRC可晚于点击播放发布。这里只更新信息，不能把已接受的播放
+     * 请求重置为暂停，否则按钮下一次点击会误提交相反目标。布局不变。 */
+    bool requested=s_backend.is_play_requested?s_backend.is_play_requested():
+                   (s_backend.is_playing?s_backend.is_playing():s_is_playing);
+    uint32_t time_ms=s_backend.get_time_ms?s_backend.get_time_ms():0;
+    ui_music_player_update_progress(time_ms/1000, duration_sec, requested);
     update_playlist_highlight();
 }
 
@@ -1213,13 +1224,23 @@ static uint32_t lyric_line_char_index(uint32_t line)
 static void player_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    /* 自然结束后才自动切歌；解码错误/拔卡只暂停，不误触发循环。继续使用
+     * 现有上下首动画与列表选中逻辑，不改布局、触摸区域或进度条交互方式。
+     * 动画未完成时延后消费事件，防止结束事件被动画保护条件丢弃。 */
+    if (!s_cover_animating && s_backend.take_finished && s_backend.take_finished()) {
+        if (s_single_loop) request_song((uint32_t)s_current_idx);
+        else ui_music_player_next_animated();
+    }
     if (s_backend.get_time_ms && s_backend.get_duration_sec) {
         uint32_t time_ms = s_backend.get_time_ms();
         uint32_t duration_sec = s_backend.get_duration_sec();
         /* Before DAC/decoder integration there is no backend play-state
          * callback. Preserve the original button interaction locally; once
          * a real callback is supplied it becomes authoritative. */
-        bool playing = s_backend.is_playing ? s_backend.is_playing() : s_is_playing;
+        /* 准备阶段没有DMA进度不代表用户取消了播放。控制台与列表图标
+         * 始终使用已接受的请求；位置继续使用上面的真实已发送样本时间。 */
+        bool playing = s_backend.is_play_requested ? s_backend.is_play_requested() :
+                       (s_backend.is_playing ? s_backend.is_playing() : s_is_playing);
         ui_music_player_update_progress(time_ms / 1000, duration_sec, playing);
 
         if (s_show_lyric && s_backend.get_lyric_line && s_lyric_line_count &&
