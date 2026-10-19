@@ -31,6 +31,7 @@
 #include "music_player_adapter.h"
 #include "audio_output.h"
 #include "ui_fonts.h"
+#include "ui_boot.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (460)
@@ -287,6 +288,26 @@ static esp_err_t app_lvgl_init(void)
     return ESP_OK;
 }
 
+/* 普通初始化阶段在 LVGL 锁外运行，只有状态发布/刷新占用锁。
+ * 字库回调则已经持锁，直接调用 ui_boot 接口，避免嵌套等待。 */
+static void app_boot_progress(uint8_t progress, const char *stage)
+{
+    lvgl_port_lock(0);
+    ui_boot_set_progress(progress,stage);
+    lvgl_port_unlock();
+}
+
+static void app_font_progress(unsigned completed, unsigned total,
+                              const char *filename, void *user_data)
+{
+    (void)user_data;
+    /* 用户只需要知道仍在启动，不暴露内部字库文件名。 */
+    const char *stage=filename ? "Loading fonts..." : "Fonts ready";
+    /* 字库阶段占启动条的 10..70 区间，只表示已完成的阶段，
+     * 不表示实际字节数或预计剩余时间；大字库内部允许短暂停留。 */
+    ui_boot_set_progress((uint8_t)(10+completed*60/total),stage);
+}
+
 void app_main(void)
 {
     /* LCD HW initialization */
@@ -300,6 +321,14 @@ void app_main(void)
     /* LVGL initialization */
     ESP_ERROR_CHECK(app_lvgl_init());
 
+    /* 第一幅提示画面不依赖 NVS、字库或 SD。启动完成前暂停触摸输入，
+     * 避免用户在加载阶段的触摸被底层锁屏/播放器当成正常手势。 */
+    lvgl_port_lock(0);
+    lv_indev_enable(lvgl_touch_indev,false);
+    ui_boot_show(lvgl_disp);
+    ui_boot_set_progress(2,"Loading settings...");
+    lvgl_port_unlock();
+
     /* 设置在 UI 创建前从 Flash 读取；失败保留 NVS 原数据并沿用默认设置。 */
     esp_err_t settings_ret=player_settings_init();
     if (settings_ret!=ESP_OK) ESP_LOGW(TAG,"Settings unavailable: %s",esp_err_to_name(settings_ret));
@@ -308,10 +337,13 @@ void app_main(void)
     lvgl_port_lock(0);
     player_settings_restore_ui();
 
-    /* Mount and load the build-time font assets before any label is created. */
-    esp_err_t font_ret = ui_fonts_init();
+    /* 正常页面使用外部字体；开机提示始终用内置字体。先刷新挂载提示，
+     * 逐字库加载时再由同步回调推进阶段条，期间不释放共同 LVGL 锁。 */
+    ui_boot_set_progress(10,"Mounting fonts...");
+    esp_err_t font_ret = ui_fonts_init_with_progress(app_font_progress,NULL);
     if (font_ret != ESP_OK) ESP_LOGW(TAG, "Custom fonts unavailable: %s", esp_err_to_name(font_ret));
 
+    ui_boot_set_progress(70,"Creating interface...");
     /* 初始化自定义 UI 系统（替换原有 demo） */
     ui_manager_init();
     ui_adj_panel_update(); /* 同步恢复的音量/亮度及静音/自动亮度图标。 */
@@ -322,6 +354,7 @@ void app_main(void)
     audio_output_set_volume(ui_get_device_state()->muted?0:ui_get_device_state()->volume);
     ui_adj_panel_set_auto_brightness_callback(screen_power_set_auto_brightness);
 
+    ui_boot_set_progress(74,"Starting power monitor...");
     lvgl_port_unlock();
 
     /* PMIC readings run on I2C1 in a separate worker. Start after UI objects
@@ -332,28 +365,32 @@ void app_main(void)
     esp_err_t pmic_ret = pmic_axp2101_init();
     if (pmic_ret != ESP_OK) ESP_LOGE(TAG, "PMIC monitor init failed: %s", esp_err_to_name(pmic_ret));
 
+    app_boot_progress(78,"Checking SD card...");
     /* Initial SD mount, followed by interrupt/poll-based hot-plug detection. */
     /* 放在 UI 初始化之后，确保 lockscreen 等 UI 对象已创建 */
     esp_err_t sd_ret = sd_card_init();
     if (sd_ret != ESP_OK) ESP_LOGE(TAG, "SD init failed: %s", esp_err_to_name(sd_ret));
 
+    app_boot_progress(82,"Preparing lock animation...");
     /* 动画资源只在本次启动导入一次，此时音频/屏幕电源任务尚未启动。
      * 全部SD读取和Flash擦写均在LVGL锁外，且不受曲库扫描是否成功影响。
      * 导入完成即从Flash持久资源的只读缓存重播，无卡也可使用上次动画。
      * 运行中更换SD文件不会触发导入；用户替换000.mjpeg后重新开机更新。 */
     esp_err_t animation_ret=lock_animation_init();
     if (animation_ret!=ESP_OK) ESP_LOGW(TAG,"Lock animation unavailable: %s",esp_err_to_name(animation_ret));
-    ui_lockscreen_start_boot_anim();
+    app_boot_progress(88,"Starting audio...");
 
     /* 解码/I2S与封面/LRC加载使用不同任务，避免JPEG/LVGL阻塞音频。
      * DAC任务自行等待PMIC供电就绪，全部初始化与文件/I2C在LVGL锁外。 */
     esp_err_t audio_ret=audio_output_init();
     if(audio_ret!=ESP_OK)ESP_LOGE(TAG,"Audio output init failed: %s",esp_err_to_name(audio_ret));
 
+    app_boot_progress(92,"Starting music library...");
     /* Background SD catalogue/cover/LRC loader. */
     esp_err_t ret = music_player_adapter_init();
     if (ret != ESP_OK) ESP_LOGE(TAG, "Music integration failed: %s", esp_err_to_name(ret));
 
+    app_boot_progress(95,"Starting display controls...");
     /* 字体和 SD 初始挂载结束后才启动十秒计时；触摸 IRQ 包装器保留
      * LVGL 正常输入，仅在熄屏时截获唤醒。所有硬件操作均在锁外执行。 */
     /* ALS初始化和ADC校准在LVGL锁外；随后由显示电源任务低频采样，
@@ -363,6 +400,7 @@ void app_main(void)
     esp_err_t power_ret = screen_power_init(lvgl_disp, lvgl_touch_indev, lcd_panel, touch_handle);
     if (power_ret != ESP_OK) ESP_LOGE(TAG, "Screen power init failed: %s", esp_err_to_name(power_ret));
 
+    app_boot_progress(98,"Starting system controls...");
     esp_err_t system_ret=system_power_init();
     if (system_ret!=ESP_OK) ESP_LOGE(TAG,"System power init failed: %s",esp_err_to_name(system_ret));
 
@@ -370,7 +408,20 @@ void app_main(void)
     esp_err_t keys_ret = volume_keys_init();
     if (keys_ret != ESP_OK) ESP_LOGE(TAG, "Volume keys init failed: %s", esp_err_to_name(keys_ret));
 
-    /* 开机动画由音乐 worker 在首次 SD 曲库扫描和首首歌曲信息加载完成后
-     * 启动。这里不再与首次扫描并行启动，避免动画读取 MJPEG 时抢占 SD
-     * I/O 锁，导致音乐扫描在冷启动阶段超时。 */
+    /* 所有同步启动阶段已处理完（可选外设失败仍沿用既有降级/重试），
+     * 不等待后台曲库扫描。只移除临时提示层，不清空任何正常页面。
+     * 吃掉启动期间仍按住的触摸；最后重置活动时间，十秒锁屏计时从
+     * 用户真正看到锁屏时开始，避免长时间导入动画资源后立即熄屏。 */
+    lvgl_port_lock(0);
+    ui_boot_set_progress(100,"Ready");
+    ui_boot_hide();
+    lv_indev_enable(lvgl_touch_indev,true);
+    lv_indev_wait_release(lvgl_touch_indev);
+    lv_display_trigger_activity(lvgl_disp);
+    lvgl_port_unlock();
+
+    /* 提示层退出后再投递原有 MJPEG 重播请求，保证用户从第一帧看到
+     * 动画，而不是动画已经在黑色提示层下面播放。资源仍来自 Flash/
+     * PSRAM 缓存，运行时不重新读取 SD，原动画帧率/布局均不变。 */
+    ui_lockscreen_start_boot_anim();
 }

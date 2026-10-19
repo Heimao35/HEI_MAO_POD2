@@ -42,6 +42,11 @@ static lv_font_t *load_font(const char *file_name, const lv_font_t *fallback)
 
 esp_err_t ui_fonts_init(void)
 {
+    return ui_fonts_init_with_progress(NULL,NULL);
+}
+
+esp_err_t ui_fonts_init_with_progress(ui_fonts_progress_cb_t progress, void *user_data)
+{
     if(s_initialized) return ESP_OK;
 
     /* Never format this partition automatically: it contains build-time assets. */
@@ -71,10 +76,24 @@ esp_err_t ui_fonts_init(void)
      * when multiple pages use it. ESP-IDF's LVGL allocator is configured for
      * this project, so the allocation can use the available external RAM.
      */
-    s_font_14 = load_font("UI_FONT_14.bin", &lv_font_montserrat_14);
-    s_font_16 = load_font("UI_FONT_16.bin", &lv_font_montserrat_16);
-    s_font_18 = load_font("UI_FONT_18.bin", &lv_font_montserrat_18);
-    s_font_22 = load_font("UI_FONT_22.bin", &lv_font_montserrat_22);
+    const struct {
+        const char *name;
+        const lv_font_t *fallback;
+        lv_font_t **destination;
+    } fonts[] = {
+        {"UI_FONT_14.bin", &lv_font_montserrat_14, &s_font_14},
+        {"UI_FONT_16.bin", &lv_font_montserrat_16, &s_font_16},
+        {"UI_FONT_18.bin", &lv_font_montserrat_18, &s_font_18},
+        {"UI_FONT_22.bin", &lv_font_montserrat_22, &s_font_22},
+    };
+    const unsigned count=sizeof(fonts)/sizeof(fonts[0]);
+    for(unsigned i=0;i<count;++i) {
+        /* 启动状态先刷新，再执行同步解析；不解锁去并行操作 LVGL，
+         * 继续遵守当前 font loader/界面的共同锁约定。 */
+        if(progress) progress(i,count,fonts[i].name,user_data);
+        *fonts[i].destination=load_font(fonts[i].name,fonts[i].fallback);
+    }
+    if(progress) progress(count,count,NULL,user_data);
 
     s_initialized = true;
     ESP_LOGI(TAG, "Custom UI fonts initialized%s", s_fontfs_mounted ? "" : " without partition");

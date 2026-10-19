@@ -201,3 +201,13 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(lock_animation_tests PRIVATE -static-libgcc)
 endif()
 add_test(NAME lock_animation COMMAND lock_animation_tests)
+
+# Render the prompt before slow font loading and retain normal pages on teardown.
+add_executable(boot_tests test_boot.c)
+target_include_directories(boot_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(boot_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(boot_tests PRIVATE -O1 -Wall -Wextra)
+  target_link_options(boot_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME boot COMMAND boot_tests)
