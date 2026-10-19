@@ -95,11 +95,11 @@ static void bright_slider_cb(lv_event_t *e)
     if (s_br_cb) s_br_cb((uint8_t)val);
 }
 
-static void vol_slider_cb(lv_event_t *e)
+/* 音量状态和后端请求的共同入口；调用方持有 LVGL 锁。
+ * 与展开面板/记录触摸活动分开，使熄屏播放时按键仍可调音量，且不会
+ * 启动动画、延长屏幕或调节栏活动时间。静音解除策略与原滑条一致。 */
+static void apply_volume_value(uint8_t val)
 {
-    (void)e;
-    volume_activity();
-    int32_t val = lv_slider_get_value(s_vol_slider);
     /* 静音时手动拖滑条 → 自动解除静音 */
     if (s_muted && val > 0) {
         s_muted = false;
@@ -109,6 +109,13 @@ static void vol_slider_cb(lv_event_t *e)
     }
     ui_get_device_state()->volume = (uint8_t)val;
     if (s_vol_cb) s_vol_cb((uint8_t)val);
+}
+
+static void vol_slider_cb(lv_event_t *e)
+{
+    (void)e;
+    volume_activity();
+    apply_volume_value((uint8_t)lv_slider_get_value(s_vol_slider));
 }
 
 /** @brief 自动亮度按钮点击 —— 切换自动/手动，按钮图标为字母 A */
@@ -396,19 +403,27 @@ static void show_panel(bool volume_only)
 
 void ui_adj_panel_show(void) { show_panel(false); }
 
-void ui_adj_panel_adjust_volume(int delta)
+/* 两种按键路径共用同一滑条值、上下限、静音策略和音量回调。
+ * show_feedback=false 供熄屏播放使用：仅在暂停的 LVGL 对象上同步数值，
+ * 方便唤醒后正确显示；不展开/移动面板，不恢复刷新，不触发活动时间。
+ * 亮屏路径保持原有单列滑入、无遮罩、五秒自动收起和活动提示行为。 */
+static void adjust_volume(int delta, bool show_feedback)
 {
     if (!s_panel) return;
     int value = ui_get_device_state()->volume + delta;
     if (value < 0) value = 0;
     if (value > 100) value = 100;
-    show_panel(true);
+    if (show_feedback) {
+        show_panel(true);
+        volume_activity();
+    }
     lv_slider_set_value(s_vol_slider, value, LV_ANIM_OFF);
-    /* 与拖动滑条共用解除静音、设备音量和后端回调，避免两条路径不同步。
-     * 暂未注册 DAC 回调时仍保留真实 UI 状态，之后可直接挂接音频后端。 */
-    vol_slider_cb(NULL);
-    lv_display_trigger_activity(lv_display_get_default());
+    apply_volume_value((uint8_t)value);
+    if (show_feedback) lv_display_trigger_activity(lv_display_get_default());
 }
+
+void ui_adj_panel_adjust_volume(int delta) { adjust_volume(delta, true); }
+void ui_adj_panel_adjust_volume_silent(int delta) { adjust_volume(delta, false); }
 
 void ui_adj_panel_hide(void)
 {

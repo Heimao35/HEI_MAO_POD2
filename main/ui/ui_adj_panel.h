@@ -33,6 +33,11 @@ void ui_adj_panel_show(void);
  * 必须持有 LVGL 锁；此调用不执行 GPIO/I2C/文件操作。 */
 void ui_adj_panel_adjust_volume(int delta);
 
+/** @brief 熄屏播放时的实体音量键：同步音量/静音、滑条和后端回调，
+ * 不展开面板、不启动动画、不触发显示活动或恢复刷新。必须持有 LVGL 锁。
+ * 只投递原音量后端 RAM 请求，不在锁内执行 I2C/文件操作。 */
+void ui_adj_panel_adjust_volume_silent(int delta);
+
 /** @brief 仅手势完整面板阻止页面手势，按键单列允许下层正常交互。 */
 bool ui_adj_panel_is_modal(void);
 

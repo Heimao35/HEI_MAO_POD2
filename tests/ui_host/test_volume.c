@@ -7,6 +7,7 @@
 
 static ui_device_state_t state = {.brightness=80, .volume=50};
 static bool locked_page, dark, ui_locked, allow_lock=true;
+static bool audio_active, power_busy, stop_audio_on_lock, darken_on_lock;
 static int up_level=1, down_level=1;
 static TickType_t ticks;
 static unsigned vol_calls, br_calls, other_clicks, auto_calls;
@@ -17,8 +18,15 @@ ui_device_state_t *ui_get_device_state(void) { return &state; }
 bool ui_lockscreen_is_visible(void) { return locked_page; }
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 bool screen_power_is_dark(void) { return dark; }
+bool audio_output_is_active(void) { return audio_active; }
+bool system_power_is_active(void) { return power_busy; }
 bool lvgl_port_lock(uint32_t timeout)
-{ (void)timeout; assert(!ui_locked); ui_locked=allow_lock; return allow_lock; }
+{
+    (void)timeout; assert(!ui_locked); ui_locked=allow_lock;
+    if(ui_locked && stop_audio_on_lock) {audio_active=false;stop_audio_on_lock=false;}
+    if(ui_locked && darken_on_lock) {dark=true;darken_on_lock=false;}
+    return allow_lock;
+}
 void lvgl_port_unlock(void) { assert(ui_locked); ui_locked=false; }
 TickType_t xTaskGetTickCount(void) { return ticks; }
 void vTaskDelay(unsigned ms) { ticks+=ms; }
@@ -34,7 +42,8 @@ esp_err_t gpio_config(const gpio_config_t *cfg)
 BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack,
                       void *arg, UBaseType_t priority, TaskHandle_t *task)
 { (void)fn;(void)name;(void)arg;(void)priority;assert(stack==2048);*task=(void *)1;return pdPASS; }
-static void volume_backend(uint8_t v) { ++vol_calls; backend_volume=v; }
+static void volume_backend(uint8_t v)
+{ if(dark)assert(ui_locked); ++vol_calls; backend_volume=v; }
 static void bright_backend(uint8_t v) { (void)v; ++br_calls; }
 static void other_cb(lv_event_t *e) { (void)e; ++other_clicks; }
 static void flush(lv_display_t *d,const lv_area_t *a,uint8_t *p)
@@ -137,6 +146,67 @@ int main(void)
     ticks=UINT32_MAX-20;up_level=0;poll_keys();key_time(40);assert(state.volume==75);
     assert(!br_calls && !ui_locked);
     puts("PASS GPIO pin config, debounce, repeat, chords, LVGL contention, dark suppression, tick wrap");
+
+    /* Screen-off playback keeps the same GPIO debounce/repeat and shared volume
+     * callback, but LVGL timers remain stopped: no panel/mask animation or activity. */
+    up_level=1;key_time(50);ui_adj_panel_hide();advance(500);
+    assert(!ui_adj_panel_is_visible());
+    dark=true;audio_active=true;key_time(50);
+    lv_display_trigger_activity(d);lv_tick_inc(1000);
+    uint32_t idle=lv_display_get_inactive_time(d),panel_activity=s_volume_activity;
+    uint8_t brightness=state.brightness;
+    before=vol_calls;up_level=0;key_time(20);up_level=1;key_time(40);
+    assert(vol_calls==before);
+    up_level=0;key_time(40);assert(state.volume==80 && backend_volume==80);
+    key_time(350);assert(state.volume==80);
+    key_time(60);assert(state.volume==85);
+    key_time(100);assert(state.volume==90);
+    up_level=1;key_time(40);down_level=0;key_time(40);
+    assert(state.volume==85 && backend_volume==85);
+    down_level=1;key_time(40);
+    assert(dark && !ui_adj_panel_is_visible() && !ui_adj_panel_is_modal());
+    assert(lv_obj_has_flag(s_panel,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_has_flag(s_overlay,LV_OBJ_FLAG_HIDDEN));
+    assert(!lv_anim_get(s_panel,panel_anim_x_cb) && !lv_anim_get(s_overlay,overlay_anim_opa_cb));
+    assert(lv_timer_get_paused(s_volume_timer) && s_volume_activity==panel_activity);
+    assert(lv_display_get_inactive_time(d)==idle && state.brightness==brightness && !br_calls);
+    assert(lv_slider_get_value(s_vol_slider)==state.volume);
+
+    /* Both pressed together stay suppressed in the dark too. */
+    before=vol_calls;up_level=down_level=0;key_time(800);assert(vol_calls==before);
+    down_level=1;key_time(500);assert(vol_calls==before);
+    up_level=1;key_time(50);
+    /* Quiet keys use the same unmute semantics as the awake slider. */
+    lvgl_port_lock(0);state.volume=0;state.muted=true;ui_adj_panel_update();lvgl_port_unlock();
+    up_level=0;key_time(40);assert(state.volume==5 && !state.muted && !s_muted && backend_volume==5);
+    up_level=1;key_time(40);
+    allow_lock=false;down_level=0;key_time(40);assert(s_pending==-5 && state.volume==5);
+    allow_lock=true;key_time(10);assert(s_pending==0 && state.volume==0 && backend_volume==0);
+    down_level=1;key_time(50);
+    /* Audio can stop between GPIO scan and acquiring LVGL: drop the pending
+     * adjustment and never turn it into a wake event or delayed volume jump. */
+    before=vol_calls;stop_audio_on_lock=true;up_level=0;key_time(40);
+    assert(!audio_active && !s_pending && vol_calls==before);key_time(200);
+    audio_active=true;key_time(500);assert(vol_calls==before); /* held key must release */
+    up_level=1;key_time(50);
+    power_busy=true;up_level=0;key_time(500);assert(vol_calls==before);
+    power_busy=false;key_time(500);assert(vol_calls==before);
+    up_level=1;key_time(50);
+    /* If screen-off begins while the key is waiting for the LVGL lock, use
+     * the quiet path after the lock; do not reopen its panel or reset inactivity. */
+    dark=false;darken_on_lock=true;up_level=0;key_time(40);
+    assert(dark && state.volume==5 && backend_volume==5);
+    assert(!ui_adj_panel_is_visible() && lv_timer_get_paused(s_volume_timer));
+    assert(lv_display_get_inactive_time(d)==idle && s_volume_activity==panel_activity);
+    up_level=1;key_time(50);
+    /* Waking retains the adjusted value; subsequent keys regain original feedback. */
+    dark=false;audio_active=false;up_level=0;key_time(40);
+    assert(state.volume==10 && backend_volume==10 && ui_adj_panel_is_visible());
+    assert(!ui_adj_panel_is_modal() && !lv_obj_has_flag(s_panel,LV_OBJ_FLAG_HIDDEN));
+    assert(lv_anim_get(s_panel,panel_anim_x_cb));
+    up_level=1;key_time(50);advance(400);
+    assert(!ui_locked && !br_calls);
+    puts("PASS dark playback volume/repeat/unmute; no feedback/wake/activity; idle/power gating and lock races");
     ui_adj_panel_set_auto_brightness_callback(auto_backend);
     state.manual_brightness=80; state.brightness=45; state.auto_brightness=true;
     lvgl_port_lock(0);ui_adj_panel_update_brightness();lvgl_port_unlock();

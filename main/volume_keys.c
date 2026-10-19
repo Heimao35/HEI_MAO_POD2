@@ -1,5 +1,7 @@
 #include "volume_keys.h"
 #include "screen_power.h"
+#include "audio_output.h"
+#include "system_power.h"
 #include "ui/ui_adj_panel.h"
 #include "driver/gpio.h"
 #include "esp_lvgl_port.h"
@@ -25,8 +27,9 @@ static volume_key_t s_keys[2];
 static TaskHandle_t s_task;
 static int s_pending;
 
-/* 启动/熄屏时不把已经按住的键当作新按下。熄屏沿用触摸/电源键唤醒
- * 策略，音量键不引入新唤醒源；亮屏后须先释放再接受本轮按键。 */
+/* 启动或熄屏且无音频任务时，不把已经按住的键当作新按下。
+ * 音频准备/播放阻止 Light-sleep，此时熄屏只停止显示，音量键应继续工作。
+ * 音量键仍不是唤醒源；真正睡眠/关机阶段丢弃事件，恢复后先释放再接受。 */
 static void reset_keys(TickType_t now)
 {
     for (unsigned i = 0; i < 2; ++i) {
@@ -53,10 +56,19 @@ static int scan_key(volume_key_t *key, bool down, TickType_t now)
     return 0;
 }
 
+/* 与显示电源任务采用同一音频活跃快照（含准备阶段），而不是用屏幕
+ * 亮灭代替系统是否仍运行。只在屏幕暗时增加此例外，原亮屏按键逻辑不变。
+ * 熄屏时电源流程活跃则不接受新音量，避免保存后又被静默修改。 */
+static bool can_adjust_volume(void)
+{
+    return !screen_power_is_dark() ||
+           (audio_output_is_active() && !system_power_is_active());
+}
+
 static void poll_keys(void)
 {
     TickType_t now = xTaskGetTickCount();
-    if (screen_power_is_dark()) { reset_keys(now); return; }
+    if (!can_adjust_volume()) { reset_keys(now); return; }
     bool up = gpio_get_level(VOLUME_UP_GPIO) == KEY_ACTIVE_LEVEL;
     bool down = gpio_get_level(VOLUME_DOWN_GPIO) == KEY_ACTIVE_LEVEL;
     if (up && down) {
@@ -70,9 +82,14 @@ static void poll_keys(void)
     if (s_pending > 100) s_pending = 100;
     if (s_pending < -100) s_pending = -100;
     /* GPIO 轮询不占 LVGL 锁。仅有事件时短暂获取；忙时保留增量，下轮再发。
-     * 锁内再次确认熄屏状态，防止与屏幕渐灭/停止 LVGL 的转换竞争。 */
+     * 锁内重新判断，处理等待锁期间的熄屏、暂停和关机切换。熄屏分支仅
+     * 同步音量/静音及后端请求：不展开面板、不更新显示活动、不重启刷新。
+     * lvgl_port_stop() 只暂停 LVGL 定时处理，状态/对象仍须在其锁内修改。 */
     if (s_pending && lvgl_port_lock(5)) {
-        if (!screen_power_is_dark()) ui_adj_panel_adjust_volume(s_pending);
+        if (can_adjust_volume()) {
+            if (screen_power_is_dark()) ui_adj_panel_adjust_volume_silent(s_pending);
+            else ui_adj_panel_adjust_volume(s_pending);
+        }
         s_pending = 0;
         lvgl_port_unlock();
     }
