@@ -35,3 +35,8 @@ esp_err_t pmic_axp2101_restart(void);
 
 /* RAM快照：DAC必须等待两路供电配置验证成功后才释放RESET。 */
 bool pmic_axp2101_outputs_ready(void);
+
+/* Shared I2C1 owner scheduling for RTC requests/INT11. RAM notifications only;
+ * the ISR form may only be called from a GPIO ISR. Not new wake sources. */
+void pmic_axp2101_notify_service(void);
+void pmic_axp2101_notify_service_from_isr(void);

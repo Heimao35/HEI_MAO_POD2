@@ -113,6 +113,8 @@ typedef struct {
     bool auto_brightness;     /**< 自动亮度是否开启 */
 
     /* 时间 (由 RTC 或 NTP 更新) */
+    bool time_valid;         /**< RTC 读数有效且无 OS/STOP；未知时显示占位文字 */
+    uint8_t weekday;          /**< PCF85063TP: 0=周日，1..6=周一..周六 */
     uint8_t hour;             /**< 24 小时制：0-23 */
     uint8_t minute;           /**< 分钟：0-59 */
     uint16_t year;

@@ -1,5 +1,6 @@
 #include "ui_lockscreen.h"
 #include "ui_statusbar.h"
+#include "ui_fonts.h"
 #include "lock_animation.h"
 #include "music_player_adapter.h"
 #include "esp_log.h"
@@ -27,6 +28,7 @@ static lv_obj_t *s_lock_page  = NULL;
 static lv_obj_t *s_bg_canvas  = NULL;
 static lv_obj_t *s_time_label = NULL;
 static lv_obj_t *s_date_label = NULL;
+static lv_obj_t *s_weekday_label = NULL;
 static atomic_bool s_visible = true;
 /* 单一常驻任务独占 JPEG 解码器和缓冲区。每次重播递增代次，旧任务
  * 即使仍在解码，也不能再发布旧帧；避免快速锁屏/解锁重叠写图。 */
@@ -150,17 +152,37 @@ void ui_lockscreen_create(lv_obj_t *parent)
     }
     lv_obj_add_flag(s_bg_canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
 
+    /* 三行统一使用整屏宽度的文本框，并在框内居中。仅把内容自适应的
+     * label 对象放到中间，不能保证文本居中；尤其 align_to 是一次性
+     * 计算，RTC 占位文本切到真实时间/星期后宽度改变会让日期或星期偏移。
+     * 固定宽度避免依赖兄弟文本的旧宽度，不改变原纵向位置、字号和间距。
+     * 这里只设标签文本对齐，不改锁屏容器/触摸范围及 MJPEG 动画逻辑。 */
     s_time_label = lv_label_create(s_lock_page);
-    lv_label_set_text(s_time_label, "12:00");
+    lv_obj_set_width(s_time_label,UI_HOR_RES);
+    lv_obj_set_style_text_align(s_time_label,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_text(s_time_label, "--:--");
     lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
     lv_obj_align(s_time_label, LV_ALIGN_TOP_MID, 0, UI_VER_RES * 30 / 100);
 
     s_date_label = lv_label_create(s_lock_page);
-    lv_label_set_text(s_date_label, "2026-01-01");
+    lv_obj_set_width(s_date_label,UI_HOR_RES);
+    lv_obj_set_style_text_align(s_date_label,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_text(s_date_label, "---- -- --");
     lv_obj_set_style_text_color(s_date_label, UI_COLOR_TEXT_SECONDARY, 0);
     lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_26, 0);
     lv_obj_align_to(s_date_label, s_time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+
+    /* 新增第三行星期：只占用日期下方空间，保留原大时间、日期、背景
+     * canvas 和解锁触摸区域的位置。中文采用 22 号，与数字字体分开。
+     * 依次更新后重新相对对齐，避免日期/占位文本宽度变化造成星期偏移。 */
+    s_weekday_label=lv_label_create(s_lock_page);
+    lv_obj_set_width(s_weekday_label,UI_HOR_RES);
+    lv_obj_set_style_text_align(s_weekday_label,LV_TEXT_ALIGN_CENTER,0);
+    lv_label_set_text(s_weekday_label,"时间未设置");
+    lv_obj_set_style_text_font(s_weekday_label,ui_font_22(),0);
+    lv_obj_set_style_text_color(s_weekday_label,UI_COLOR_TEXT_SECONDARY,0);
+    lv_obj_align_to(s_weekday_label,s_date_label,LV_ALIGN_OUT_BOTTOM_MID,0,10);
 
     s_visible = true;
     if (s_rgb_buf && s_decode_buf &&
@@ -173,10 +195,17 @@ void ui_lockscreen_update(void)
     if (!s_lock_page || !s_visible) return;
     ui_device_state_t *st = ui_get_device_state();
     char buf[32];
-    snprintf(buf, sizeof(buf), "%02d:%02d", st->hour, st->minute);
-    lv_label_set_text(s_time_label, buf);
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", st->year, st->month, st->day);
-    lv_label_set_text(s_date_label, buf);
+    if(st->time_valid) snprintf(buf,sizeof(buf),"%02d:%02d",st->hour,st->minute);
+    else snprintf(buf,sizeof(buf),"--:--");
+    lv_label_set_text(s_time_label,buf);
+    if(st->time_valid) snprintf(buf,sizeof(buf),"%04d-%02d-%02d",st->year,st->month,st->day);
+    else snprintf(buf,sizeof(buf),"---- -- --");
+    lv_label_set_text(s_date_label,buf);
+    static const char *const weekdays[]={"天","一","二","三","四","五","六"};
+    if(st->time_valid && st->weekday<=6) snprintf(buf,sizeof(buf),"星期%s",weekdays[st->weekday]);
+    else snprintf(buf,sizeof(buf),"时间未设置");
+    lv_label_set_text(s_weekday_label,buf);
+    lv_obj_align_to(s_weekday_label,s_date_label,LV_ALIGN_OUT_BOTTOM_MID,0,10);
 }
 
 static void show_anim_ready(lv_anim_t *a)

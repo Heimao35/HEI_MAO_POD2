@@ -1,4 +1,5 @@
 #include "pmic_axp2101.h"
+#include "rtc_clock.h"
 #include "system_power.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
@@ -367,14 +368,21 @@ static esp_err_t monitor_step(void)
     return ret != ESP_OK ? ret : output_ret;
 }
 
+void pmic_axp2101_notify_service(void)
+{
+    if(s_worker) xTaskNotifyGive(s_worker);
+}
+void IRAM_ATTR pmic_axp2101_notify_service_from_isr(void)
+{
+    BaseType_t woken=pdFALSE;
+    if(s_worker) vTaskNotifyGiveFromISR(s_worker,&woken);
+    if(woken) portYIELD_FROM_ISR();
+}
 static void IRAM_ATTR pmic_irq_handler(void *arg)
 {
     (void)arg;
-    /* GPIO ISR does no I2C, allocation, logging or LVGL work. Notifications
-     * coalesce IRQ bursts; the task drains status and samples the current state. */
-    BaseType_t woken = pdFALSE;
-    if (s_worker) vTaskNotifyGiveFromISR(s_worker, &woken);
-    if (woken) portYIELD_FROM_ISR();
+    /* No I2C, allocation, logging or LVGL from either PMIC/RTC GPIO ISR. */
+    pmic_axp2101_notify_service_from_isr();
 }
 
 /* 原厂手册 pp.21/32：0x10[0] Soft PWROFF；0x10[1] 整机
@@ -407,16 +415,28 @@ static void service_power_action(void)
     atomic_store(&s_power_action_state, POWER_ACTION_DONE);
 }
 
+/* RTC shares this owner, stack and existing Light-sleep pause/BUSY barrier.
+ * Tick at 1s for RTC, but retain PMIC's original 5s healthy/2s failure cadence.
+ * IRQs/explicit requests still wake immediately; no extra peripheral task. */
 static void monitor_task(void *arg)
 {
     (void)arg;
+    TickType_t last_poll=0;
+    uint32_t poll_ms=PMIC_POLL_MS;
+    bool first=true,notified=false;
     for (;;) {
-        esp_err_t ret = ESP_OK;
         service_power_action();
-        atomic_store(&s_monitor_busy, true);
-        if (!atomic_load(&s_monitor_paused)) ret = monitor_step();
-        atomic_store(&s_monitor_busy, false);
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ret == ESP_OK ? PMIC_POLL_MS : PMIC_RETRY_MS));
+        atomic_store(&s_monitor_busy,true);
+        if(!atomic_load(&s_monitor_paused)) {
+            TickType_t now=xTaskGetTickCount();
+            if(first || notified || (TickType_t)(now-last_poll)>=pdMS_TO_TICKS(poll_ms)) {
+                first=false;last_poll=now;
+                poll_ms=monitor_step()==ESP_OK ? PMIC_POLL_MS : PMIC_RETRY_MS;
+            }
+            rtc_clock_service();
+        }
+        atomic_store(&s_monitor_busy,false);
+        notified=ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(1000))!=0;
     }
 }
 
@@ -459,6 +479,8 @@ esp_err_t pmic_axp2101_init(void)
     ret = gpio_isr_handler_add(PMIC_IRQ_GPIO, pmic_irq_handler, NULL);
     if (ret != ESP_OK) goto fail;
     irq_added = true;
+    esp_err_t rtc_ret=rtc_clock_init();
+    if(rtc_ret!=ESP_OK) ESP_LOGW(TAG,"RTC init unavailable: %s",esp_err_to_name(rtc_ret));
     if (xTaskCreate(monitor_task, "pmic", 4096, NULL, 2, &s_worker) != pdPASS) {
         ret = ESP_ERR_NO_MEM;
         goto fail;
@@ -467,6 +489,7 @@ esp_err_t pmic_axp2101_init(void)
     return ESP_OK;
 
 fail:
+    rtc_clock_deinit();
     if (irq_added) gpio_isr_handler_remove(PMIC_IRQ_GPIO);
     if (s_device) i2c_master_bus_rm_device(s_device);
     i2c_del_master_bus(s_bus);

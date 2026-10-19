@@ -197,3 +197,8 @@ PMIC/系统关机代码；未修改告警阈值、欠压阈值、充电参数或
 原子状态和待执行超时撤回策略；服务已领取命令即使monitor被暂停也可进行。
 读取低电状态只向电源任务投递快照，不在 PMIC owner 内阻塞等待自身断电。
 详细UI、失败恢复、NVS流程及测试见 `POWER_OFF_PERSISTENCE_PLAN.md`。
+
+
+### RTC shared-owner extension (2026-10-19)
+
+PCF85063TP has now been attached to the existing SDA48/SCL47 I2C1 bus at0x51 with INT11. RTC register work runs only inside the existing PMIC monitor BUSY/pause gate, including time-set requests, so the screen's existing PMIC Light-sleep barrier also covers RTC transactions. The owner wakes at most every1s for RTC; PMIC sampling retains5s/2s cadence and IRQ-immediate refresh. RTC IRQ is not an added wake source. No AXP2101 rail/RTCLDO/charger/long-key-policy register is modified by this integration. See `docs/RTC_PCF85063TP.md` for register evidence, UI, font additions and validation limits.

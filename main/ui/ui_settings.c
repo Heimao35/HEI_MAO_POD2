@@ -9,6 +9,7 @@
 #include "ui_settings.h"
 #include "ui_statusbar.h"
 #include "ui_fonts.h"
+#include "ui_clock_settings.h"
 
 static lv_obj_t *s_page = NULL; /**< 设置页面容器 */
 static bool s_visible = false;
@@ -24,19 +25,19 @@ static const struct {
     { LV_SYMBOL_WIFI,     "无线网络"   },
     { LV_SYMBOL_BLUETOOTH,"蓝牙"       },
     { LV_SYMBOL_GPS,      "姿态感应"   },  /* 姿态感应用 GPS/指南针图标代替 */
-    { LV_SYMBOL_SETTINGS, "时钟"       },  /* 时钟设置 */
+    { NULL,               "时钟"       },  /* 小表盘使用矢量绘制，不依赖字库图标 */
     { LV_SYMBOL_IMAGE,    "锁屏设置"   },  /* 锁屏页面设置 */
 };
 #define ITEM_COUNT (sizeof(s_items) / sizeof(s_items[0]))
 
 /**
- * @brief 设置项按钮点击回调（当前仅打印日志，后续跳转子页面）
+ * @brief 设置项按钮点击回调：时钟项进入独立 RTC 设置子页
  */
 static void item_click_cb(lv_event_t *e)
 {
     int idx = (int)(uintptr_t)lv_event_get_user_data(e);
-    (void)idx;
-    /* TODO: 跳转到对应的详细设置子页面 */
+    if(idx==3) ui_clock_settings_show();
+    /* 其余设置项保留原入口，后续按各自功能接入。 */
 }
 
 /**
@@ -115,11 +116,37 @@ void ui_settings_create(lv_obj_t *parent)
                             (void *)(uintptr_t)i);
 
         /* 图标字体 26px，增大使图标更醒目 */
-        lv_obj_t *ico = lv_label_create(btn);
-        lv_label_set_text(ico, s_items[i].symbol);
-        lv_obj_set_style_text_color(ico, UI_COLOR_TEXT, 0);
-        lv_obj_set_style_text_font(ico, &lv_font_montserrat_26, 0);
-        lv_obj_center(ico);
+        if(i==3) {
+            /* 时钟图标为 40px 圆形表盘加两根指针。保持原 100px 按钮、
+             * 网格位置、触摸目标不变；只替换齿轮，避免依赖二进制字库
+             * 中未必包含的 FontAwesome 时钟字符。所有子对象不接触摸，
+             * 点击表盘内部仍完整交给原按钮回调。线点数组需永久有效。 */
+            lv_obj_t *dial=lv_obj_create(btn);
+            lv_obj_set_size(dial,40,40);lv_obj_center(dial);
+            lv_obj_set_style_radius(dial,LV_RADIUS_CIRCLE,0);
+            lv_obj_set_style_bg_opa(dial,LV_OPA_TRANSP,0);
+            lv_obj_set_style_border_color(dial,UI_COLOR_TEXT,0);
+            lv_obj_set_style_border_width(dial,3,0);
+            lv_obj_set_style_pad_all(dial,0,0);
+            lv_obj_remove_flag(dial,LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE);
+            static const lv_point_precise_t hands[]={{17,6},{17,17},{26,22}};
+            lv_obj_t *line=lv_line_create(dial);
+            lv_line_set_points(line,hands,3);
+            lv_obj_set_style_line_color(line,UI_COLOR_TEXT,0);
+            lv_obj_set_style_line_width(line,3,0);
+            lv_obj_set_style_line_rounded(line,true,0);
+            /* 表盘 3px 边框内的内容区是 34px，中心为 (17,17)。
+             * 指针跟随表盘居中，不依赖外层按钮的主题 padding。 */
+            lv_obj_set_size(line,34,34);
+            lv_obj_set_pos(line,0,0);
+            lv_obj_remove_flag(line,LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_obj_t *ico = lv_label_create(btn);
+            lv_label_set_text(ico, s_items[i].symbol);
+            lv_obj_set_style_text_color(ico, UI_COLOR_TEXT, 0);
+            lv_obj_set_style_text_font(ico, &lv_font_montserrat_26, 0);
+            lv_obj_center(ico);
+        }
 
         /* 按钮下方文字 */
         lv_obj_t *lbl = lv_label_create(item);

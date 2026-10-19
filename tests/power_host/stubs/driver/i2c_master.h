@@ -28,3 +28,5 @@ esp_err_t i2c_master_bus_rm_device(i2c_master_dev_handle_t device);
 esp_err_t i2c_master_transmit_receive(i2c_master_dev_handle_t device, const uint8_t *write, size_t write_size,
                                      uint8_t *read, size_t read_size, int timeout_ms);
 esp_err_t i2c_master_transmit(i2c_master_dev_handle_t device, const uint8_t *write, size_t size, int timeout_ms);
+
+esp_err_t i2c_master_get_bus_handle(int port, i2c_master_bus_handle_t *bus);

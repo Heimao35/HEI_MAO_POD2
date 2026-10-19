@@ -22,11 +22,13 @@ static ui_device_state_t s_device_state = {
     .manual_brightness = 80,
     .volume            = 50,
     .auto_brightness   = false,
-    .hour              = 12,
+    .time_valid        = false,
+    .weekday           = 0,
+    .hour              = 0,
     .minute            = 0,
-    .year              = 2026,
-    .month             = 1,
-    .day               = 1,
+    .year              = 0,
+    .month             = 0,
+    .day               = 0,
 };
 
 /**

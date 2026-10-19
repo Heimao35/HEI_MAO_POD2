@@ -8,8 +8,13 @@
 #include "../../main/ui/ui_common.c"
 #include "../../main/ui/ui_statusbar.c"
 
+esp_err_t rtc_clock_init(void) { return ESP_OK; }
+void rtc_clock_deinit(void) {}
+void rtc_clock_service(void) {}
+
 static uint8_t registers[256];
 void vTaskDelay(unsigned ticks) { (void)ticks; }
+TickType_t xTaskGetTickCount(void) { return 0; }
 static bool ui_locked, in_isr, unavailable, task_failure, handler_installed, ui_lock_busy;
 static bool inject_remove_on_ack, repeated_irq, force_irq_low;
 static int fail_read_reg = -1;

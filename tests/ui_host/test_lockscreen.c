@@ -16,7 +16,8 @@ static bool cancel_during_decode, fail_engine;
 static bool show_status_time;
 static TickType_t ticks;
 static lv_obj_t *bar;
-static ui_device_state_t state = {.hour=16, .minute=45, .year=2026, .month=10, .day=18};
+const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
+static ui_device_state_t state = {.time_valid=true, .weekday=0, .hour=16, .minute=45, .year=2026, .month=10, .day=18};
 
 bool lvgl_port_lock(uint32_t timeout) { (void)timeout; assert(!ui_locked && !sd_locked); ui_locked=true; return true; }
 void lvgl_port_unlock(void) { assert(ui_locked); ui_locked=false; }
@@ -79,6 +80,24 @@ static void run_requested(void)
     if (generation && generation==atomic_load(&s_anim_generation)) play_mjpeg(generation);
     atomic_store(&s_anim_busy,false);
 }
+/* Time strings and the custom weekday font have different glyph widths.
+ * Every line needs a fixed page-width text box with centered text, not merely
+ * a once-computed position relative to a content-sized sibling label. */
+static void assert_clock_centered(void)
+{
+    lv_obj_update_layout(s_lock_page);
+    lv_area_t page;lv_obj_get_coords(s_lock_page,&page);
+    lv_obj_t *labels[]={s_time_label,s_date_label,s_weekday_label};
+    for(unsigned i=0;i<sizeof(labels)/sizeof(labels[0]);++i) {
+        lv_area_t area;lv_obj_get_coords(labels[i],&area);
+        assert(lv_obj_get_width(labels[i])==UI_HOR_RES);
+        assert(area.x1+area.x2==page.x1+page.x2);
+        assert(lv_obj_get_style_text_align(labels[i],LV_PART_MAIN)==LV_TEXT_ALIGN_CENTER);
+    }
+    assert(lv_obj_get_y(s_time_label)==UI_VER_RES*30/100);
+    assert(lv_obj_get_y(s_date_label)==lv_obj_get_y(s_time_label)+lv_obj_get_height(s_time_label)+10);
+    assert(lv_obj_get_y(s_weekday_label)==lv_obj_get_y(s_date_label)+lv_obj_get_height(s_date_label)+10);
+}
 int main(void)
 {
     lv_init(); lv_display_t *display=lv_display_create(460,460);
@@ -91,6 +110,23 @@ int main(void)
     ui_lockscreen_update();
     assert(!strcmp(lv_label_get_text(s_time_label),"16:45"));
     assert(!strcmp(lv_label_get_text(s_date_label),"2026-10-18"));
+    assert(!strcmp(lv_label_get_text(s_weekday_label),"星期天"));
+    assert_clock_centered();
+    state.time_valid=false;ui_lockscreen_update();
+    assert(!strcmp(lv_label_get_text(s_time_label),"--:--"));
+    assert(!strcmp(lv_label_get_text(s_weekday_label),"时间未设置"));
+    assert_clock_centered();
+    state.time_valid=true;
+    state.hour=1;state.minute=11;state.month=1;state.day=1;state.weekday=1;
+    ui_lockscreen_update();assert_clock_centered();
+    state.hour=23;state.minute=58;state.month=12;state.day=31;state.weekday=6;
+    ui_lockscreen_update();assert_clock_centered();
+    /* Changing weekday line metrics must not affect horizontal centering or
+     * the original 10px vertical gap beneath the existing date line. */
+    lv_obj_set_style_text_font(s_weekday_label,&lv_font_montserrat_16,0);
+    ui_lockscreen_update();assert_clock_centered();
+    lv_obj_set_style_text_font(s_weekday_label,ui_font_22(),0);
+    ui_lockscreen_update();assert_clock_centered();
 
     ui_lockscreen_start_boot_anim(); unsigned first=atomic_load(&s_anim_requested);
     assert(first && !ui_lockscreen_anim_is_idle());

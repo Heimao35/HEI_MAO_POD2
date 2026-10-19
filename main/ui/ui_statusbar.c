@@ -97,7 +97,7 @@ void ui_statusbar_create(lv_obj_t *parent)
 
     /* ========== 中间时间 ========== */
     s_time_lbl = lv_label_create(s_bar);
-    lv_label_set_text(s_time_lbl, "12:00");
+    lv_label_set_text(s_time_lbl, "--:--");
     lv_obj_set_style_text_color(s_time_lbl, UI_COLOR_STATUS_TEXT, 0);
     lv_obj_set_style_text_font(s_time_lbl, SB_TEXT_FONT, 0);
     lv_obj_align(s_time_lbl, LV_ALIGN_CENTER, 0, 0);
@@ -153,7 +153,9 @@ void ui_statusbar_update(void)
     if (st->sd_card_inserted)   lv_obj_remove_flag(s_icon_sd, LV_OBJ_FLAG_HIDDEN);
     else                        lv_obj_add_flag(s_icon_sd, LV_OBJ_FLAG_HIDDEN);
 
-    snprintf(buf, sizeof(buf), "%02d:%02d", st->hour, st->minute);
+    /* 未校准/失联时不用旧演示时间冒充 RTC，保持原时间位置与字号。 */
+    if(st->time_valid) snprintf(buf, sizeof(buf), "%02d:%02d", st->hour, st->minute);
+    else snprintf(buf,sizeof(buf),"--:--");
     lv_label_set_text(s_time_lbl, buf);
 
     /* 没有电池、读数越界或 I2C 暂时失败时显示 --% 和空电池。

@@ -15,6 +15,10 @@ const lv_font_t *ui_font_18(void) { return &lv_font_montserrat_18; }
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 
 bool ui_settings_is_visible(void) { return false; }
+bool ui_clock_settings_is_visible(void) { return false; }
+void ui_clock_settings_create(lv_obj_t *parent) { (void)parent; }
+void ui_clock_settings_update(void) {}
+void ui_clock_settings_close_for_lock(void) {}
 bool ui_power_dialog_is_visible(void) { return false; }
 bool ui_lockscreen_is_visible(void) { return false; }
 bool ui_mode_panel_is_visible(void) { return false; }
