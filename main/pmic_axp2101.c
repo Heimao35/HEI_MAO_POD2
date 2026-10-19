@@ -1,4 +1,5 @@
 #include "pmic_axp2101.h"
+#include "system_power.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_attr.h"
@@ -62,6 +63,7 @@ enum {
     POWER_ACTION_IDLE,
     POWER_ACTION_OFF_REQUESTED,
     POWER_ACTION_RESTART_REQUESTED,
+    POWER_ACTION_LOW_BATTERY_OFF_REQUESTED,
     POWER_ACTION_EXECUTING,
     POWER_ACTION_DONE,
 };
@@ -86,7 +88,8 @@ static esp_err_t request_power_action(unsigned requested)
         return ESP_ERR_INVALID_STATE;
     xTaskNotifyGive(s_worker);
     /* 尚未执行的超时请求必须撤销，避免界面恢复后迟到的命令突然断电。
-     * 已领取的命令只包含两个各100ms超时的I2C事务，等待其明确结果；
+     * 已领取的命令仅执行有100ms单次超时的有界I2C事务（低电命令
+     * 额外重读电池/VBUS/SOC），等待其明确结果；
      * 不能宣称撤销已经送达芯片的断电/重启动作。 */
     for (unsigned i = 0;; ++i) {
         unsigned state = atomic_load(&s_power_action_state);
@@ -106,6 +109,9 @@ static esp_err_t request_power_action(unsigned requested)
 
 esp_err_t pmic_axp2101_poweroff(void)
 { return request_power_action(POWER_ACTION_OFF_REQUESTED); }
+
+esp_err_t pmic_axp2101_poweroff_low_battery(void)
+{ return request_power_action(POWER_ACTION_LOW_BATTERY_OFF_REQUESTED); }
 
 esp_err_t pmic_axp2101_restart(void)
 { return request_power_action(POWER_ACTION_RESTART_REQUESTED); }
@@ -353,6 +359,10 @@ static esp_err_t monitor_step(void)
         ESP_LOGI(TAG, "Monitor communication recovered");
         s_fault_logged = false;
     }
+    /* 低电保护独立于 UI 发布：即使 LVGL 锁繁忙，也必须将有效状态/
+     * 采样失败告知电源任务。只投递 RAM，不在 PMIC owner 中等待关机。 */
+    system_power_update_battery(sample.valid,sample.battery_present,
+        sample.battery_pct_valid,sample.battery_pct,sample.vbus_present);
     publish_power_sample(&sample);
     return ret != ESP_OK ? ret : output_ret;
 }
@@ -373,11 +383,24 @@ static void IRAM_ATTR pmic_irq_handler(void *arg)
 static void service_power_action(void)
 {
     unsigned requested = atomic_load(&s_power_action_state);
-    if (requested != POWER_ACTION_OFF_REQUESTED && requested != POWER_ACTION_RESTART_REQUESTED) return;
+    if (requested != POWER_ACTION_OFF_REQUESTED && requested != POWER_ACTION_RESTART_REQUESTED &&
+        requested != POWER_ACTION_LOW_BATTERY_OFF_REQUESTED) return;
     unsigned expected = requested;
     if (!atomic_compare_exchange_strong(&s_power_action_state, &expected, POWER_ACTION_EXECUTING)) return;
-    uint8_t value;
-    esp_err_t ret = read_register(0x10, &value);
+    esp_err_t ret=ESP_OK;
+    if(requested==POWER_ACTION_LOW_BATTERY_OFF_REQUESTED) {
+        /* NVS/媒体停稳可能耗时数秒。最终动作由唯一 PMIC owner 串行
+         * 读取新状态，不用 UI 缓存；即使倒计时结束时才插线也可取消。
+         * I2C 错误/无电池/未知 SOC 均不得被解释为 0% 后强行断电。 */
+        power_sample_t sample={0};
+        ret=read_power_sample(&sample);
+        system_power_update_battery(sample.valid,sample.battery_present,
+            sample.battery_pct_valid,sample.battery_pct,sample.vbus_present);
+        if(ret==ESP_OK && (!sample.battery_present || !sample.battery_pct_valid ||
+            sample.battery_pct>1 || sample.vbus_present)) ret=ESP_ERR_INVALID_STATE;
+    }
+    uint8_t value=0;
+    if(ret==ESP_OK) ret=read_register(0x10, &value);
     const uint8_t command = requested == POWER_ACTION_RESTART_REQUESTED ? 0x02 : 0x01;
     if (ret == ESP_OK) ret = write_register(0x10, (value & (uint8_t)~0x03) | command);
     atomic_store(&s_power_action_result, ret);

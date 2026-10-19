@@ -1,13 +1,19 @@
 #include "ui_power_dialog.h"
 #include "ui_fonts.h"
+#include <stdio.h>
 
-static lv_obj_t *s_overlay, *s_status, *s_buttons[3];
+static lv_obj_t *s_overlay, *s_status, *s_hint, *s_buttons[3];
+static bool s_low_mode;
 
 static void action_cb(lv_event_t *event)
 {
     /* 点击只投递枚举；NVS 提交、等待 SD/JPEG 和 PMIC I2C 全部在电源任务，
      * 不能堵住 LVGL。由任务统一处理重复点击和终态切换。 */
-    system_power_request((system_power_action_t)(uintptr_t)lv_event_get_user_data(event));
+    system_power_action_t action=(system_power_action_t)(uintptr_t)lv_event_get_user_data(event);
+    /* 低电模式第二键只关闭提示，沿用 CANCEL 枚举投递；是否取消计时
+     * 由电源任务按模式区分。绝不在点击回调中保存或改变关机期限。 */
+    if(s_low_mode && action==SYSTEM_POWER_RESTART) action=SYSTEM_POWER_CANCEL;
+    system_power_request(action);
 }
 static void create_dialog(void)
 {
@@ -38,12 +44,12 @@ static void create_dialog(void)
     lv_obj_set_width(s_status,350);
     lv_obj_set_style_text_align(s_status,LV_TEXT_ALIGN_CENTER,0);
     lv_obj_align(s_status,LV_ALIGN_TOP_MID,0,10);
-    lv_obj_t *hint=lv_label_create(card);
-    lv_label_set_text(hint,"持续按住电源键 10 秒将强制关机");
-    lv_obj_set_width(hint,350);
-    lv_obj_set_style_text_align(hint,LV_TEXT_ALIGN_CENTER,0);
-    lv_obj_set_style_text_opa(hint,LV_OPA_70,0);
-    lv_obj_align(hint,LV_ALIGN_TOP_MID,0,66);
+    s_hint=lv_label_create(card);
+    lv_label_set_text(s_hint,"持续按住电源键 10 秒将强制关机");
+    lv_obj_set_width(s_hint,350);
+    lv_obj_set_style_text_align(s_hint,LV_TEXT_ALIGN_CENTER,0);
+    lv_obj_set_style_text_opa(s_hint,LV_OPA_70,0);
+    lv_obj_align(s_hint,LV_ALIGN_TOP_MID,0,66);
     const char *labels[]={"确认关机","重启","取消"};
     const system_power_action_t actions[]={SYSTEM_POWER_OFF,SYSTEM_POWER_RESTART,SYSTEM_POWER_CANCEL};
     for (unsigned i=0;i<3;++i) {
@@ -59,12 +65,39 @@ static void create_dialog(void)
         lv_label_set_text(label,labels[i]); lv_obj_center(label);
     }
 }
+/* 只调整这张独立弹窗中的按钮内容/数量；复用原卡片尺寸、配色、字体、
+ * 遮罩和圆角，正常三键关机弹窗的坐标完全保持原样。 */
+static void configure_mode(bool low)
+{
+    if(!s_overlay) create_dialog();
+    s_low_mode=low;
+    const char *labels[]={low?"立即关机":"确认关机",low?"关闭":"重启","取消"};
+    for(unsigned i=0;i<3;++i) {
+        if(low && i==2) lv_obj_add_flag(s_buttons[i],LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_buttons[i],LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(s_buttons[i],low?166:106,44);
+        lv_obj_align(s_buttons[i],LV_ALIGN_BOTTOM_LEFT,(int32_t)i*(low?180:120),0);
+        lv_label_set_text(lv_obj_get_child(s_buttons[i],0),labels[i]);
+        lv_obj_center(lv_obj_get_child(s_buttons[i],0));
+    }
+    lv_label_set_text(s_hint,low?"关闭提示不会取消自动关机":"持续按住电源键 10 秒将强制关机");
+}
 void ui_power_dialog_show(void)
 {
-    if (!s_overlay) create_dialog();
+    configure_mode(false);
     lv_obj_remove_flag(s_overlay,LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_overlay);
     ui_power_dialog_set_status("正在关机，请选择操作",false);
+}
+void ui_power_dialog_show_low_battery(unsigned seconds)
+{
+    /* 每秒只更新现有标签，既不重新创建对象，也不重置电源任务计时。 */
+    if(!s_overlay || !s_low_mode) configure_mode(true);
+    lv_obj_remove_flag(s_overlay,LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_overlay);
+    char text[80];
+    snprintf(text,sizeof(text),"电量过低，将在%u秒后关机",seconds);
+    ui_power_dialog_set_status(text,false);
 }
 void ui_power_dialog_hide(void)
 {

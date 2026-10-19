@@ -10,7 +10,7 @@
 
 static uint8_t registers[256];
 void vTaskDelay(unsigned ticks) { (void)ticks; }
-static bool ui_locked, in_isr, unavailable, task_failure, handler_installed;
+static bool ui_locked, in_isr, unavailable, task_failure, handler_installed, ui_lock_busy;
 static bool inject_remove_on_ack, repeated_irq, force_irq_low;
 static int fail_read_reg = -1;
 static int fail_write_reg = -1, ignored_write_reg = -1;
@@ -19,12 +19,22 @@ static uint8_t rail_write_order[32];
 static unsigned transactions, writes, notifications, buses, devices;
 static unsigned module_writes, irq_writes, status_reads;
 static void (*irq_handler)(void *);
+static unsigned battery_updates;
+static bool posted_valid,posted_present,posted_pct_valid,posted_vbus;
+static uint8_t posted_percent;
+void system_power_update_battery(bool valid,bool present,bool pct_valid,uint8_t percent,bool vbus)
+{
+    assert(!ui_locked && !in_isr);
+    ++battery_updates;posted_valid=valid;posted_present=present;posted_pct_valid=pct_valid;
+    posted_percent=percent;posted_vbus=vbus;
+}
+
 
 const lv_font_t *ui_font_14(void) { return &lv_font_montserrat_14; }
 const lv_font_t *ui_font_16(void) { return &lv_font_montserrat_16; }
 
 bool lvgl_port_lock(uint32_t timeout)
-{ (void)timeout; assert(!ui_locked && !in_isr); ui_locked = true; return true; }
+{ (void)timeout; assert(!ui_locked && !in_isr); if(ui_lock_busy) return false; ui_locked = true; return true; }
 void lvgl_port_unlock(void) { assert(ui_locked); ui_locked = false; }
 
 esp_err_t i2c_new_master_bus(const i2c_master_bus_config_t *cfg, i2c_master_bus_handle_t *bus)
@@ -209,6 +219,7 @@ int main(void)
     assert(monitor_step() == ESP_OK);
     assert(state->power_valid && state->battery_present && state->battery_pct_valid);
     assert(state->vbus_present && state->charging && state->battery_pct == 68);
+    assert(battery_updates==1 && posted_valid && posted_present && posted_pct_valid && posted_percent==68 && posted_vbus);
     assert(registers[0x18] == 0x0B && module_writes == 1);
     assert(registers[0x22]==0xA6 && registers[0x27]==0xAD);
     assert(s_key_events_armed && !key_presses && !down_events && !up_events);
@@ -386,6 +397,40 @@ int main(void)
     assert(atomic_load(&s_power_action_state)==POWER_ACTION_IDLE);
     before=transactions; service_power_action(); assert(transactions==before);
     puts("PASS 10s hardware-off masks/readback, edge ACK retry, safe soft-off bit ownership and cancellation of late requests");
+    /* Low-battery terminal action must read hardware again, without LVGL. */
+    registers[0x10]=0xBE;registers[0x00]=1U<<3;registers[0x01]=(2U<<5)|5;registers[0xA4]=1;
+    atomic_store(&s_power_action_state,POWER_ACTION_LOW_BATTERY_OFF_REQUESTED);service_power_action();
+    assert(registers[0x10]==0xBD && atomic_load(&s_power_action_result)==ESP_OK);
+    assert(posted_valid && posted_pct_valid && posted_percent==1 && !posted_vbus);
+    for(unsigned scenario=0;scenario<5;++scenario) {
+        registers[0x10]=0xBE;registers[0x00]=1U<<3;registers[0xA4]=1;
+        if(scenario==0) registers[0x00]|=1U<<5; /* VBUS */
+        if(scenario==1) registers[0xA4]=2;
+        if(scenario==2) registers[0xA4]=255;
+        if(scenario==3) registers[0x00]=0;
+        if(scenario==4) fail_read_reg=0xA4;
+        unsigned previous_writes=writes;
+        atomic_store(&s_power_action_state,POWER_ACTION_LOW_BATTERY_OFF_REQUESTED);service_power_action();
+        assert(registers[0x10]==0xBE && writes==previous_writes);
+        assert(atomic_load(&s_power_action_result)==(scenario==4?ESP_ERR_TIMEOUT:ESP_ERR_INVALID_STATE));
+        if(scenario==4) assert(!posted_valid);
+        fail_read_reg=-1;
+    }
+    atomic_store(&s_power_action_state,POWER_ACTION_IDLE);
+    assert(pmic_axp2101_poweroff_low_battery()==ESP_ERR_TIMEOUT);
+    before=transactions;service_power_action();assert(transactions==before);
+    puts("PASS low-battery owner rechecks SOC/battery/VBUS; bad/unknown/recovered states cannot power off; timed-out request is withdrawn");
+    /* Polling alone, without an IRQ, also delivers low SOC even when the UI
+     * cannot acquire its lock. A failed next read publishes invalid, not 0%. */
+    registers[0x00]=1U<<3;registers[0xA4]=1;
+    unsigned updates_before=battery_updates;
+    ui_lock_busy=true;
+    assert(monitor_step()==ESP_OK && battery_updates==updates_before+1);
+    assert(posted_valid && posted_present && posted_pct_valid && posted_percent==1 && !posted_vbus);
+    fail_read_reg=0xA4;
+    assert(monitor_step()==ESP_ERR_TIMEOUT && !posted_valid && !posted_pct_valid);
+    fail_read_reg=-1;ui_lock_busy=false;
+    puts("PASS no-IRQ low SOC and invalid I2C samples reach the power coordinator despite a busy UI");
     lv_deinit();
     puts("ALL POWER MONITOR TESTS PASSED");
     return 0;

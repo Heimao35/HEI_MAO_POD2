@@ -25,6 +25,9 @@ bool pmic_axp2101_pause_monitor(bool pause);
 void pmic_axp2101_set_key_edge_callback(void (*callback)(bool pressed));
 /* Blocking terminal command, outside LVGL lock; executed by PMIC owner task. */
 esp_err_t pmic_axp2101_poweroff(void);
+/* 低电关机专用：owner 重新读取电量/电池/VBUS，只有有效 <=1% 且无
+ * VBUS 才发 Soft PWROFF；条件恢复/I2C 失败时拒绝断电。 */
+esp_err_t pmic_axp2101_poweroff_low_battery(void);
 
 /* AXP2101整机POWOFF/POWON（0x10[1]），与关机共用PMIC所有者任务。
  * 在LVGL锁外调用；成功只代表I2C命令成功，不是供电波形验证。 */
