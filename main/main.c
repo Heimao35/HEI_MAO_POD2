@@ -263,7 +263,7 @@ static esp_err_t app_lvgl_init(void)
         .flags = {
             .buff_dma = false,
             .buff_spiram = true,
-            .sw_rotate = true,// true: 软件; false: 硬件
+            .sw_rotate = false,// true: 软件; false: 硬件
             .swap_bytes = false,
             .full_refresh = false,
             .direct_mode = true,
