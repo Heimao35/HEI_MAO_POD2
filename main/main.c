@@ -17,6 +17,7 @@
 #include "system_power.h"
 #include "player_settings.h"
 #include "volume_keys.h"
+#include "motion_sensor.h"
 
 #include "esp_lcd_co5300.h"
 #include "co5300_init_cmds.h"
@@ -403,6 +404,12 @@ void app_main(void)
     app_boot_progress(98,"Starting system controls...");
     esp_err_t system_ret=system_power_init();
     if (system_ret!=ESP_OK) ESP_LOGE(TAG,"System power init failed: %s",esp_err_to_name(system_ret));
+
+    /* BMI270复用现有I2C1；8KiB功能配置由独立低优先级worker分块加载，
+     * 不持有LVGL锁、不阻塞开机提示/音频/PMIC。先准备好显示与关机接口，
+     * 再允许传感器发布温度、当天步数和经过状态寄存器确认的抬腕事件。 */
+    esp_err_t motion_ret = motion_sensor_init();
+    if (motion_ret != ESP_OK) ESP_LOGW(TAG, "Motion sensor init failed: %s", esp_err_to_name(motion_ret));
 
     /* 音量键与触摸滑条共享设备音量和回调；UI 和熄屏状态机就绪后再接入。 */
     esp_err_t keys_ret = volume_keys_init();

@@ -2,6 +2,7 @@
 #include "screen_power.h"
 #include "pmic_axp2101.h"
 #include "player_settings.h"
+#include "motion_sensor.h"
 #include "music_player_adapter.h"
 #include "sd_card.h"
 #include "ui/ui_power_dialog.h"
@@ -135,7 +136,9 @@ static esp_err_t quiesce(void)
     }
     /* 所有等待均在 LVGL 锁外。先停新请求，再等已经开始的 SD/JPEG 工作
      * 结束；超时直接返回可恢复状态，不能强杀持有文件/锁的任务。 */
-    while (!music_player_adapter_pause(true) || !ui_lockscreen_anim_is_idle()) {
+    /* 关机独立拥有IMU暂停位；显示任务退出睡眠时不能误解除此请求。
+     * 不在I2C配置/状态读取尚未结束时发送PMIC整机断电/重启命令。 */
+    while (!motion_sensor_shutdown(true) || !music_player_adapter_pause(true) || !ui_lockscreen_anim_is_idle()) {
         if ((TickType_t)(xTaskGetTickCount()-started)>=pdMS_TO_TICKS(QUIESCE_MS)) return ESP_ERR_TIMEOUT;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -183,6 +186,7 @@ static void finish(system_power_action_t action, bool low_battery)
     ESP_LOGE(TAG,"Shutdown/restart aborted: %s",esp_err_to_name(ret));
     screen_power_shutdown_display(false);
     music_player_adapter_pause(false);
+    motion_sensor_shutdown(false);
     atomic_store(&s_finalizing,false);
     set_status(low_battery?"关机失败，将自动重试":"操作失败，请重试或取消",false);
 }

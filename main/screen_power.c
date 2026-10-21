@@ -5,6 +5,7 @@
 #include "system_power.h"
 #include "display_dpi_sleep.h"
 #include "pmic_axp2101.h"
+#include "motion_sensor.h"
 #include "sd_card.h"
 #include "music_player_adapter.h"
 #include "ui/ui_manager.h"
@@ -22,6 +23,7 @@
 
 #define TOUCH_IRQ_GPIO GPIO_NUM_6
 #define PMIC_IRQ_GPIO GPIO_NUM_10
+#define MOTION_IRQ_GPIO 12
 #define LCD_TE_GPIO GPIO_NUM_23 /* main.c: EXAMPLE_PIN_NUM_LCD_TE, diagnostic pulse only */
 #define LOCK_IDLE_MS 10000U
 /* 渐灭由电源任务使用 FreeRTOS 时间推进；LVGL 停止刷新后仍然有效。
@@ -279,8 +281,34 @@ static void dark_idle(void)
         pmic_axp2101_pause_monitor(false);
         return;
     }
+    /* BMI270有独立worker；PMIC停稳不等于共享总线上所有外设都停稳。
+     * 原子owner/BUSY屏障确认其I2C结束，睡眠期间芯片自己继续计步/识别。
+     * 尚未初始化/关闭抬腕时GPIO12不加入EXT1，不影响原有触摸/电源键。 */
+    if (!motion_sensor_sleep(true)) {
+        motion_sensor_sleep(false);
+        pmic_axp2101_pause_monitor(false);
+        return;
+    }
+    bool motion_wake = motion_sensor_wake_enabled();
+    if (motion_wake && gpio_get_level(MOTION_IRQ_GPIO) == 0) {
+        motion_sensor_notify_wake(); /* 先让worker读状态清锁存，避免低电平睡醒循环。 */
+        motion_sensor_sleep(false);
+        pmic_axp2101_pause_monitor(false);
+        audio_output_sleep(false);
+        return;
+    }
+    esp_err_t wake_ret = motion_wake ? esp_sleep_enable_ext1_wakeup_io(
+        1ULL << MOTION_IRQ_GPIO, ESP_EXT1_WAKEUP_ANY_LOW) :
+        esp_sleep_disable_ext1_wakeup_io(1ULL << MOTION_IRQ_GPIO);
+    if (wake_ret != ESP_OK) {
+        motion_sensor_sleep(false);
+        pmic_axp2101_pause_monitor(false);
+        audio_output_sleep(false);
+        return;
+    }
     if (!audio_output_sleep(true)) {
         /* 保留请求直到worker确认，避免每轮立即撤销导致永远收不到ACK。 */
+        motion_sensor_sleep(false);
         pmic_axp2101_pause_monitor(false);
         return;
     }
@@ -289,7 +317,8 @@ static void dark_idle(void)
      * Before SD init, the missing mutex also prevents an early sleep. */
     if (sd_card_io_lock(0)) {
         if (!system_power_is_active() && !atomic_load(&s_events) && gpio_get_level(PMIC_IRQ_GPIO) != 0 &&
-            gpio_get_level(TOUCH_IRQ_GPIO) != 0 && !music_player_adapter_is_playing()) {
+            gpio_get_level(TOUCH_IRQ_GPIO) != 0 && !music_player_adapter_is_playing() &&
+            (!motion_wake || gpio_get_level(MOTION_IRQ_GPIO) != 0)) {
             esp_sleep_enable_timer_wakeup(1000000ULL);
             esp_err_t ret = esp_light_sleep_start();
             if (ret != ESP_OK && !s_sleep_fault_logged)
@@ -306,6 +335,15 @@ static void dark_idle(void)
             rtc_gpio_hold_dis(PMIC_IRQ_GPIO);
             rtc_gpio_deinit(TOUCH_IRQ_GPIO);
             rtc_gpio_deinit(PMIC_IRQ_GPIO);
+            /* 与GPIO6/10相同，先解除RTC HOLD再恢复数字GPIO。GPIO12只在
+             * 本轮确实加入EXT1时处理，避免改动关闭抬腕时的普通中断配置。
+             * 唤醒原因只是候选；worker读BMI270的wrist位确认后才请求亮屏。 */
+            if (motion_wake) {
+                rtc_gpio_hold_dis(MOTION_IRQ_GPIO);
+                rtc_gpio_deinit(MOTION_IRQ_GPIO);
+                if ((wake_pins & (1ULL << MOTION_IRQ_GPIO)) || gpio_get_level(MOTION_IRQ_GPIO) == 0)
+                    motion_sensor_notify_wake();
+            }
             if ((wake_pins & (1ULL << TOUCH_IRQ_GPIO)) || gpio_get_level(TOUCH_IRQ_GPIO) == 0)
                 post_event(EVENT_TOUCH);
 
@@ -313,6 +351,7 @@ static void dark_idle(void)
         sd_card_io_unlock();
     }
     audio_output_sleep(false);
+    motion_sensor_sleep(false);
     pmic_axp2101_pause_monitor(false);
 }
 

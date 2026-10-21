@@ -29,16 +29,13 @@ static lv_obj_t *s_bg_canvas  = NULL;
 static lv_obj_t *s_time_label = NULL;
 static lv_obj_t *s_date_label = NULL;
 static lv_obj_t *s_weekday_label = NULL;
-/* 右下角姿态传感器读数。当前没有 BMI270 驱动，发布接口只更新 RAM/标签；
+/* 右下角姿态传感器读数由 BMI270 后台发布，接口只更新 RAM/标签；
  * 未发布前显示“--”，不能用 0 或演示值冒充真实测量。 */
 static lv_obj_t *s_steps_label = NULL;
 static lv_obj_t *s_temp_label = NULL;
 static bool s_steps_valid, s_temp_valid;
 static uint32_t s_steps_value;
 static int16_t s_temp_x10;
-/* 日键 = year*10000 + month*100 + day，0 表示尚未取得有效日期。
- * 跨日时只清显示值；计步模块也必须在新的一天复位自己的计数器。 */
-static uint32_t s_steps_day;
 static atomic_bool s_visible = true;
 /* 单一常驻任务独占 JPEG 解码器和缓冲区。每次重播递增代次，旧任务
  * 即使仍在解码，也不能再发布旧帧；避免快速锁屏/解锁重叠写图。 */
@@ -253,7 +250,6 @@ void ui_lockscreen_create(lv_obj_t *parent)
     s_temp_valid = false;
     s_steps_value = 0;
     s_temp_x10 = 0;
-    s_steps_day = 0;
 
     s_visible = true;
     if (s_rgb_buf && s_decode_buf &&
@@ -278,38 +274,16 @@ void ui_lockscreen_update(void)
     lv_label_set_text(s_weekday_label,buf);
     lv_obj_align_to(s_weekday_label,s_date_label,LV_ALIGN_OUT_BOTTOM_MID,0,10);
 
-    /* 每日零点清零：仅在 RTC 日期有效时比较日键。
-     * - 时间未知（RTC 未设置/读失败）时不猜测日期，保留上次显示值；
-     * - 锁屏不可见时本函数会被周期定时器跳过，因此跨日后的第一次显示
-     *   也会走这里完成清零；
-     * - 清零只影响锁屏显示。BMI270 计步模块必须在新的一天重置自己的
-     *   计数器，否则下一次发布会把跨日累计值重新带回来。
-     * 发布接口 ui_lockscreen_set_steps() 会先把日键同步为“今天”，
-     * 所以零点后收到的新步数不会被这里误清零。 */
-    if (st->time_valid) {
-        uint32_t day = (uint32_t)st->year * 10000U +
-                       (uint32_t)st->month * 100U + (uint32_t)st->day;
-        if (day) {
-            if (s_steps_day == 0) s_steps_day = day;
-            else if (day != s_steps_day) {
-                s_steps_day = day;
-                if (s_steps_valid) s_steps_value = 0;
-            }
-        }
-    }
+    /* 每日零点清零现由BMI270后台根据真实RTC日期统一处理，熄屏时也
+     * 会推进；UI只显示带有效性标记的数据，不再独立重置另一份计数，
+     * 避免RTC发布/传感器发布先后顺序不同而把刚收到的新一天步数清掉。 */
     sensor_labels_update();
 }
 
 void ui_lockscreen_set_steps(bool valid, uint32_t steps)
 {
-    /* 发布方持有 LVGL 锁。若当前日期已跨天，先把日键同步到新日期：
-     * 这条数据是“今天的”，不能被下一次 update 的跨日清零逻辑再次清掉。 */
-    ui_device_state_t *st = ui_get_device_state();
-    if (st->time_valid) {
-        uint32_t day = (uint32_t)st->year * 10000U +
-                       (uint32_t)st->month * 100U + (uint32_t)st->day;
-        if (day) s_steps_day = day;
-    }
+    /* 发布方持有LVGL锁；参数已由后台换算为当天步数。此处只更新
+     * 原有标签，不访问RTC/I2C，也不因后台采样而触发活动时间或亮屏。 */
     s_steps_valid = valid;
     if (valid) s_steps_value = steps;
     sensor_labels_update();
@@ -317,8 +291,8 @@ void ui_lockscreen_set_steps(bool valid, uint32_t steps)
 
 void ui_lockscreen_set_temperature(bool valid, int16_t temp_c_x10)
 {
-    /* 与步数一样只更新显示；温度有效性由发布方（未来的 BMI270 模块）
-     * 根据芯片状态判断，UI 不自行推测环境温度。 */
+    /* 与步数一样只更新显示；温度有效性由BMI270 后台发布方
+     * 根据芯片状态判断；这里显示芯片温度，不推测环境温度。 */
     s_temp_valid = valid;
     if (valid) s_temp_x10 = temp_c_x10;
     sensor_labels_update();

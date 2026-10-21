@@ -7,13 +7,15 @@
  *   的两列网格、顶部展开和底部收起手势；
  * - 与 ui_clock_settings.c 一样，页面放在主屏幕内、初始位于屏幕右侧，
  *   点击设置项后从右侧滑入，左上角箭头从当前位置滑回右侧；
- * - 本页没有滚轮、定时器、任务、文件或 I2C 访问，不参与音频/电源流程；
- * - 两个开关当前只维护 RAM 状态，尚未接入 BMI270，因此不会开启任何
- *   传感器功能，也不会被写入 NVS。后续模块通过头文件中的查询接口读取。
+ * - 本页没有滚轮、定时器、任务、文件或 I2C 访问；
+ * - 两个开关维护本次运行的选择，并向 BMI270 worker 投递 RAM 请求；
+ *   所有硬件配置在 LVGL 锁外完成，不修改本页的布局、动画或触摸逻辑。
  */
 
 #include "ui_motion_settings.h"
 #include "ui_fonts.h"
+#include "motion_sensor.h"
+#include "ui_lockscreen.h"
 
 /* 两个条目作为一个整体居中：行宽 380、行高 96、间距 36。
  * 120 和 252 两行覆盖 120..348，视觉中心约 234，接近 460 屏幕的中心，
@@ -35,8 +37,8 @@ static lv_obj_t *s_motion_steps_switch;
 static lv_obj_t *s_motion_wake_switch;
 static bool s_motion_visible;
 
-/* 开关的 RAM 状态。默认关闭：传感器功能尚未实现，不能默认宣称已启用。
- * 后续 BMI270 模块通过 ui_motion_settings_steps_enabled() 等接口读取；
+/* 开关的 RAM 状态。默认关闭，只有用户打开开关才请求传感器功能。
+ * UI 状态表示用户意图，不代表芯片已通过初始化/通信验证；
  * 若需要开机保持，应在传感器/NVS 模块中统一持久化，而不是让 UI 直接写 Flash。 */
 static bool s_motion_steps_enabled;
 static bool s_motion_wake_enabled;
@@ -76,11 +78,11 @@ static void slide_out(void)
 }
 
 /**
- * @brief 开关状态变化：只更新 RAM 标志，不调用传感器或持久化。
+ * @brief 开关状态变化：更新 RAM 意图并投递后台请求，不做 I2C/Flash。
  *
  * user_data 为 0 表示计步开关，1 表示抬手亮屏开关。开关自身由 LVGL
  * 的 CHECKABLE 行为维护选中状态，这里只读取结果，避免手动取反造成
- * 与动画/重复点击不一致。后续接入 BMI270 时，应在此处只投递请求，
+ * 与动画/重复点击不一致。这里只向 BMI270 worker 投递原子 RAM 请求，
  * 真正的 I2C 配置由传感器任务在 LVGL 锁外完成。
  */
 static void switch_changed_cb(lv_event_t *e)
@@ -89,6 +91,11 @@ static void switch_changed_cb(lv_event_t *e)
     bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
     if ((uintptr_t)lv_event_get_user_data(e) == 0) s_motion_steps_enabled = checked;
     else s_motion_wake_enabled = checked;
+    /* 温度不依赖这两个开关，后台始终低频读取。关闭计步后立即隐藏旧步数，
+     * 避免 I2C 正忙时仍显示正在计步；再次开启保留本次运行中当天的步数。
+     * 抬腕开关只改变传感器功能/唤醒策略，绝不直接点亮屏幕或重播动画。 */
+    if (!s_motion_steps_enabled) ui_lockscreen_set_steps(false, 0);
+    motion_sensor_set_features(s_motion_steps_enabled, s_motion_wake_enabled);
 }
 
 /** @brief 返回键点击：只调用无参的收起函数，避免直接转换函数指针类型。 */
@@ -197,8 +204,8 @@ void ui_motion_settings_create(lv_obj_t *parent)
     create_row(s_motion_page, ROW_FIRST_Y, "计步", &s_motion_steps_switch, 0);
     create_row(s_motion_page, ROW_FIRST_Y + ROW_GAP, "抬手亮屏", &s_motion_wake_switch, 1);
 
-    /* 默认关闭。不要在这里调用 lv_obj_add_state(sw, CHECKED)：
-     * UI 开关必须如实反映“功能尚未启用”的初始状态。 */
+    /* 保持原有默认关闭和本次运行的 RAM 设置策略；不在创建页面时发 I2C
+     * 或 NVS 操作。后台初始化完成也不会擅自把用户开关改为打开。 */
     s_motion_steps_enabled = false;
     s_motion_wake_enabled = false;
     s_motion_visible = false;

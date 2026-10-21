@@ -6,6 +6,8 @@
 #include <setjmp.h>
 #include "../../main/system_power.c"
 #include "../../main/ui/ui_power_dialog.c"
+static bool motion_shutdown_paused, motion_busy;
+bool motion_sensor_shutdown(bool pause) { motion_shutdown_paused=pause; return !pause || !motion_busy; }
 static TickType_t ticks;
 static bool locked,dark,suspended,display_off,media_paused,media_idle=true,anim_idle=true;
 static bool fail_ui_lock, mounted=true, sd_lock=true;
@@ -52,13 +54,13 @@ esp_err_t player_settings_save(const player_settings_t *v)
 }
 esp_err_t pmic_axp2101_poweroff(void)
 {
-    assert(!locked && saves && suspended && media_paused); ++off_calls;
+    assert(!locked && saves && suspended && media_paused && motion_shutdown_paused); ++off_calls;
     if(terminal_action==1) longjmp(terminal,1);
     return off_result;
 }
 esp_err_t pmic_axp2101_poweroff_low_battery(void)
 {
-    assert(!locked && saves && suspended && media_paused);
+    assert(!locked && saves && suspended && media_paused && motion_shutdown_paused);
     ++low_off_calls;
     /* Model the separate owner-side fresh precondition check. */
     if(!battery_is_low(atomic_load(&s_battery_sample))) return ESP_ERR_INVALID_STATE;
@@ -66,7 +68,7 @@ esp_err_t pmic_axp2101_poweroff_low_battery(void)
 }
 esp_err_t pmic_axp2101_restart(void)
 {
-    assert(!locked && saves && suspended && media_paused); ++restarts;
+    assert(!locked && saves && suspended && media_paused && motion_shutdown_paused); ++restarts;
     if (terminal_action==2) longjmp(terminal,2);
     return restart_result;
 }
@@ -276,5 +278,10 @@ int main(void)
     assert(!s_low_mode && !lv_obj_has_flag(s_buttons[2],LV_OBJ_FLAG_HIDDEN));
     assert(!strcmp(lv_label_get_text(lv_obj_get_child(s_buttons[1],0)),"重启"));
     puts("PASS save failure retries boundedly; low-battery prompt supersedes manual dialog and restores normal three-button mode");
+    reset_case(); long_press(); motion_busy=true;
+    system_power_request(SYSTEM_POWER_OFF); system_power_step();
+    assert(!off_calls && !saves && !motion_shutdown_paused && !media_paused);
+    motion_busy=false;
+    puts("PASS busy BMI270 blocks terminal power action and failure releases its independent owner");
     return 0;
 }

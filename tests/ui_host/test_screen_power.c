@@ -17,7 +17,13 @@ static bool power_active;
 bool system_power_is_active(void) { return power_active; }
 static bool ui_locked, locked = true, anim_idle = true, playing, ui_busy;
 static bool sd_available = true, sd_locked, pmic_idle = true, pmic_paused;
-static int touch_level = 1, pmic_level = 1;
+static int touch_level = 1, pmic_level = 1, motion_level = 1;
+static bool motion_wake_enabled, motion_paused, motion_idle=true;
+static unsigned motion_hints;
+static uint64_t enabled_ext1=(1ULL<<6)|(1ULL<<10);
+bool motion_sensor_sleep(bool pause) { motion_paused=pause; return !pause || motion_idle; }
+bool motion_sensor_wake_enabled(void) { return motion_wake_enabled; }
+void motion_sensor_notify_wake(void) { ++motion_hints; }
 static unsigned stops, resumes, suspend_calls, resume_calls, locks, cancels;
 static unsigned sleep_calls, original_irqs, te_disabled, rtc_restores;
 static uint64_t held_pads;
@@ -62,7 +68,7 @@ TickType_t xTaskGetTickCount(void) { return test_ticks; }
 static uint8_t brightness_value;
 static esp_err_t suspend_result, resume_result;
 static uint64_t wake_status;
-static bool inject_sleep_touch, inject_sleep_key;
+static bool inject_sleep_touch, inject_sleep_key, inject_sleep_motion;
 static ui_device_state_t state = {.brightness = 65, .manual_brightness = 65};
 void ambient_light_reset(void) { ++light_resets; }
 bool ambient_light_is_transitioning(void) { return light_ready && s_auto_brightness; }
@@ -107,30 +113,32 @@ int gpio_get_level(gpio_num_t pin)
     /* Frozen RTC mux appears low to the digital GPIO path. Old code would
      * spuriously queue TOUCH and PMIC edges would stay unavailable. */
     if (held_pads & (1ULL << pin)) return 0;
-    return pin == 6 ? touch_level : pmic_level;
+    return pin == 6 ? touch_level : pin == 12 ? motion_level : pmic_level;
 }
 esp_err_t gpio_intr_enable(gpio_num_t pin) { assert(pin == 23); te_disabled = false; return ESP_OK; }
 esp_err_t gpio_intr_disable(gpio_num_t pin) { assert(pin == 23); te_disabled = true; return ESP_OK; }
 esp_err_t rtc_gpio_deinit(gpio_num_t pin)
 {
-    assert(pin == 6 || pin == 10);
+    assert(pin == 6 || pin == 10 || pin == 12);
     assert(!(held_pads & (1ULL << pin))); /* HOLD must be disabled before changing mux. */
     ++rtc_restores; return ESP_OK;
 }
 esp_err_t rtc_gpio_hold_dis(gpio_num_t pin)
-{ assert(pin==6 || pin==10); held_pads &= ~(1ULL<<pin); ++hold_releases; return ESP_OK; }
+{ assert(pin==6 || pin==10 || pin==12); held_pads &= ~(1ULL<<pin); ++hold_releases; return ESP_OK; }
 esp_err_t esp_sleep_enable_ext1_wakeup_io(uint64_t mask, int mode)
-{ assert(mask == ((1ULL << 6) | (1ULL << 10)) && mode == ESP_EXT1_WAKEUP_ANY_LOW); return ESP_OK; }
+{ assert((mask == ((1ULL << 6) | (1ULL << 10)) || mask == (1ULL << 12)) && mode == ESP_EXT1_WAKEUP_ANY_LOW); enabled_ext1 |= mask; return ESP_OK; }
+esp_err_t esp_sleep_disable_ext1_wakeup_io(uint64_t mask)
+{ assert(mask == (1ULL << 12)); enabled_ext1 &= ~mask; return ESP_OK; }
 esp_err_t esp_sleep_enable_timer_wakeup(uint64_t us)
 { assert(!ui_locked && sd_locked && us == 1000000ULL); return ESP_OK; }
 uint64_t esp_sleep_get_ext1_wakeup_status(void) { return wake_status; }
 esp_err_t esp_light_sleep_start(void)
 {
-    assert(!ui_locked && sd_locked && pmic_paused && atomic_load(&s_dark));
+    assert(!ui_locked && sd_locked && pmic_paused && motion_paused && atomic_load(&s_dark));
     assert(s_stream_stopped && te_disabled && !playing && anim_idle);
     ++sleep_calls;
-    held_pads=(1ULL<<6)|(1ULL<<10);
-    wake_status = inject_sleep_touch ? 1ULL << 6 : inject_sleep_key ? 1ULL << 10 : 0;
+    held_pads=enabled_ext1;
+    wake_status = inject_sleep_touch ? 1ULL << 6 : inject_sleep_key ? 1ULL << 10 : inject_sleep_motion ? 1ULL << 12 : 0;
     return ESP_OK;
 }
 esp_err_t esp_lcd_panel_co5300_set_brightness(esp_lcd_panel_handle_t panel, uint8_t value)
@@ -401,6 +409,33 @@ int main(void)
     ui_busy=false;screen_power_step();
     assert(brightness_value==72 && state.brightness==72 && state.manual_brightness==72 && !s_auto_ui_dirty);
     puts("PASS deferred automatic publication cannot overwrite a newer manual request");
+    /* Sensor IRQ is a candidate handled by its worker, never direct display
+     * wake. EXT1 includes GPIO12 only for an enabled, configured wrist feature. */
+    locked=true;
+    screen_power_key_short_press(); screen_power_step(); finish_fade();
+    motion_wake_enabled=true;
+    unsigned before_sleep=sleep_calls, before_restore=rtc_restores;
+    motion_idle=false;
+    screen_power_step();
+    assert(sleep_calls==before_sleep && !motion_paused && !pmic_paused);
+    motion_idle=true;
+    motion_level=0;
+    screen_power_step();
+    assert(sleep_calls==before_sleep && motion_hints && screen_power_is_dark());
+    motion_level=1;
+    screen_power_step();
+    assert(sleep_calls==before_sleep+1 && rtc_restores==before_restore+3);
+    assert((enabled_ext1 & (1ULL<<12)) && !held_pads && !motion_paused);
+    assert(screen_power_is_dark());
+    inject_sleep_motion=true;
+    unsigned hints_before=motion_hints;
+    screen_power_step();
+    assert(motion_hints==hints_before+1 && screen_power_is_dark() && !held_pads);
+    inject_sleep_motion=false;
+    motion_wake_enabled=false;
+    screen_power_step();
+    assert(!(enabled_ext1 & (1ULL<<12)) && !held_pads);
+    puts("PASS BMI270 sleep barrier, conditional EXT1 and HOLD cleanup do not bypass gesture validation");
     lv_deinit();
     puts("ALL SCREEN POWER TESTS PASSED");
     return 0;

@@ -234,3 +234,18 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_link_options(motion_tests PRIVATE -static-libgcc)
 endif()
 add_test(NAME motion COMMAND motion_tests)
+
+# Real Bosch SensorAPI + production adapter against paged BMI270 hardware doubles.
+add_executable(motion_sensor_tests test_motion_sensor.c
+    "${REPO}/main/third_party/bmi270/bmi2.c"
+    "${REPO}/main/third_party/bmi270/bmi270.c")
+target_include_directories(motion_sensor_tests PRIVATE ../power_host/stubs ../screen_host/stubs stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(motion_sensor_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(motion_sensor_tests PRIVATE -O1 -Wall -Wextra -ffunction-sections -fdata-sections)
+  target_link_options(motion_sensor_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+  if(NOT WIN32)
+    target_link_libraries(motion_sensor_tests PRIVATE m)
+  endif()
+endif()
+add_test(NAME motion_sensor COMMAND motion_sensor_tests)

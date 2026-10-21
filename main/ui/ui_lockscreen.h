@@ -37,9 +37,8 @@ void ui_lockscreen_update(void);
  * @brief 发布当天的步数到锁屏右下角。
  * @param valid false 表示尚无有效传感器数据，显示“-- 步”，不伪造 0。
  * @param steps 当天步数（不是上电以来的累计值）。
- * @note  调用方必须持有 LVGL 锁。日期变化时锁屏会把显示值清零一次；
- *        BMI270 计步模块也应在新的一天重置自己的计数器，避免下一次
- *        发布把跨日累计值重新带回来。
+ * @note  调用方必须持有 LVGL 锁。日期与跨日清零由 BMI270 后台统一
+ *        管理，UI 不维护第二个跨日计数器；熄屏时也继续每日换算。
  */
 void ui_lockscreen_set_steps(bool valid, uint32_t steps);
 

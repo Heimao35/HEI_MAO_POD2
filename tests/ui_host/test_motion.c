@@ -1,6 +1,6 @@
 /* Real motion-settings page with LVGL's software renderer and event input.
- * No BMI270, I2C, NVS or tasks: verifies only the UI contract that exists
- * today (slide in/out, back button, two large switches, RAM-only getters). */
+ * Sensor request double verifies both switches post their combined intent
+ * without changing slide/back behavior or making synchronous I2C calls. */
 #include <assert.h>
 #include <stdio.h>
 #include "../../main/ui/ui_motion_settings.c"
@@ -9,6 +9,12 @@
  * layout/click coordinates match the production page. */
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 
+static bool requested_steps, requested_wake;
+static unsigned request_count;
+void motion_sensor_set_features(bool steps, bool wake)
+{ requested_steps=steps; requested_wake=wake; ++request_count; }
+void ui_lockscreen_set_steps(bool valid, uint32_t steps)
+{ assert(!valid && !steps); }
 static uint32_t ticks;
 static lv_point_t pointer_point;
 static lv_indev_state_t pointer_state;
@@ -93,7 +99,12 @@ int main(void)
     click_obj(pointer, s_motion_wake_switch);
     assert(ui_motion_settings_steps_enabled());
     assert(ui_motion_settings_wake_enabled());
-    puts("PASS large step/wake switches toggle independently in RAM");
+    assert(requested_steps && requested_wake && request_count==2);
+    click_obj(pointer, s_motion_steps_switch);
+    assert(!requested_steps && requested_wake && request_count==3);
+    click_obj(pointer, s_motion_steps_switch);
+    assert(requested_steps && requested_wake && request_count==4);
+    puts("PASS large switches post independent combined requests without hardware access");
 
     /* Back button uses the same 350 ms right-side exit as the clock subpage. */
     click_obj(pointer, s_motion_back);
