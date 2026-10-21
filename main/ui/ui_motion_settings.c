@@ -1,0 +1,253 @@
+/**
+ * @file ui_motion_settings.c
+ * @brief 姿态感应设置子页：两项大尺寸开关，样式复用时钟设置子页的进出动画。
+ *
+ * 维护约定：
+ * - 本页只是设置页的视觉子页，不建立新的屏幕/显示对象，也不改变设置主页
+ *   的两列网格、顶部展开和底部收起手势；
+ * - 与 ui_clock_settings.c 一样，页面放在主屏幕内、初始位于屏幕右侧，
+ *   点击设置项后从右侧滑入，左上角箭头从当前位置滑回右侧；
+ * - 本页没有滚轮、定时器、任务、文件或 I2C 访问，不参与音频/电源流程；
+ * - 两个开关当前只维护 RAM 状态，尚未接入 BMI270，因此不会开启任何
+ *   传感器功能，也不会被写入 NVS。后续模块通过头文件中的查询接口读取。
+ */
+
+#include "ui_motion_settings.h"
+#include "ui_fonts.h"
+
+/* 两个条目作为一个整体居中：行宽 380、行高 96、间距 36。
+ * 120 和 252 两行覆盖 120..348，视觉中心约 234，接近 460 屏幕的中心，
+ * 同时给顶部标题和左上返回箭头留出空间。 */
+#define ROW_W        380
+#define ROW_H        96
+#define ROW_X        ((UI_HOR_RES - ROW_W) / 2)
+#define ROW_FIRST_Y  120
+#define ROW_GAP      132
+
+/* 开关尺寸只影响本页：页面内容少，采用 140x70 的大轨道，让 22 号文字
+ * 与开关比例协调；旋钮直径由 LVGL 按对象高度计算（70px）。 */
+#define SWITCH_W     140
+#define SWITCH_H     70
+
+static lv_obj_t *s_motion_page;
+static lv_obj_t *s_motion_back;
+static lv_obj_t *s_motion_steps_switch;
+static lv_obj_t *s_motion_wake_switch;
+static bool s_motion_visible;
+
+/* 开关的 RAM 状态。默认关闭：传感器功能尚未实现，不能默认宣称已启用。
+ * 后续 BMI270 模块通过 ui_motion_settings_steps_enabled() 等接口读取；
+ * 若需要开机保持，应在传感器/NVS 模块中统一持久化，而不是让 UI 直接写 Flash。 */
+static bool s_motion_steps_enabled;
+static bool s_motion_wake_enabled;
+
+/** @brief 子页 X 位移动画执行回调。与时钟子页一致，只改位置，不改布局。 */
+static void anim_x(void *obj, int32_t x)
+{
+    lv_obj_set_x((lv_obj_t *)obj, x);
+}
+
+/** @brief 滑出完成：隐藏子页并把可见标志清零。 */
+static void hidden(lv_anim_t *anim)
+{
+    (void)anim;
+    lv_obj_add_flag(s_motion_page, LV_OBJ_FLAG_HIDDEN);
+    s_motion_visible = false;
+}
+
+/**
+ * @brief 从当前 X 位置滑出到屏幕右侧。
+ *
+ * 不把起点写死为 0：用户在滑入途中点击返回时，动画应从实际位置继续，
+ * 避免页面先跳到 0 再滑出。350ms、ease-out 与时钟子页/设置主页一致。
+ */
+static void slide_out(void)
+{
+    lv_anim_delete(s_motion_page, anim_x);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_motion_page);
+    lv_anim_set_values(&a, lv_obj_get_x(s_motion_page), UI_HOR_RES);
+    lv_anim_set_duration(&a, UI_ANIM_DURATION_MS);
+    lv_anim_set_path_cb(&a, UI_ANIM_PATH);
+    lv_anim_set_exec_cb(&a, anim_x);
+    lv_anim_set_completed_cb(&a, hidden);
+    lv_anim_start(&a);
+}
+
+/**
+ * @brief 开关状态变化：只更新 RAM 标志，不调用传感器或持久化。
+ *
+ * user_data 为 0 表示计步开关，1 表示抬手亮屏开关。开关自身由 LVGL
+ * 的 CHECKABLE 行为维护选中状态，这里只读取结果，避免手动取反造成
+ * 与动画/重复点击不一致。后续接入 BMI270 时，应在此处只投递请求，
+ * 真正的 I2C 配置由传感器任务在 LVGL 锁外完成。
+ */
+static void switch_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if ((uintptr_t)lv_event_get_user_data(e) == 0) s_motion_steps_enabled = checked;
+    else s_motion_wake_enabled = checked;
+}
+
+/** @brief 返回键点击：只调用无参的收起函数，避免直接转换函数指针类型。 */
+static void back_clicked_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_motion_settings_hide();
+}
+
+/**
+ * @brief 创建一个“左侧文字 + 右侧大开关”的条目。
+ *
+ * 行容器本身取消 CLICKABLE/SCROLLABLE：只有开关是点击目标，避免把
+ * 整行做成一个看不见的大按钮，导致用户点到文字区域也误切换功能。
+ * 文字与开关都在行内垂直居中，行整体水平居中（ROW_X）。
+ *
+ * 开关颜色显式覆盖默认主题：
+ * - 轨道（MAIN）关闭时为中性深灰 0x303030；
+ * - 选中指示层（INDICATOR）关闭时透明，打开时铺满白色；
+ * - 旋钮（KNOB）在深色轨道上为白色，在白色轨道上反转为页面深色，
+ *   保证两种状态都能看清旋钮位置。
+ * 这里只改颜色/尺寸，不改变 LVGL 开关自带的点击、选中和滑动动画。
+ */
+static void create_row(lv_obj_t *parent, int32_t y, const char *text,
+                       lv_obj_t **switch_out, uintptr_t index)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, ROW_W, ROW_H);
+    lv_obj_set_pos(row, ROW_X, y);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 22 号是用户允许的最大字号；文字颜色沿用普通页面的白色。 */
+    lv_obj_t *label = lv_label_create(row);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, ui_font_22(), 0);
+    lv_obj_set_style_text_color(label, UI_COLOR_TEXT, 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 12, 0);
+
+    lv_obj_t *sw = lv_switch_create(row);
+    lv_obj_set_size(sw, SWITCH_W, SWITCH_H);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -12, 0);
+    lv_obj_set_style_bg_color(sw, UI_COLOR_CONTROL_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(sw, 0, LV_PART_MAIN);
+    /* 关闭：不画选中指示层，露出深灰轨道。 */
+    lv_obj_set_style_bg_opa(sw, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    /* 打开：白色选中层铺满轨道。 */
+    lv_obj_set_style_bg_color(sw, UI_COLOR_TEXT, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    /* 旋钮在两种底色上保持对比。 */
+    lv_obj_set_style_bg_color(sw, UI_COLOR_TEXT, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(sw, UI_COLOR_PAGE_BG_DARK, LV_PART_KNOB | LV_STATE_CHECKED);
+    lv_obj_set_style_radius(sw, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+    lv_obj_set_style_shadow_width(sw, 0, LV_PART_KNOB);
+    lv_obj_add_event_cb(sw, switch_changed_cb, LV_EVENT_VALUE_CHANGED,
+                        (void *)index);
+
+    *switch_out = sw;
+}
+
+void ui_motion_settings_create(lv_obj_t *parent)
+{
+    /* 全屏子页与时钟设置子页同层：覆盖在设置主页上方，但仍是主屏幕的子对象。
+     * 初始放在屏幕右侧并隐藏，show() 只做位移动画，不创建/销毁对象。 */
+    s_motion_page = lv_obj_create(parent);
+    lv_obj_set_size(s_motion_page, UI_HOR_RES, UI_VER_RES);
+    lv_obj_set_pos(s_motion_page, UI_HOR_RES, 0);
+    lv_obj_set_style_bg_color(s_motion_page, UI_COLOR_PAGE_BG_DARK, 0);
+    lv_obj_set_style_bg_opa(s_motion_page, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_motion_page, 0, 0);
+    lv_obj_set_style_radius(s_motion_page, 0, 0);
+    lv_obj_set_style_pad_all(s_motion_page, 0, 0);
+    /* 子页不向外冒泡事件/手势：返回动画或开关点击不能触发设置页收起、
+     * 锁屏解锁或播放器切歌。页面本身不滚动，内容固定居中。 */
+    lv_obj_remove_flag(s_motion_page, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_EVENT_BUBBLE |
+                              LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_flag(s_motion_page, LV_OBJ_FLAG_HIDDEN);
+
+    /* 标题与时钟设置子页保持完全相同的字号、颜色和顶部位置。 */
+    lv_obj_t *title = lv_label_create(s_motion_page);
+    lv_label_set_text(title, "姿态感应");
+    lv_obj_set_style_text_font(title, ui_font_22(), 0);
+    lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+    /* 返回键只画 LVGL 自带左箭头，不依赖中文/图标字库；44x44 触摸目标
+     * 与时钟子页相同，位于左上角。 */
+    s_motion_back = lv_button_create(s_motion_page);
+    lv_obj_set_size(s_motion_back, 44, 44);
+    lv_obj_set_pos(s_motion_back, 12, 8);
+    lv_obj_set_style_bg_opa(s_motion_back, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_motion_back, 0, 0);
+    lv_obj_set_style_shadow_width(s_motion_back, 0, 0);
+    lv_obj_t *arrow = lv_label_create(s_motion_back);
+    lv_label_set_text(arrow, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_font(arrow, &lv_font_montserrat_26, 0);
+    lv_obj_set_style_text_color(arrow, UI_COLOR_TEXT, 0);
+    lv_obj_center(arrow);
+    lv_obj_add_event_cb(s_motion_back, back_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+    create_row(s_motion_page, ROW_FIRST_Y, "计步", &s_motion_steps_switch, 0);
+    create_row(s_motion_page, ROW_FIRST_Y + ROW_GAP, "抬手亮屏", &s_motion_wake_switch, 1);
+
+    /* 默认关闭。不要在这里调用 lv_obj_add_state(sw, CHECKED)：
+     * UI 开关必须如实反映“功能尚未启用”的初始状态。 */
+    s_motion_steps_enabled = false;
+    s_motion_wake_enabled = false;
+    s_motion_visible = false;
+}
+
+void ui_motion_settings_show(void)
+{
+    if (!s_motion_page || s_motion_visible) return;
+    lv_anim_delete(s_motion_page, anim_x);
+    /* 与时钟子页一致：每次从右侧边界重新开始，不依赖上次滑出后的位置。 */
+    lv_obj_set_x(s_motion_page, UI_HOR_RES);
+    lv_obj_remove_flag(s_motion_page, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_motion_page);
+    s_motion_visible = true;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_motion_page);
+    lv_anim_set_values(&a, UI_HOR_RES, 0);
+    lv_anim_set_duration(&a, UI_ANIM_DURATION_MS);
+    lv_anim_set_path_cb(&a, UI_ANIM_PATH);
+    lv_anim_set_exec_cb(&a, anim_x);
+    lv_anim_start(&a);
+}
+
+void ui_motion_settings_hide(void)
+{
+    if (!s_motion_page || !s_motion_visible) return;
+    slide_out();
+}
+
+void ui_motion_settings_close_for_lock(void)
+{
+    /* 锁屏只负责收起浮层；不保存、不等待任何后台操作。 */
+    if (!s_motion_page || !s_motion_visible) return;
+    slide_out();
+}
+
+bool ui_motion_settings_is_visible(void)
+{
+    return s_motion_visible;
+}
+
+bool ui_motion_settings_steps_enabled(void)
+{
+    return s_motion_steps_enabled;
+}
+
+bool ui_motion_settings_wake_enabled(void)
+{
+    return s_motion_wake_enabled;
+}

@@ -224,3 +224,13 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   endif()
 endif()
 add_test(NAME clock COMMAND clock_tests)
+
+# Motion-settings page: large switches, slide/back behavior, RAM-only state.
+add_executable(motion_tests test_motion.c)
+target_include_directories(motion_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(motion_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(motion_tests PRIVATE -O1 -Wall -Wextra)
+  target_link_options(motion_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME motion COMMAND motion_tests)

@@ -19,6 +19,11 @@ bool ui_clock_settings_is_visible(void) { return false; }
 void ui_clock_settings_create(lv_obj_t *parent) { (void)parent; }
 void ui_clock_settings_update(void) {}
 void ui_clock_settings_close_for_lock(void) {}
+/* ui_manager.c is the production source under test; keep its new motion-page
+ * calls inert because the page itself is tested separately. */
+bool ui_motion_settings_is_visible(void) { return false; }
+void ui_motion_settings_create(lv_obj_t *parent) { (void)parent; }
+void ui_motion_settings_close_for_lock(void) {}
 bool ui_power_dialog_is_visible(void) { return false; }
 bool ui_lockscreen_is_visible(void) { return false; }
 bool ui_mode_panel_is_visible(void) { return false; }

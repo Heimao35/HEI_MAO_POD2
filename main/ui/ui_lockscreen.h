@@ -34,6 +34,25 @@ void ui_lockscreen_create(lv_obj_t *parent);
 void ui_lockscreen_update(void);
 
 /**
+ * @brief 发布当天的步数到锁屏右下角。
+ * @param valid false 表示尚无有效传感器数据，显示“-- 步”，不伪造 0。
+ * @param steps 当天步数（不是上电以来的累计值）。
+ * @note  调用方必须持有 LVGL 锁。日期变化时锁屏会把显示值清零一次；
+ *        BMI270 计步模块也应在新的一天重置自己的计数器，避免下一次
+ *        发布把跨日累计值重新带回来。
+ */
+void ui_lockscreen_set_steps(bool valid, uint32_t steps);
+
+/**
+ * @brief 发布温度到步数上方，右对齐显示。
+ * @param valid false 表示无有效温度，显示“--℃”。
+ * @param temp_c_x10 摄氏度×10（例如 235 表示 23.5℃，-52 表示 -5.2℃）。
+ * @note  调用方必须持有 LVGL 锁。当前只做显示，不读取 I2C；BMI270 的
+ *        片内温度传感器测的是芯片结温，不是环境温度，有效性由发布方判断。
+ */
+void ui_lockscreen_set_temperature(bool valid, int16_t temp_c_x10);
+
+/**
  * @brief 进入锁屏或恢复已有锁屏，并从头重播 MJPEG。
  * @note  仅从已隐藏的锁屏进入时播放页面滑入；亮屏唤醒不重复滑入。
  *        调用方须持有 LVGL 锁。

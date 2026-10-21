@@ -10,6 +10,7 @@
 #include "ui_statusbar.h"
 #include "ui_fonts.h"
 #include "ui_clock_settings.h"
+#include "ui_motion_settings.h"
 
 static lv_obj_t *s_page = NULL; /**< 设置页面容器 */
 static bool s_visible = false;
@@ -31,12 +32,17 @@ static const struct {
 #define ITEM_COUNT (sizeof(s_items) / sizeof(s_items[0]))
 
 /**
- * @brief 设置项按钮点击回调：时钟项进入独立 RTC 设置子页
+ * @brief 设置项按钮点击回调：姿态感应/时钟进入各自的独立子页
+ *
+ * 索引 2 是“姿态感应”，索引 3 是“时钟”。两个子页都只是覆盖在设置
+ * 主页上的全屏页面，隐藏/显示不改变设置主页的网格、状态栏和手势；
+ * 其余条目保留原入口，后续按各自功能接入。
  */
 static void item_click_cb(lv_event_t *e)
 {
     int idx = (int)(uintptr_t)lv_event_get_user_data(e);
-    if(idx==3) ui_clock_settings_show();
+    if(idx==2) ui_motion_settings_show();
+    else if(idx==3) ui_clock_settings_show();
     /* 其余设置项保留原入口，后续按各自功能接入。 */
 }
 

@@ -24,6 +24,7 @@
 #include "ui_adj_panel.h"
 #include "ui_settings.h"
 #include "ui_clock_settings.h"
+#include "ui_motion_settings.h"
 #include "esp_log.h"
 
 static const char *TAG = "ui_manager";
@@ -92,8 +93,10 @@ static void gesture_released_cb(lv_event_t *e)
     (void)e;
     /* 关机弹窗是唯一新增模态层；取消后恢复原手势判定和页面动画。 */
     if (ui_power_dialog_is_visible()) return;
-    /* 子页滚轮独占拖动，不让边缘/底部滑动穿透到原设置页或播放器。 */
-    if (ui_clock_settings_is_visible()) return;
+    /* 子页滚轮/开关独占触摸，不让边缘/底部滑动穿透到原设置页或播放器。
+     * 姿态感应子页没有滚轮，但同样必须独占，否则在返回动画途中从底部
+     * 上滑会把下层的设置主页收起，留下一个悬空的子页。 */
+    if (ui_clock_settings_is_visible() || ui_motion_settings_is_visible()) return;
     lv_indev_t *indev = lv_indev_active();
     if (!indev) return;
 
@@ -297,6 +300,10 @@ void ui_manager_init(void)
     /* ---- 4. 设置页面 ---- */
     ui_settings_create(scr);
     ui_clock_settings_create(scr);
+    /* 姿态感应设置页与时钟设置页同级，均为覆盖在设置主页上的全屏子页。
+     * 创建顺序在状态栏之前，保持原有 z-order；显示时再 move_foreground，
+     * 不改变各模式页面、锁屏、面板和状态栏的既有顺序。 */
+    ui_motion_settings_create(scr);
 
     /* ---- 5. 状态栏（最顶层） ---- */
     ui_statusbar_create(scr);
@@ -380,6 +387,7 @@ void ui_manager_lock(void)
     /* 电源键锁屏时收起原有浮层，防止设置页/面板继续盖住锁屏。
      * 仅复用原收起动画，不改变这些页面自身的手势、布局及动画曲线。 */
     ui_clock_settings_close_for_lock();
+    ui_motion_settings_close_for_lock();
     ui_settings_hide();
     ui_mode_panel_hide();
     ui_adj_panel_hide();
