@@ -33,6 +33,10 @@ void screen_power_shutdown_display(bool off)
 bool screen_power_display_suspended(void) { assert(!locked); return suspended; }
 void ui_lockscreen_stop_anim(void) { assert(locked); ++stops; }
 bool ui_lockscreen_anim_is_idle(void) { assert(!locked); return anim_idle; }
+void ui_video_player_close_for_lock(void) { assert(locked); }
+void video_player_stop(void) {}
+void video_player_release(void) {}
+bool video_player_is_idle(void) { return true; }
 bool music_player_adapter_pause(bool pause)
 { assert(!locked); media_paused=pause; return media_idle; }
 esp_err_t music_player_adapter_capture_selection(void)

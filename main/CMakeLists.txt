@@ -1,6 +1,9 @@
 idf_component_register(SRCS "main.c"
                               "sd_card.c"
                               "lock_animation.c"
+                              "video_mjpeg.c"
+                              "video_library.c"
+                              "video_player.c"
                               "pmic_axp2101.c"
                               "rtc_clock.c"
                               "motion_sensor.c"
@@ -40,7 +43,7 @@ idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "." "ui"
                     PRIV_REQUIRES fatfs sdmmc esp_driver_jpeg esp_partition
                                   esp_lcd esp_lcd_touch_cst820
-                                  esp_hw_support driver
+                                  esp_hw_support esp_timer driver
                                   esp_lvgl_port
                                   esp_audio_codec spiffs nvs_flash esp_adc esp_driver_i2s)
 

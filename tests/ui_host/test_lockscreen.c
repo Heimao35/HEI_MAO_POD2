@@ -25,6 +25,7 @@ ui_device_state_t *ui_get_device_state(void) { return &state; }
 void ui_statusbar_show_time(bool value) { show_status_time=value; }
 lv_obj_t *ui_statusbar_get_obj(void) { return bar; }
 void music_player_adapter_request_scan_if_needed(void) { ++scans; }
+bool video_player_is_idle(void) { return true; }
 bool sd_card_io_lock(TickType_t wait) { (void)wait; ++sd_accesses; assert(!"lock replay must never access SD"); return false; }
 void sd_card_io_unlock(void) { assert(sd_locked); sd_locked=false; }
 bool sd_card_is_mounted(void) { return mounted; }

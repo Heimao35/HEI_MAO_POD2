@@ -24,6 +24,27 @@ endif()
 enable_testing()
 add_test(NAME player_ui COMMAND player_ui_tests)
 
+# Video page object ordering, preview descriptors, canvas handoff and lifecycle
+# with a simulated backend; no SD/JPEG/audio device is touched.
+add_executable(video_ui_tests test_video_ui.c)
+target_include_directories(video_ui_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(video_ui_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(video_ui_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable -ffunction-sections -fdata-sections)
+  target_link_options(video_ui_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+endif()
+add_test(NAME video_ui COMMAND video_ui_tests)
+
+# Real 460x460 MJPEG fixture: streaming parser, seek and thumbnail window.
+add_executable(video_mjpeg_tests test_video_mjpeg.c)
+target_include_directories(video_mjpeg_tests PRIVATE ../media_host/stubs "${REPO}/main")
+target_compile_definitions(video_mjpeg_tests PRIVATE
+  VIDEO_FIXTURE="${CMAKE_CURRENT_LIST_DIR}/fixtures/animation/baseline-460.mjpeg")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(video_mjpeg_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+endif()
+add_test(NAME video_mjpeg COMMAND video_mjpeg_tests)
+
 # Exercise production media scheduling separately from the LVGL object tests.
 add_executable(player_adapter_tests test_adapter.c ../media_host/support.c)
 target_include_directories(player_adapter_tests PRIVATE stubs ../media_host/stubs ../screen_host/stubs "${REPO}/main")

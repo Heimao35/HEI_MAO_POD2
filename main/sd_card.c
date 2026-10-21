@@ -1,8 +1,11 @@
 #include "sd_card.h"
 #include "ui/ui_common.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include "ff.h"
 #include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -23,13 +26,21 @@ static atomic_uint s_generation = 0;
 static SemaphoreHandle_t s_io_mutex;
 static SemaphoreHandle_t s_evt_sem = NULL;
 static void (*s_audio_detach)(void);
+static void (*s_video_detach)(void);
 static atomic_bool s_safe_remount_requested;
-static atomic_bool s_safe_speed;
 
 esp_err_t sd_card_set_audio_detach_callback(void (*callback)(void))
 {
     if (!sd_card_io_lock(pdMS_TO_TICKS(1000))) return ESP_ERR_TIMEOUT;
     s_audio_detach=callback;
+    sd_card_io_unlock();
+    return ESP_OK;
+}
+
+esp_err_t sd_card_set_video_detach_callback(void (*callback)(void))
+{
+    if (!sd_card_io_lock(pdMS_TO_TICKS(1000))) return ESP_ERR_TIMEOUT;
+    s_video_detach=callback;
     sd_card_io_unlock();
     return ESP_OK;
 }
@@ -55,7 +66,7 @@ static void create_sys_dirs(void)
     ensure_dir(SD_SYS_DIR "/MEDIA");
     ensure_dir(SD_SYS_DIR "/MEDIA/cam");
     ensure_dir(SD_SYS_DIR "/MEDIA/pictures");
-    ensure_dir(SD_SYS_DIR "/MEDIA/vedio");
+    ensure_dir(SD_SYS_DIR "/MEDIA/video");
     ensure_dir(SD_SYS_DIR "/MEDIA/lock_scr");
     ensure_dir(SD_SYS_DIR "/BIN");
     ensure_dir(SD_SYS_DIR "/.hmcache");
@@ -68,10 +79,11 @@ static esp_err_t do_mount(void)
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.slot = SDMMC_HOST_SLOT_0;
-    /* Normal cards mount at 40 MHz. After a scan-time I/O timeout,
-     * the recovery remount uses 20 MHz to provide additional timing margin. */
-    host.max_freq_khz = atomic_load(&s_safe_speed) ?
-                        SDMMC_FREQ_DEFAULT : SDMMC_FREQ_HIGHSPEED;
+    /* 本板/当前卡在 40 MHz 下实测出现 CRC 和数据读超时，降速重挂载后
+     * 20 MHz 稳定；20 MHz 4-bit 原始顺序读约 8.7 MB/s，已经高于视频
+     * 60fps（约 1.4 MB/s）和音频所需带宽。默认直接使用 20 MHz，避免
+     * 每次开机先在 40 MHz 失败再恢复。 */
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 4;
@@ -94,6 +106,54 @@ static esp_err_t do_mount(void)
     }
 
     sdmmc_card_print_info(stdout, s_card);
+    size_t host_width = s_card->host.get_bus_width ?
+                        s_card->host.get_bus_width(s_card->host.slot) : 0;
+    /* 用与视频读取相同的 512B 对齐 64KiB PSRAM 缓冲，直接询问主机驱动
+     * 是否会走多块 DMA 快路径。 */
+    uint8_t *probe = heap_caps_aligned_alloc(512, 64U * 1024U,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    bool probe_aligned = probe && s_card->host.check_buffer_alignment &&
+                         s_card->host.check_buffer_alignment(
+                             s_card->host.slot, probe, 64U * 1024U);
+    /* 绕过 FATFS/VFS 的只读底层基准：1 个扇区 vs 128 个连续扇区。
+     * 如果两者都慢，问题在卡/总线；如果 128 扇区很快，问题在 FATFS 路径。 */
+    if (probe) {
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t r1 = sdmmc_read_sectors(s_card, probe, 2048, 1);
+        int64_t t1 = esp_timer_get_time();
+        /* 与单扇区读错开，避免卡内部缓存影响 64KiB 基准。 */
+        esp_err_t r128 = sdmmc_read_sectors(s_card, probe, 4096, 128);
+        int64_t t2 = esp_timer_get_time();
+        ESP_LOGI(TAG, "Raw SD read: 1 sector=%lld us (%s), 128 sectors=%lld us (%s)",
+                 (long long)(t1 - t0), esp_err_to_name(r1),
+                 (long long)(t2 - t1), esp_err_to_name(r128));
+    }
+    heap_caps_free(probe);
+    ESP_LOGI(TAG,
+             "SD bus: real=%d kHz, host_width=%u, card_width=%u, DDR=%d, SPI=%d, "
+             "64K_probe_dma=%d, capacity=%llu MB",
+             s_card->real_freq_khz, (unsigned)host_width,
+             (unsigned)(1U << s_card->log_bus_width), (int)s_card->is_ddr,
+             (s_card->host.flags & SDMMC_HOST_FLAG_SPI) != 0,
+             (int)probe_aligned,
+             (unsigned long long)((uint64_t)s_card->csd.capacity *
+                                  s_card->csd.sector_size / (1024U * 1024U)));
+    FATFS *fs = NULL;
+    DWORD free_clusters = 0;
+    FRESULT fr = f_getfree(SD_MOUNT_POINT, &free_clusters, &fs);
+    if (fr == FR_OK && fs) {
+        unsigned cluster_bytes = (unsigned)fs->csize * fs->ssize;
+        ESP_LOGI(TAG, "FAT: cluster=%u bytes, sector=%u bytes, free=%lu clusters",
+                 cluster_bytes, (unsigned)fs->ssize,
+                 (unsigned long)free_clusters);
+        /* FATFS 每次 f_read 最多只跨一个簇；8 KiB 簇会把 64 KiB 视频读取
+         * 拆成 8 次 SD 命令，顺序吞吐会被命令开销拖垮。 */
+        if (cluster_bytes < 32U * 1024U)
+            ESP_LOGW(TAG, "Small FAT cluster; video throughput will be low. "
+                          "Reformat FAT32 with 32/64 KiB allocation units.");
+    } else {
+        ESP_LOGW(TAG, "FAT cluster query failed: %d", (int)fr);
+    }
     create_sys_dirs();
     ++s_generation;
     s_mounted = true;
@@ -115,6 +175,7 @@ static void do_unmount(void)
     /* 音频唯一长开文件在同一SD锁内关闭，再销毁VFS；播放器不再持有
      * 失效FILE指针。回调只能关闭文件/发布原子标志，不等待UI或DAC。 */
     if (s_audio_detach) s_audio_detach();
+    if (s_video_detach) s_video_detach();
     esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
     s_card = NULL;
     s_mounted = false;
@@ -159,9 +220,6 @@ static void sd_detect_task(void *arg)
         } else if (!inserted && s_mounted) {
             ESP_LOGI(TAG, "Card removed, unmounting...");
             do_unmount();
-            /* A physical reinsertion is a new card/session: retry its normal
-             * 40 MHz operating point instead of retaining a prior recovery mode. */
-            atomic_store(&s_safe_speed, false);
         }
     }
 }
@@ -172,7 +230,6 @@ esp_err_t sd_card_init(void)
     s_io_mutex = xSemaphoreCreateMutex();
     s_evt_sem = xSemaphoreCreateBinary();
     atomic_store(&s_safe_remount_requested, false);
-    atomic_store(&s_safe_speed, false);
     if (!s_io_mutex || !s_evt_sem) {
         if (s_io_mutex) vSemaphoreDelete(s_io_mutex);
         if (s_evt_sem) vSemaphoreDelete(s_evt_sem);
@@ -214,7 +271,6 @@ void sd_card_poll_detect(void)
 void sd_card_request_safe_remount(void)
 {
     if (!s_evt_sem) return;
-    atomic_store(&s_safe_speed, true);
     atomic_store(&s_safe_remount_requested, true);
     xSemaphoreGive(s_evt_sem);
 }

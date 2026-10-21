@@ -30,6 +30,7 @@
 #include "lock_animation.h"
 #include "pmic_axp2101.h"
 #include "music_player_adapter.h"
+#include "video_player.h"
 #include "audio_output.h"
 #include "ui_fonts.h"
 #include "ui_boot.h"
@@ -390,6 +391,13 @@ void app_main(void)
     /* Background SD catalogue/cover/LRC loader. */
     esp_err_t ret = music_player_adapter_init();
     if (ret != ESP_OK) ESP_LOGE(TAG, "Music integration failed: %s", esp_err_to_name(ret));
+
+    app_boot_progress(93,"Starting video player...");
+    /* 视频 worker 只创建命令队列/任务并注册 SD detach 回调；真正的扫描、
+     * 缩略图和解码在进入视频模式/点击预览后才发生，不拖慢开机。 */
+    esp_err_t video_ret = video_player_init();
+    if (video_ret != ESP_OK)
+        ESP_LOGE(TAG, "Video player init failed: %s", esp_err_to_name(video_ret));
 
     app_boot_progress(95,"Starting display controls...");
     /* 字体和 SD 初始挂载结束后才启动十秒计时；触摸 IRQ 包装器保留

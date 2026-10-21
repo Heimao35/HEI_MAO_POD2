@@ -169,8 +169,11 @@ static void gesture_released_cb(lv_event_t *e)
      * 设置下拉或播放器手势。实际滑条触摸由控件接收，不冒泡到这里。 */
     if (ui_mode_panel_is_visible() || ui_adj_panel_is_modal()) return;
 
-    /* ---- 从状态栏区域下滑 → 展开设置页面 ---- */
-    if (!is_horizontal && dy > GESTURE_MIN_DIST &&
+    /* ---- 从状态栏区域下滑 → 展开设置页面 ----
+     * 全屏视频播放时状态栏已隐藏，不允许再用同一手势把设置页盖到视频上；
+     * 左右边缘的模式栏/声光栏不受影响，仍是播放时可用的浮层。 */
+    if (!(s_current_mode == UI_MODE_VIDEO && ui_video_player_is_player_active()) &&
+        !is_horizontal && dy > GESTURE_MIN_DIST &&
         s_press_point.y < (int32_t)UI_STATUSBAR_HEIGHT) {
         ui_settings_show();
         return;
@@ -333,6 +336,10 @@ void ui_manager_switch_mode(ui_mode_t mode)
 {
     if (mode == s_current_mode || mode >= UI_MODE_MAX) return;
 
+    /* 离开视频模式前先停播放并释放视频 JPEG/缩略图资源；该调用只投递
+     * 请求，不等待 SD/解码，因此可以在 LVGL 回调中安全执行。 */
+    if (s_current_mode == UI_MODE_VIDEO) ui_video_player_on_mode_leave();
+
     lv_obj_t *old_page = s_mode_pages[s_current_mode];
     lv_obj_t *new_page = s_mode_pages[mode];
     if (!old_page || !new_page) return;
@@ -367,6 +374,8 @@ void ui_manager_switch_mode(ui_mode_t mode)
     lv_anim_start(&a_in);
 
     s_current_mode = mode;
+    /* 进入视频模式只准备列表/索引，不自动播放；播放由用户点预览图触发。 */
+    if (mode == UI_MODE_VIDEO) ui_video_player_on_mode_enter();
     ESP_LOGI(TAG, "Switched to mode %d", (int)mode);
 }
 
@@ -388,6 +397,9 @@ void ui_manager_lock(void)
      * 仅复用原收起动画，不改变这些页面自身的手势、布局及动画曲线。 */
     ui_clock_settings_close_for_lock();
     ui_motion_settings_close_for_lock();
+    /* 锁屏 MJPEG 和视频播放器不能同时占用硬件 JPEG。这里先隐藏播放器并
+     * 投递停止/释放请求，锁屏动画会等待视频 worker 空闲后再解码。 */
+    ui_video_player_close_for_lock();
     ui_settings_hide();
     ui_mode_panel_hide();
     ui_adj_panel_hide();

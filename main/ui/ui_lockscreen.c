@@ -3,6 +3,7 @@
 #include "ui_fonts.h"
 #include "lock_animation.h"
 #include "music_player_adapter.h"
+#include "video_player.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/jpeg_decode.h"
@@ -59,6 +60,12 @@ static void play_mjpeg(unsigned generation)
     size_t position=0, frame_len=0;
     const uint8_t *frame=NULL;
     if (!lock_animation_next_frame(&position,&frame,&frame_len)) return;
+
+    /* 视频播放器可能正在停止/释放它自己的 JPEG 引擎。先等它空闲，
+     * 避免视频首帧和锁屏动画同时进入硬件 codec；最多等 500ms，超时后
+     * 仍由驱动内部的 codec mutex 串行化。 */
+    for (unsigned i=0; i<100 && !video_player_is_idle(); ++i)
+        vTaskDelay(pdMS_TO_TICKS(5));
 
     jpeg_decoder_handle_t decoder = NULL;
     jpeg_decode_engine_cfg_t eng_cfg = {

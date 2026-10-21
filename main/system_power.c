@@ -7,6 +7,8 @@
 #include "sd_card.h"
 #include "ui/ui_power_dialog.h"
 #include "ui/ui_lockscreen.h"
+#include "ui/ui_video_player.h"
+#include "video_player.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -132,13 +134,19 @@ static esp_err_t quiesce(void)
     TickType_t started=xTaskGetTickCount();
     if (lvgl_port_lock(0)) {
         ui_lockscreen_stop_anim();
+        /* 先隐藏视频页并投递停止/释放；不能持有 LVGL 锁等待解码线程。 */
+        ui_video_player_close_for_lock();
         lvgl_port_unlock();
     }
+    /* 双保险：即使 UI 尚未创建/已经隐藏，也向视频 worker 投递终态请求。 */
+    video_player_stop();
+    video_player_release();
     /* 所有等待均在 LVGL 锁外。先停新请求，再等已经开始的 SD/JPEG 工作
      * 结束；超时直接返回可恢复状态，不能强杀持有文件/锁的任务。 */
     /* 关机独立拥有IMU暂停位；显示任务退出睡眠时不能误解除此请求。
      * 不在I2C配置/状态读取尚未结束时发送PMIC整机断电/重启命令。 */
-    while (!motion_sensor_shutdown(true) || !music_player_adapter_pause(true) || !ui_lockscreen_anim_is_idle()) {
+    while (!motion_sensor_shutdown(true) || !music_player_adapter_pause(true) ||
+           !ui_lockscreen_anim_is_idle() || !video_player_is_idle()) {
         if ((TickType_t)(xTaskGetTickCount()-started)>=pdMS_TO_TICKS(QUIESCE_MS)) return ESP_ERR_TIMEOUT;
         vTaskDelay(pdMS_TO_TICKS(20));
     }

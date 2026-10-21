@@ -29,6 +29,8 @@ void      sd_card_poll_detect(void);
 void      sd_card_request_safe_remount(void);
 /* 一次注册；卸载持有SD锁时关闭音频流。回调内不可重新取锁或访问UI。 */
 esp_err_t sd_card_set_audio_detach_callback(void (*callback)(void));
+/* 视频文件同样必须在 VFS 卸载前关闭；回调在 SD 锁内执行，只可关闭 FILE。 */
+esp_err_t sd_card_set_video_detach_callback(void (*callback)(void));
 
 #ifdef __cplusplus
 }
