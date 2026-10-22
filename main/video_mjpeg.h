@@ -6,14 +6,15 @@
  * 解析器按 JPEG 段长度跳过 APP/DQT/SOF/DHT 等段，再在 SOS 熵编码区识别
  * FFD9，不能直接搜索第一个 FFD9：APP 段里的缩略图也可能含 FFD9。
  *
- * 所有 fopen/fread/fseek 都由调用方持有 sd_card_io_lock()。播放线程长期
- * 持有一个 video_mjpeg_t；缩略图使用 video_mjpeg_read_frame_near() 短时
- * 打开文件，读完立即关闭。这样 SD 卸载时只需要关闭播放线程的文件句柄。
+ * 所有 f_open/f_read/f_lseek/f_close 都由调用方持有 sd_card_io_lock()。
+ * 播放线程长期持有一个 video_mjpeg_t；缩略图使用
+ * video_mjpeg_read_frame_near() 短时打开文件，读完立即关闭。这样 SD
+ * 卸载时只需要关闭播放线程的文件对象。
  *
- * 文件大小：ESP-IDF 的 off_t/st_size 是 32 位有符号，而 FATFS 的 fsize 是
- * 32 位无符号，因此 2 GiB 以上的文件在 stat 中表现为负值。本模块会按无符号
- * 还原真实大小，支持顺序播放到 FAT32 上限 4 GiB-1；但 VFS lseek 仍受 32 位
- * 有符号限制，2 GiB 之后的随机跳转不可用。
+ * 文件 I/O 直接使用 FatFs（f_open/f_read/f_lseek/f_close），不经过 VFS：
+ * ESP-IDF VFS 的 off_t 是 32 位有符号，只能定位到 2 GiB；FatFs 的 FSIZE_t
+ * 是 32 位无符号，可完整支持 FAT32 单文件上限 4 GiB-1，进度条能跳转到
+ * 文件任意位置。路径在模块内去掉 VFS 挂载点前缀并使用默认卷。
  */
 
 #ifndef VIDEO_MJPEG_H
@@ -60,7 +61,7 @@ esp_err_t video_mjpeg_open(video_mjpeg_t **out, const char *path);
 void video_mjpeg_close(video_mjpeg_t *reader);
 
 /**
- * @brief SD 卸载回调专用：只关闭 FILE，不取 SD 锁、不释放缓冲。
+ * @brief SD 卸载回调专用：只关闭 FIL，不取 SD 锁、不释放缓冲。
  * @note 调用方（sd_card）已经持有 SD 锁，且随后会卸载 VFS。
  */
 void video_mjpeg_detach(video_mjpeg_t *reader);
@@ -77,8 +78,8 @@ bool video_mjpeg_next(video_mjpeg_t *reader, const uint8_t **frame,
 
 /**
  * @brief 跳到文件偏移。下一帧会从该位置之后的下一个 SOI 开始。
- * @note  2 GiB（2^31 字节）之后的位置受 32 位有符号 off_t 限制，返回 false；
- *        2 GiB 以内以及文件开头的跳转不受影响。
+ * @note  受 FatFs FSIZE_t 与 FAT32 限制，可定位到 4 GiB-1 以内的任意位置。
+ *        跳转按 512 字节向下对齐；失败时返回 false，原有文件位置不变。
  */
 bool video_mjpeg_seek(video_mjpeg_t *reader, uint64_t offset);
 

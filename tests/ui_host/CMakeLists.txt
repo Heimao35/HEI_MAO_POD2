@@ -37,7 +37,8 @@ add_test(NAME video_ui COMMAND video_ui_tests)
 
 # Real 460x460 MJPEG fixture: streaming parser, seek and thumbnail window.
 add_executable(video_mjpeg_tests test_video_mjpeg.c)
-target_include_directories(video_mjpeg_tests PRIVATE ../media_host/stubs "${REPO}/main")
+# stubs/ff.h keeps the real parser test on stdio while production uses FatFs.
+target_include_directories(video_mjpeg_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
 target_compile_definitions(video_mjpeg_tests PRIVATE
   VIDEO_FIXTURE="${CMAKE_CURRENT_LIST_DIR}/fixtures/animation/baseline-460.mjpeg")
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")

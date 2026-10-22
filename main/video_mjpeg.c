@@ -4,32 +4,31 @@
  *
  * 解析原则与锁屏动画一致：JPEG 段必须按长度跳过，熵编码区只接受 FF00、
  * RST0..7 和 FFD9。这样不会被 APP 段内嵌缩略图的 FFD9 提前截断。
+ *
+ * 文件访问直接调用 FatFs，而不是 VFS：ESP-IDF 的 off_t 是 32 位有符号，
+ * VFS 只能定位到 2 GiB；FatFs 的 FSIZE_t 是 32 位无符号，可覆盖 FAT32
+ * 单文件上限 4 GiB-1，进度条因此能跳转到文件末尾附近。
  */
 
 #include "video_mjpeg.h"
+#include "sd_card.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "ff.h"
 #include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 static const char *TAG = "video_mjpeg";
 
-/* MinGW 主机回归需要 O_BINARY，避免 CRT 做文本换行转换。 */
-#ifdef _WIN32
-#define VM_OPEN_FLAGS (O_RDONLY | O_BINARY)
-#else
-#define VM_OPEN_FLAGS O_RDONLY
-#endif
+/* 与调用方的路径缓冲（VIDEO_NAME_MAX+80）一致；超长路径直接拒绝。 */
+#define VM_PATH_MAX 336U
 
 struct video_mjpeg {
-    int fd;                  /* VFS 文件描述符；-1 表示已 detach/关闭 */
+    FIL fil;                 /* FatFs 文件对象；opened 为 true 时有效 */
+    bool opened;             /* detach/close 后清零，避免再次 f_close */
     uint64_t size;
     uint64_t read_base;      /* read_buf[0] 对应的文件偏移 */
-    uint64_t next_read;      /* 下一次 read() 的文件偏移 */
+    uint64_t next_read;      /* 下一次 f_read 的文件偏移 */
     size_t read_len;
     size_t read_pos;
     uint8_t *read_buf;
@@ -69,40 +68,38 @@ uint8_t video_mjpeg_fps_from_name(const char *name)
 }
 
 /*
- * 直接走 VFS read()，不要用 stdio fread()。
+ * 直接调用 FatFs f_read，不要用 stdio fread()。
  *
- * 本项目的音频路径已经验证过：v5.5.4 FATFS/VFS 在 stdio 缓冲/小块路径下
- * 会显著放大 SD 命令开销；read() 由调用方给出完整块大小，FATFS 才能把
- * 一个 64 KiB 对齐块直接交给 sdmmc_read_sectors() 做多块 DMA。
+ * 本项目的音频路径已经验证过：v5.5.4 的 stdio 缓冲/小块路径会显著放大
+ * SD 命令开销；f_read 由调用方给出完整块大小，FatFs 才能把 64 KiB 的
+ * 读缓冲按扇区直接交给 sdmmc_read_sectors() 做多块 DMA。走 VFS 时底层
+ * 也是 f_read，这里少一层路径/描述符转发，读写性能保持不变。
  */
-static ssize_t read_full(int fd, void *buf, size_t bytes)
+static size_t read_full(FIL *file, void *buf, size_t bytes)
 {
     size_t done = 0;
     while (done < bytes) {
-        ssize_t n = read(fd, (uint8_t *)buf + done, bytes - done);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) break;
-        done += (size_t)n;
+        UINT br = 0;
+        if (f_read(file, (uint8_t *)buf + done, (UINT)(bytes - done), &br) != FR_OK ||
+            br == 0) break;
+        done += (size_t)br;
     }
-    return (ssize_t)done;
+    return done;
 }
 
 /* 从当前缓冲取一个字节；缓冲耗尽时从 SD 读下一块。 */
 static int get_byte(video_mjpeg_t *r)
 {
     if (r->read_pos >= r->read_len) {
-        if (r->fd < 0 || r->eof) return -1;
-        ssize_t n = read_full(r->fd, r->read_buf, VIDEO_MJPEG_READ_BYTES);
-        if (n <= 0) {
+        if (!r->opened || r->eof) return -1;
+        size_t n = read_full(&r->fil, r->read_buf, VIDEO_MJPEG_READ_BYTES);
+        if (!n) {
             r->eof = true;
             return -1;
         }
         r->read_base = r->next_read;
-        r->next_read += (size_t)n;
-        r->read_len = (size_t)n;
+        r->next_read += n;
+        r->read_len = n;
         r->read_pos = 0;
     }
     return r->read_buf[r->read_pos++];
@@ -196,25 +193,34 @@ static bool parse_frame(video_mjpeg_t *r)
 }
 
 /*
- * ESP-IDF VFS/newlib 的 off_t 是 32 位有符号，而 FATFS 的 fsize 是 32 位
- * 无符号：文件达到 2 GiB（2^31 字节）后 stat 的 st_size 会回绕成负值。
- * FAT32 单文件上限是 4 GiB-1，因此负值按 32 位无符号还原就是真实大小。
- * 注意 VFS 的 lseek 仍是 32 位有符号：2 GiB 之后的位置无法直接定位，
- * 大文件只能从头顺序播放到结尾，见 video_mjpeg_seek。
+ * VFS 挂载点不是 FAT 路径的一部分：/sdcard/HEI_MAO_POD_SYS/... 对应
+ * FatFs 根目录下的 /HEI_MAO_POD_SYS/...。FF_FS_RPATH=0 时无盘符路径
+ * 使用默认卷 0；sd_card 只挂载一个 FAT 卷，且 sd_card.c 的
+ * f_getfree(SD_MOUNT_POINT, ...) 也依赖同一个默认卷。
+ * 转换失败时直接拒绝，不访问文件系统。
  */
-static uint64_t size_from_stat(off_t value)
+static bool to_fatfs_path(const char *path, char *out, size_t cap)
 {
-    return value < 0 ? (uint64_t)(uint32_t)value : (uint64_t)value;
+    if (!path) return false;
+    const size_t prefix = sizeof(SD_MOUNT_POINT) - 1;
+    if (strncmp(path, SD_MOUNT_POINT, prefix) || path[prefix] != '/' ||
+        !path[prefix + 1]) return false;
+    const char *relative = path + prefix;
+    size_t len = strlen(relative);
+    if (len >= cap) return false;
+    memcpy(out, relative, len + 1);
+    return true;
 }
 
-/* 取普通文件的真实字节数；目录、空文件和 stat 失败都视为无效。 */
+/* 取普通文件的真实字节数。FatFs 的 fsize 是 32 位无符号，FAT32 单文件
+ * 上限 4 GiB-1，不再有 VFS off_t 的符号回绕问题；目录、空文件和
+ * f_stat 失败都视为无效。 */
 static bool stat_regular_size(const char *path, uint64_t *size)
 {
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
-    uint64_t bytes = size_from_stat(st.st_size);
-    if (!bytes) return false;
-    *size = bytes;
+    FILINFO info;
+    if (f_stat(path, &info) != FR_OK || (info.fattrib & AM_DIR) || !info.fsize)
+        return false;
+    *size = (uint64_t)info.fsize;
     return true;
 }
 
@@ -223,13 +229,14 @@ esp_err_t video_mjpeg_open(video_mjpeg_t **out, const char *path)
     if (!out || !path || !path[0]) return ESP_ERR_INVALID_ARG;
     *out = NULL;
 
+    char fat_path[VM_PATH_MAX];
+    if (!to_fatfs_path(path, fat_path, sizeof(fat_path))) return ESP_ERR_NOT_FOUND;
     uint64_t file_size = 0;
-    if (!stat_regular_size(path, &file_size)) return ESP_ERR_NOT_FOUND;
+    if (!stat_regular_size(fat_path, &file_size)) return ESP_ERR_NOT_FOUND;
 
     video_mjpeg_t *r = heap_caps_calloc(1, sizeof(*r),
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!r) return ESP_ERR_NO_MEM;
-    r->fd = -1;
     r->read_buf = heap_caps_aligned_alloc(VIDEO_MJPEG_IO_ALIGN,
                                           VIDEO_MJPEG_READ_BYTES,
                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -244,11 +251,11 @@ esp_err_t video_mjpeg_open(video_mjpeg_t **out, const char *path)
         video_mjpeg_close(r);
         return ESP_ERR_NO_MEM;
     }
-    r->fd = open(path, VM_OPEN_FLAGS);
-    if (r->fd < 0) {
+    if (f_open(&r->fil, fat_path, FA_READ) != FR_OK) {
         video_mjpeg_close(r);
         return ESP_ERR_NOT_FOUND;
     }
+    r->opened = true;
     r->size = file_size;
     r->read_base = 0;
     r->next_read = 0;
@@ -265,9 +272,9 @@ esp_err_t video_mjpeg_open(video_mjpeg_t **out, const char *path)
 void video_mjpeg_detach(video_mjpeg_t *reader)
 {
     if (!reader) return;
-    if (reader->fd >= 0) {
-        close(reader->fd);
-        reader->fd = -1;
+    if (reader->opened) {
+        f_close(&reader->fil);
+        reader->opened = false;
     }
     reader->eof = true;
 }
@@ -275,9 +282,9 @@ void video_mjpeg_detach(video_mjpeg_t *reader)
 void video_mjpeg_close(video_mjpeg_t *reader)
 {
     if (!reader) return;
-    if (reader->fd >= 0) {
-        close(reader->fd);
-        reader->fd = -1;
+    if (reader->opened) {
+        f_close(&reader->fil);
+        reader->opened = false;
     }
     heap_caps_free(reader->read_buf);
     heap_caps_free(reader->frame_buf);
@@ -287,7 +294,7 @@ void video_mjpeg_close(video_mjpeg_t *reader)
 bool video_mjpeg_next(video_mjpeg_t *reader, const uint8_t **frame,
                       size_t *bytes, uint64_t *frame_offset)
 {
-    if (!reader || !frame || !bytes || !frame_offset || reader->fd < 0) return false;
+    if (!reader || !frame || !bytes || !frame_offset || !reader->opened) return false;
     if (!find_soi(reader)) return false;
 
     uint64_t start = buffered_offset(reader) - 2;
@@ -301,14 +308,14 @@ bool video_mjpeg_next(video_mjpeg_t *reader, const uint8_t **frame,
 
 bool video_mjpeg_seek(video_mjpeg_t *reader, uint64_t offset)
 {
-    if (!reader || reader->fd < 0 || offset > reader->size) return false;
-    /* 向下对齐到扇区边界，保证后续 read() 的目标地址和 FATFS 起始偏移
+    if (!reader || !reader->opened || offset > reader->size) return false;
+    /* 向下对齐到扇区边界，保证后续 f_read 的目标地址和 FATFS 起始偏移
      * 都满足 SDMMC 直接多块 DMA 条件。解析器会从该位置向后找 SOI。 */
     offset &= ~((uint64_t)VIDEO_MJPEG_IO_ALIGN - 1U);
-    /* VFS lseek 的 off_t 是 32 位有符号，2 GiB 之后无法定位。大文件仍可
-     * 从头顺序播放到结尾；进度条拖到该区域会安全失败并提示“无法跳转”。 */
-    if (offset > (uint64_t)INT32_MAX) return false;
-    if (lseek(reader->fd, (off_t)offset, SEEK_SET) < 0) return false;
+    /* FSIZE_t 是 32 位无符号，FAT32 文件最大 4 GiB-1；size 已受该限制，
+     * 这里的检查只防御损坏的 reader 状态。 */
+    if (offset > (uint64_t)UINT32_MAX) return false;
+    if (f_lseek(&reader->fil, (FSIZE_t)offset) != FR_OK) return false;
     reader->read_base = offset;
     reader->next_read = offset;
     reader->read_len = 0;
@@ -329,7 +336,7 @@ uint64_t video_mjpeg_size(const video_mjpeg_t *reader)
 
 bool video_mjpeg_valid(const video_mjpeg_t *reader)
 {
-    return reader && reader->fd >= 0;
+    return reader && reader->opened;
 }
 
 bool video_mjpeg_at_end(const video_mjpeg_t *reader)
@@ -425,14 +432,23 @@ esp_err_t video_mjpeg_read_frame_near(const char *path, uint64_t target,
     if (!path || !out || !out_len || !out_offset || out_cap < 4)
         return ESP_ERR_INVALID_ARG;
 
+    char fat_path[VM_PATH_MAX];
+    if (!to_fatfs_path(path, fat_path, sizeof(fat_path))) return ESP_ERR_NOT_FOUND;
     uint64_t size = 0;
-    if (!stat_regular_size(path, &size)) return ESP_ERR_NOT_FOUND;
+    if (!stat_regular_size(fat_path, &size)) return ESP_ERR_NOT_FOUND;
     if (target >= size) target = size / 2;
     /* 目标文件偏移也向下对齐；多读的几百字节由 SOI 扫描自然跳过。 */
     target &= ~((uint64_t)VIDEO_MJPEG_IO_ALIGN - 1U);
 
-    int fd = open(path, VM_OPEN_FLAGS);
-    if (fd < 0) return ESP_ERR_NOT_FOUND;
+    /* FIL 自带 FF_MAX_SS（本配置 4 KiB）的扇区缓存，放到视频 worker
+     * 16 KiB 栈上会明显抬高最坏栈占用；缩略图只在 worker 内串行使用，
+     * 用 PSRAM 堆对象即可，读完后立即释放。 */
+    FIL *file = heap_caps_malloc(sizeof(*file), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!file) return ESP_ERR_NO_MEM;
+    if (f_open(file, fat_path, FA_READ) != FR_OK) {
+        heap_caps_free(file);
+        return ESP_ERR_NOT_FOUND;
+    }
 
     esp_err_t result = ESP_ERR_NOT_FOUND;
     /* 先取中间附近；失败后退回文件开头，至少给用户一个首帧预览。
@@ -442,19 +458,17 @@ esp_err_t video_mjpeg_read_frame_near(const char *path, uint64_t target,
     const size_t chunk = 64U * 1024U;
     for (unsigned attempt = 0; attempt < 2 && result != ESP_OK; ++attempt) {
         uint64_t read_at = attempts[attempt];
-        /* 32 位 off_t 无法定位 2 GiB 之后的位置；FAT32 文件的中点仍在
-         * 2 GiB 内，超过时直接回退到文件开头取首帧。 */
-        if (read_at >= size || read_at > (uint64_t)INT32_MAX) continue;
-        if (lseek(fd, (off_t)read_at, SEEK_SET) < 0) continue;
+        if (read_at >= size || read_at > (uint64_t)UINT32_MAX) continue;
+        if (f_lseek(file, (FSIZE_t)read_at) != FR_OK) continue;
 
         size_t total = 0;
         size_t start = 0, end = 0;
         while (total < out_cap) {
             size_t want = out_cap - total;
             if (want > chunk) want = chunk;
-            ssize_t n = read_full(fd, out + total, want);
-            if (n <= 0) break;
-            total += (size_t)n;
+            size_t n = read_full(file, out + total, want);
+            if (!n) break;
+            total += n;
             if (find_frame_in_window(out, total, &start, &end)) {
                 size_t len = end - start;
                 if (len > out_cap) break;
@@ -468,6 +482,7 @@ esp_err_t video_mjpeg_read_frame_near(const char *path, uint64_t target,
         }
     }
 
-    close(fd);
+    f_close(file);
+    heap_caps_free(file);
     return result;
 }
