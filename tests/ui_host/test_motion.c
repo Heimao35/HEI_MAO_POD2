@@ -71,6 +71,10 @@ int main(void)
     lv_display_set_flush_cb(display, flush);
     lv_obj_remove_flag(lv_screen_active(), LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 页面尚未创建时恢复调用必须安全忽略（main 只在 UI 创建后调用）。 */
+    ui_motion_settings_restore(true, true);
+    assert(!requested_steps && !requested_wake && request_count == 0);
+
     ui_motion_settings_create(lv_screen_active());
     lv_indev_t *pointer = lv_indev_create();
     lv_indev_set_type(pointer, LV_INDEV_TYPE_POINTER);
@@ -122,6 +126,25 @@ int main(void)
     assert(ui_motion_settings_steps_enabled());
     assert(ui_motion_settings_wake_enabled());
     puts("PASS reopening keeps the RAM switch state");
+
+    /* 开机从 NVS 恢复：程序化设置选中状态不会触发 VALUE_CHANGED，
+     * 每次恢复只允许投递一次合并请求，视觉必须与恢复值一致。 */
+    unsigned requests = request_count;
+    ui_motion_settings_restore(false, false);
+    assert(!ui_motion_settings_steps_enabled() && !ui_motion_settings_wake_enabled());
+    assert(!lv_obj_has_state(s_motion_steps_switch, LV_STATE_CHECKED));
+    assert(!lv_obj_has_state(s_motion_wake_switch, LV_STATE_CHECKED));
+    assert(!requested_steps && !requested_wake && request_count == requests + 1);
+    ui_motion_settings_restore(true, true);
+    assert(ui_motion_settings_steps_enabled() && ui_motion_settings_wake_enabled());
+    assert(lv_obj_has_state(s_motion_steps_switch, LV_STATE_CHECKED));
+    assert(lv_obj_has_state(s_motion_wake_switch, LV_STATE_CHECKED));
+    assert(requested_steps && requested_wake && request_count == requests + 2);
+    /* 恢复后用户点击仍按真实选中状态取反并投递新请求。 */
+    click_obj(pointer, s_motion_wake_switch);
+    assert(ui_motion_settings_steps_enabled() && !ui_motion_settings_wake_enabled());
+    assert(requested_steps && !requested_wake && request_count == requests + 3);
+    puts("PASS boot restore applies persisted switches without extra UI events");
 
     /* Lock-screen entry closes the floating page without touching switches. */
     ui_motion_settings_close_for_lock();

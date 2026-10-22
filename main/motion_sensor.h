@@ -12,8 +12,10 @@ typedef struct {
 } motion_sensor_snapshot_t;
 
 esp_err_t motion_sensor_init(void);
-/* RAM-only request, safe while holding the LVGL lock. Defaults remain off,
- * matching the existing UI. Temperature is sampled independently. */
+/* RAM-only request, safe while holding the LVGL lock and also before
+ * motion_sensor_init() (the worker applies the latest request on first poll).
+ * The UI restores persisted switch intent at boot; without saved settings
+ * both features stay off. Temperature is sampled independently. */
 void motion_sensor_set_features(bool steps, bool wrist_wake);
 void motion_sensor_get_snapshot(motion_sensor_snapshot_t *out);
 /* Independent owner bits: releasing sleep must never release shutdown.

@@ -8,8 +8,11 @@
  * - 与 ui_clock_settings.c 一样，页面放在主屏幕内、初始位于屏幕右侧，
  *   点击设置项后从右侧滑入，左上角箭头从当前位置滑回右侧；
  * - 本页没有滚轮、定时器、任务、文件或 I2C 访问；
- * - 两个开关维护本次运行的选择，并向 BMI270 worker 投递 RAM 请求；
- *   所有硬件配置在 LVGL 锁外完成，不修改本页的布局、动画或触摸逻辑。
+ * - 两个开关维护用户意图，并向 BMI270 worker 投递 RAM 请求；
+ *   所有硬件配置在 LVGL 锁外完成，不修改本页的布局、动画或触摸逻辑；
+ * - 开关值接入现有 player_settings 快照：player_settings_capture() 在
+ *   电源 worker 的 LVGL 锁内读取下面两个 RAM 标志，经 3 秒合并后写入
+ *   NVS；本页自身不写 Flash。开机由 main 调用 restore() 恢复。
  */
 
 #include "ui_motion_settings.h"
@@ -37,9 +40,9 @@ static lv_obj_t *s_motion_steps_switch;
 static lv_obj_t *s_motion_wake_switch;
 static bool s_motion_visible;
 
-/* 开关的 RAM 状态。默认关闭，只有用户打开开关才请求传感器功能。
- * UI 状态表示用户意图，不代表芯片已通过初始化/通信验证；
- * 若需要开机保持，应在传感器/NVS 模块中统一持久化，而不是让 UI 直接写 Flash。 */
+/* 开关的 RAM 状态（用户意图）。创建时默认关闭；开机由 restore() 套用
+ * NVS 快照，之后用户点击立即更新。状态不代表芯片已通过初始化/通信验证，
+ * 持久化由既有 player_settings 快照链路统一完成，UI 不直接写 Flash。 */
 static bool s_motion_steps_enabled;
 static bool s_motion_wake_enabled;
 
@@ -83,7 +86,9 @@ static void slide_out(void)
  * user_data 为 0 表示计步开关，1 表示抬手亮屏开关。开关自身由 LVGL
  * 的 CHECKABLE 行为维护选中状态，这里只读取结果，避免手动取反造成
  * 与动画/重复点击不一致。这里只向 BMI270 worker 投递原子 RAM 请求，
- * 真正的 I2C 配置由传感器任务在 LVGL 锁外完成。
+ * 真正的 I2C 配置由传感器任务在 LVGL 锁外完成。保存沿用现有设置链路：
+ * player_settings_capture() 随后读取这两个 RAM 标志，由电源 worker 在
+ * 停止调整 3 秒后合并写入 NVS，因此本回调不直接访问 Flash。
  */
 static void switch_changed_cb(lv_event_t *e)
 {
@@ -204,11 +209,35 @@ void ui_motion_settings_create(lv_obj_t *parent)
     create_row(s_motion_page, ROW_FIRST_Y, "计步", &s_motion_steps_switch, 0);
     create_row(s_motion_page, ROW_FIRST_Y + ROW_GAP, "抬手亮屏", &s_motion_wake_switch, 1);
 
-    /* 保持原有默认关闭和本次运行的 RAM 设置策略；不在创建页面时发 I2C
-     * 或 NVS 操作。后台初始化完成也不会擅自把用户开关改为打开。 */
+    /* 创建时先按“未选中”初始化；main 在 ui_manager_init() 之后、同一
+     * LVGL 锁内调用 ui_motion_settings_restore() 套用 NVS 中保存的选择。
+     * 创建页面本身不发 I2C/Flash；传感器离线也不会擅自把用户开关改成关闭。 */
     s_motion_steps_enabled = false;
     s_motion_wake_enabled = false;
     s_motion_visible = false;
+}
+
+void ui_motion_settings_restore(bool steps, bool wake)
+{
+    /* 防御：页面尚未创建时没有可更新的对象；生产的开机顺序由 main 保证
+     * （ui_manager_init() 之后立即调用），不会走到这个分支。 */
+    if (!s_motion_page) return;
+    s_motion_steps_enabled = steps;
+    s_motion_wake_enabled = wake;
+    /* 程序化设置选中状态不会触发 LV_EVENT_VALUE_CHANGED（该事件只由
+     * 用户交互产生），因此不会重复进入 switch_changed_cb。开关旋钮的
+     * 位置/过渡由 LVGL 主题根据状态自动处理，不改本页布局。 */
+    if (steps) lv_obj_add_state(s_motion_steps_switch, LV_STATE_CHECKED);
+    else lv_obj_remove_state(s_motion_steps_switch, LV_STATE_CHECKED);
+    if (wake) lv_obj_add_state(s_motion_wake_switch, LV_STATE_CHECKED);
+    else lv_obj_remove_state(s_motion_wake_switch, LV_STATE_CHECKED);
+    /* 与用户关闭计步的行为一致：恢复为关闭时立即清空锁屏步数，不能在
+     * 下次传感器轮询前显示上次运行的旧数字。 */
+    if (!steps) ui_lockscreen_set_steps(false, 0);
+    /* 传感器 worker 的启动晚于 UI（见 main），此调用只写原子 RAM 请求；
+     * 没有 worker 时通知是空操作，worker 首次轮询会读取该请求并配置芯片。
+     * 抬起亮屏同理：只有芯片成功配置后 motion_sensor_wake_enabled() 才为真。 */
+    motion_sensor_set_features(steps, wake);
 }
 
 void ui_motion_settings_show(void)

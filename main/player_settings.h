@@ -9,6 +9,10 @@
 typedef struct {
     uint8_t brightness, volume;
     bool muted, auto_brightness;
+    /* 姿态感应设置页两个开关的用户意图。只保存“用户是否希望启用”，
+     * 不保存传感器在线状态、当天步数或芯片配置；开机后由 UI 恢复开关
+     * 视觉并向 BMI270 worker 重新投递请求。 */
+    bool motion_steps, motion_wake;
     char song_folder[MUSIC_NAME_MAX];
     char song_audio[MUSIC_NAME_MAX];
 } player_settings_t;
@@ -17,6 +21,10 @@ typedef struct {
 esp_err_t player_settings_init(void);
 /* 下列 RAM 接口须持有 LVGL 锁；绝不进行 Flash/SD I/O。 */
 void player_settings_restore_ui(void);
+/* 读取 NVS 快照中的姿态开关意图；仅访问 RAM，不做 Flash I/O。
+ * 必须在 ui_manager_init() 之后、持有 LVGL 锁时调用，再交给
+ * ui_motion_settings_restore() 套用到开关视觉与传感器请求。 */
+void player_settings_get_motion(bool *steps, bool *wake);
 void player_settings_capture(player_settings_t *out);
 void player_settings_get_song(char *folder, char *audio);
 void player_settings_set_song(const music_item_t *item);

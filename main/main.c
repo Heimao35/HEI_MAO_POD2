@@ -26,6 +26,7 @@
 #include "ui_manager.h"
 #include "ui_adj_panel.h"
 #include "ui_lockscreen.h"
+#include "ui_motion_settings.h"
 #include "sd_card.h"
 #include "lock_animation.h"
 #include "pmic_axp2101.h"
@@ -355,6 +356,13 @@ void app_main(void)
     ui_boot_set_progress(70,"Creating interface...");
     /* 初始化自定义 UI 系统（替换原有 demo） */
     ui_manager_init();
+    /* 姿态感应两个开关随其他用户设置一起从 NVS 恢复：页面已在
+     * ui_manager_init() 中创建，此处仍持同一把 LVGL 锁。只恢复开关意图
+     * 并向传感器任务投递 RAM 请求；真正的 I2C 配置由稍后启动的 BMI270
+     * worker 在 LVGL 锁外完成，未保存值则保持默认关闭。 */
+    bool motion_steps = false, motion_wake = false;
+    player_settings_get_motion(&motion_steps, &motion_wake);
+    ui_motion_settings_restore(motion_steps, motion_wake);
     ui_adj_panel_update(); /* 同步恢复的音量/亮度及静音/自动亮度图标。 */
 
     /* 注册亮度/音量回调：UI只投递请求，显示/音频任务分别写硬件。 */

@@ -1,4 +1,5 @@
 #include "player_settings.h"
+#include "ui/ui_motion_settings.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include <string.h>
@@ -39,10 +40,14 @@ static size_t encode(const player_settings_t *v, uint8_t *b)
     memcpy(b, "HMP2", 4); put16(b+4, SETTINGS_VERSION);
     size_t n = SETTINGS_HEADER;
     uint8_t muted=v->muted, automatic=v->auto_brightness;
+    uint8_t motion_steps=v->motion_steps, motion_wake=v->motion_wake;
     n=add_field(b,n,1,&v->brightness,1); n=add_field(b,n,2,&v->volume,1);
     n=add_field(b,n,3,&muted,1); n=add_field(b,n,4,&automatic,1);
     n=add_field(b,n,5,v->song_folder,(uint16_t)strlen(v->song_folder));
     n=add_field(b,n,6,v->song_audio,(uint16_t)strlen(v->song_audio));
+    /* 7/8 为新增的可选单字节开关字段。旧固件按未知 ID 跳过，因此不需要
+     * 升级版本；旧数据缺少这两个字段时解码默认值保持关闭。 */
+    n=add_field(b,n,7,&motion_steps,1); n=add_field(b,n,8,&motion_wake,1);
     put16(b+6,n); put32(b+8,crc32(b+SETTINGS_HEADER,n-SETTINGS_HEADER));
     return n;
 }
@@ -58,7 +63,7 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
         if (n-off<3) return ESP_ERR_INVALID_SIZE;
         uint8_t id=b[off++]; uint16_t len=get16(b+off); off+=2;
         if (len>n-off) return ESP_ERR_INVALID_SIZE;
-        if (id>=1 && id<=6) {
+        if (id>=1 && id<=8) {
             if (seen & (1U<<id)) return ESP_ERR_INVALID_RESPONSE;
             seen |= 1U<<id;
         }
@@ -75,6 +80,11 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
             if (len>=MUSIC_NAME_MAX || memchr(b+off,0,len)) return ESP_ERR_INVALID_SIZE;
             char *dest=id==5?tmp.song_folder:tmp.song_audio;
             memcpy(dest,b+off,len); dest[len]=0;
+        } else if (id==7 || id==8) {
+            /* 姿态开关只接受单字节 0/1，避免损坏数据把任意值当成真。 */
+            if (len!=1) return ESP_ERR_INVALID_SIZE;
+            if (b[off]>1) return ESP_ERR_INVALID_ARG;
+            if (id==7) tmp.motion_steps=b[off]; else tmp.motion_wake=b[off];
         }
         off+=len;
     }
@@ -109,6 +119,12 @@ void player_settings_restore_ui(void)
     st->brightness=s_ram.brightness; st->manual_brightness=s_ram.brightness; st->volume=s_ram.volume;
     st->muted=s_ram.muted; st->auto_brightness=s_ram.auto_brightness;
 }
+void player_settings_get_motion(bool *steps, bool *wake)
+{
+    /* 只读 RAM 快照；调用方随后把值套用到姿态页开关。 */
+    if (steps) *steps=s_ram.motion_steps;
+    if (wake) *wake=s_ram.motion_wake;
+}
 void player_settings_capture(player_settings_t *out)
 {
     ui_device_state_t *st=ui_get_device_state();
@@ -117,6 +133,12 @@ void player_settings_capture(player_settings_t *out)
      * 开机先用手动值亮屏，自动模式恢复后再由新鲜ADC数据平滑接管。 */
     s_ram.brightness=st->manual_brightness<5?5:st->manual_brightness;
     s_ram.volume=st->volume; s_ram.muted=st->muted; s_ram.auto_brightness=st->auto_brightness;
+    /* 姿态开关由设置子页维护用户意图，这里在现有 LVGL 锁快照中一并读取：
+     * 不新增任务/定时器，也不让 UI 直接访问 Flash；开关变化会像音量/亮度
+     * 一样进入电源 worker 的 3 秒合并保存。UI 尚未创建时取到默认关闭，
+     * 但生产路径中 capture 只在 ui_manager_init() 之后才被调用。 */
+    s_ram.motion_steps=ui_motion_settings_steps_enabled();
+    s_ram.motion_wake=ui_motion_settings_wake_enabled();
     *out=s_ram;
 }
 void player_settings_get_song(char *folder, char *audio)
@@ -130,6 +152,7 @@ bool player_settings_equal(const player_settings_t *a, const player_settings_t *
 {
     return a->brightness==b->brightness && a->volume==b->volume &&
         a->muted==b->muted && a->auto_brightness==b->auto_brightness &&
+        a->motion_steps==b->motion_steps && a->motion_wake==b->motion_wake &&
         !strcmp(a->song_folder,b->song_folder) && !strcmp(a->song_audio,b->song_audio);
 }
 esp_err_t player_settings_save(const player_settings_t *v)
