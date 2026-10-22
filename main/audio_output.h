@@ -23,3 +23,26 @@ bool audio_output_quiesce(bool pause);
 
 /* Light-sleep独立持有者；与关机屏障互不撤销。 */
 bool audio_output_sleep(bool pause);
+
+/* ------------------------------------------------------------------ */
+/* 视频 PCM 模式：与音乐共用I2S/DAC/ring，不新建通道、不做解码。
+ * 进入前调用方必须已暂停音乐（video_player 已执行）。open 同步等待音频
+ * worker 配置I2S，失败时视频可静音继续；write 是单生产者接口，视频
+ * worker 独占调用；flush 丢弃ring并把音频播放时间归零（seek用）。
+ * open/write/flush/close 均不得在LVGL锁内调用。 */
+typedef struct {
+    uint32_t sample_rate; /* 与音乐相同的支持列表 */
+    uint8_t channels;     /* 1/2 */
+    uint8_t bits;         /* 16/24/32 */
+} audio_output_pcm_cfg_t;
+
+esp_err_t audio_output_video_open(const audio_output_pcm_cfg_t *cfg);
+void audio_output_video_close(void);
+void audio_output_video_play(bool play);
+void audio_output_video_flush(void);
+void audio_output_video_eof(void);
+size_t audio_output_video_write(const void *pcm,size_t frames,uint32_t timeout_ms);
+/* DMA已消费的真实音频帧对应时间；flush后从0开始。 */
+uint64_t audio_output_video_time_us(void);
+bool audio_output_video_started(void);
+bool audio_output_video_play_requested(void);

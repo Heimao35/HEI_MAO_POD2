@@ -16,6 +16,8 @@
 
 #include "video_player.h"
 #include "video_mjpeg.h"
+#include "video_seek_index.h"
+#include "video_wav.h"
 #include "jpeg_codec.h"
 #include "sd_card.h"
 #include "music_player_adapter.h"
@@ -45,6 +47,12 @@ static const char *TAG = "video_player";
 #define VIDEO_TASK_STACK  16384
 #define VIDEO_TASK_PRIO   5
 #define VIDEO_SD_LOCK_MS  1000
+/* WAV 每次读取的原始 PCM 大小；写入 ring 时 audio_output 负责转成
+ * 32bit 双声道槽。16 KiB 在 48kHz/16bit 立体声下约 85ms。 */
+#define VIDEO_AUDIO_CHUNK_BYTES (16U * 1024U)
+/* 音频长时间未启动（DAC 未就绪等）后退回原有 esp_timer 节拍，避免画面
+ * 永远停在首帧。正常预缓冲只需约 160ms。 */
+#define VIDEO_AUDIO_START_TIMEOUT_MS 3000
 
 typedef enum {
     CMD_SCAN = 1,
@@ -87,6 +95,10 @@ static atomic_uint s_page_token;
 
 /* 以下变量只由 worker 访问。 */
 static video_mjpeg_t *s_reader;
+/* 可选 .vix 帧位置索引：存在时 seek 按“时间→帧→偏移”精确定位，
+ * 进度也改为时间/帧比例；缺失时保持原字节比例行为。 */
+static video_seek_index_t *s_seek_index;
+static uint32_t s_frame_pos;         /* 已从文件消费的帧数（seek后为目标帧号） */
 static uint8_t *s_frames[2];
 static uint8_t s_frame_index;
 static uint32_t s_frame_seq;
@@ -105,6 +117,21 @@ static bool s_library_valid;
 static uint8_t *s_thumb_jpeg;
 static uint8_t *s_thumb_decode;
 static uint8_t *s_thumb_pixels[VIDEO_PAGE_SIZE];
+
+/* 同名 WAV 音轨。s_audio_active 表示 WAV 已打开且 audio_output 已切到
+ * 视频 PCM 模式；此后视频帧节拍改由音频 DMA 时间驱动。 */
+static video_wav_t *s_wav;
+static bool s_audio_active;              /* worker-only */
+/* 供其他任务查询的镜像；电源/锁屏屏障不能读取非原子 worker 状态。 */
+static atomic_bool s_audio_open_flag;
+static bool s_audio_eof;
+static uint64_t s_next_frame_us;     /* 下一帧相对音频起点的 PTS */
+static uint8_t *s_audio_buf;         /* PSRAM 原始 PCM 暂存 */
+static size_t s_audio_pending_frames;/* 写入ring未完成的尾部（帧） */
+static size_t s_audio_pending_off;
+static TickType_t s_audio_wait_at;   /* 等待音频TX启动的起点 */
+static uint64_t s_audio_last_us;     /* 上次观测到的音频时间，用于检测音轨提前结束 */
+static TickType_t s_audio_last_at;
 
 /* 5 秒一次的解码诊断。它只统计 worker 自己观测到的读/解码耗时和丢帧，
  * 不是整机 CPU 占用，也不代表面板实际扫描帧率。 */
@@ -187,6 +214,14 @@ static void publish_frame(const uint8_t *pixels)
 static void update_progress(void)
 {
     if (!s_reader) return;
+    if (s_seek_index) {
+        /* 有索引时进度按帧时间，而不是文件字节：变码率视频的字节比例
+         * 与时间比例不一致，用字节会让拖动后的滑块与实际时间错开。 */
+        uint32_t total = video_seek_index_total_frames(s_seek_index);
+        uint32_t per_mille = total ? (uint32_t)((uint64_t)s_frame_pos * 1000U / total) : 0;
+        atomic_store(&s_progress, per_mille > 1000 ? 1000 : per_mille);
+        return;
+    }
     uint64_t size = video_mjpeg_size(s_reader);
     uint64_t pos = video_mjpeg_tell(s_reader);
     uint32_t per_mille = size ? (uint32_t)(pos * 1000U / size) : 0;
@@ -306,6 +341,11 @@ static bool decode_frame(const uint8_t *jpeg, size_t bytes, uint8_t *out)
 
 static void close_reader(void)
 {
+    /* 索引已在打开时全部读入 PSRAM，FILE 早已关闭；这里只释放内存。 */
+    if (s_seek_index) {
+        video_seek_index_close(s_seek_index);
+        s_seek_index = NULL;
+    }
     video_mjpeg_t *reader = s_reader;
     if (!reader) {
         atomic_store(&s_reader_open, false);
@@ -324,6 +364,131 @@ static void close_reader(void)
     atomic_store(&s_reader_open, false);
 }
 
+/* ------------------------------------------------------------------------- */
+/* 同名 WAV 音轨。音频生产者始终是视频 worker，因此 ring 维持单生产者/
+ * DMA 单消费者的约束；音频 worker 只负责 I2S/DAC/音量与 TX 启停。 */
+
+static void close_wav_reader(void)
+{
+    video_wav_t *wav = s_wav;
+    if (!wav) return;
+    if (sd_card_io_lock(VIDEO_SD_LOCK_MS)) {
+        video_wav_close(wav);
+        sd_card_io_unlock();
+    } else {
+        video_wav_detach(wav);
+        video_wav_close(wav);
+    }
+    s_wav = NULL;
+}
+
+static void close_audio_session(void)
+{
+    /* 先让音频 worker 停 TX/归还通道，再关闭 WAV；顺序不能反，否则阻塞
+     * 在 ring 上的推送可能继续访问已释放的文件。 */
+    if (s_audio_active) {
+        audio_output_video_close();
+        s_audio_active = false;
+    }
+    atomic_store(&s_audio_open_flag, false);
+    close_wav_reader();
+    s_audio_eof = false;
+    s_audio_pending_frames = s_audio_pending_off = 0;
+    heap_caps_free(s_audio_buf);
+    s_audio_buf = NULL;
+}
+
+/* 打开同名 WAV 并把 audio_output 切到视频 PCM 模式。
+ * 没有音轨、格式不支持或 DAC/通道配置失败时返回 false，视频静音播放。 */
+static bool open_audio_session(const video_item_t *item)
+{
+    char path[VIDEO_NAME_MAX + 80];
+    if (video_library_make_audio_path(item, path, sizeof(path)) != ESP_OK)
+        return false;
+    if (!s_audio_buf) {
+        s_audio_buf = heap_caps_malloc(VIDEO_AUDIO_CHUNK_BYTES,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_audio_buf) return false;
+    }
+    if (!sd_card_io_lock(VIDEO_SD_LOCK_MS)) return false;
+    video_wav_t *wav = NULL;
+    esp_err_t ret = video_wav_open(&wav, path);
+    sd_card_io_unlock();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Audio track unavailable: %s", esp_err_to_name(ret));
+        heap_caps_free(s_audio_buf);
+        s_audio_buf = NULL;
+        return false;
+    }
+
+    audio_output_pcm_cfg_t cfg = {
+        .sample_rate = video_wav_rate(wav),
+        .channels = video_wav_channels(wav),
+        .bits = video_wav_bits(wav),
+    };
+    ret = audio_output_video_open(&cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Video audio unavailable: %s", esp_err_to_name(ret));
+        if (sd_card_io_lock(VIDEO_SD_LOCK_MS)) {
+            video_wav_close(wav);
+            sd_card_io_unlock();
+        } else {
+            video_wav_detach(wav);
+            video_wav_close(wav);
+        }
+        heap_caps_free(s_audio_buf);
+        s_audio_buf = NULL;
+        return false;
+    }
+
+    s_wav = wav;
+    s_audio_active = true;
+    atomic_store(&s_audio_open_flag, true);
+    s_audio_eof = false;
+    s_audio_pending_frames = s_audio_pending_off = 0;
+    s_audio_wait_at = s_audio_last_at = xTaskGetTickCount();
+    s_audio_last_us = 0;
+    ESP_LOGI(TAG, "Video audio: %luHz %ubit %uch, %llu frames",
+             (unsigned long)video_wav_rate(wav), video_wav_bits(wav),
+             video_wav_channels(wav), (unsigned long long)video_wav_frames(wav));
+    return true;
+}
+
+/* 从 WAV 读一块并推入 ring。ring 满时保留未写入的尾部，下一次继续，
+ * 绝不丢帧（丢音频会让音画逐渐漂移）。 */
+static void feed_audio(void)
+{
+    if (!s_audio_active || s_audio_eof) return;
+    unsigned frame_bytes = video_wav_channels(s_wav) * video_wav_bits(s_wav) / 8U;
+    if (!frame_bytes) return;
+
+    /* 0 超时：ring 满时立即返回，绝不阻塞视频 worker 的帧节拍；
+     * 未写入的尾部保留到下一轮继续。 */
+    if (s_audio_pending_frames) {
+        size_t n = audio_output_video_write(
+            s_audio_buf + s_audio_pending_off * frame_bytes,
+            s_audio_pending_frames, 0);
+        s_audio_pending_off += n;
+        s_audio_pending_frames -= n;
+        if (s_audio_pending_frames) return;
+        s_audio_pending_off = 0;
+    }
+
+    size_t chunk = VIDEO_AUDIO_CHUNK_BYTES / frame_bytes;
+    if (!chunk) return;
+    if (!sd_card_io_lock(VIDEO_SD_LOCK_MS)) return;
+    size_t frames = video_wav_read(s_wav, s_audio_buf, chunk);
+    sd_card_io_unlock();
+    if (!frames) {
+        s_audio_eof = true;
+        audio_output_video_eof();
+        return;
+    }
+    size_t n = audio_output_video_write(s_audio_buf, frames, 0);
+    s_audio_pending_off = n;
+    s_audio_pending_frames = frames - n;
+}
+
 static uint32_t frame_period_from_name(const char *name)
 {
     uint8_t fps = video_mjpeg_fps_from_name(name);
@@ -332,7 +497,8 @@ static uint32_t frame_period_from_name(const char *name)
     return 1000000U / 60U;
 }
 
-static esp_err_t open_reader(uint32_t index, char *err, size_t err_size)
+static esp_err_t open_reader(uint32_t index, video_item_t *item_out,
+                             char *err, size_t err_size)
 {
     video_item_t item;
     char path[VIDEO_NAME_MAX + 80];
@@ -350,12 +516,33 @@ static esp_err_t open_reader(uint32_t index, char *err, size_t err_size)
         return ESP_ERR_TIMEOUT;
     }
     esp_err_t ret = video_library_get_item(index, &item);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        /* 索引来自旧固件布局；让上层按“列表过期”处理并重新扫描。 */
+        sd_card_io_unlock();
+        snprintf(err, err_size, "视频列表已过期，请重新扫描");
+        return ret;
+    }
     if (ret == ESP_OK) {
         s_frame_us = frame_period_from_name(item.name);
-        ret = video_library_make_path_name(item.name, path, sizeof(path));
+        ret = video_library_make_video_path(&item, path, sizeof(path));
     }
     if (ret == ESP_OK) ret = video_mjpeg_open(&s_reader, path);
+    if (ret == ESP_OK) {
+        /* 可选 .vix：只有文件夹布局带索引。缺失/损坏/与文件大小不符时
+         * 保持原字节比例 seek，不影响播放。 */
+        char index_path[VIDEO_NAME_MAX + 80];
+        video_seek_index_t *seek_index = NULL;
+        if (video_library_make_index_path(&item, index_path, sizeof(index_path)) == ESP_OK &&
+            video_seek_index_open(&seek_index, index_path,
+                                  (uint32_t)video_mjpeg_size(s_reader)) == ESP_OK) {
+            s_seek_index = seek_index;
+            s_frame_us = video_seek_index_frame_us(seek_index);
+            s_frame_pos = 0;
+        }
+    }
     sd_card_io_unlock();
+
+    if (ret == ESP_OK && item_out) *item_out = item;
 
     if (ret != ESP_OK) {
         snprintf(err, err_size, "无法打开视频文件");
@@ -388,6 +575,7 @@ static bool read_frame(const uint8_t **frame, size_t *bytes, uint64_t *offset)
     if (ok) {
         ++s_diag_reads;
         s_diag_bytes += *bytes;
+        if (s_seek_index) ++s_frame_pos;
     }
     return ok;
 }
@@ -413,15 +601,23 @@ static bool pause_music_for_video(void)
     s_music_paused = true;
     /* 等媒体 worker 完成当前曲库扫描/封面读取，避免它和视频每帧争 SD 锁。
      * 3 秒仍不空闲时继续，至少音频已经停止；日志会暴露剩余占用。 */
+    bool paused = false;
     for (unsigned i = 0; i < 150; ++i) {
         if (atomic_load(&s_cancel)) return false;
         if (music_player_adapter_pause(true)) {
+            paused = true;
             if (i) ESP_LOGI(TAG, "Music paused after %u ms", i * 20U);
-            return true;
+            break;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-    ESP_LOGW(TAG, "Music media worker still busy after 3s; video read may contend for SD");
+    if (!paused)
+        ESP_LOGW(TAG, "Music media worker still busy after 3s; video read may contend for SD");
+    /* 媒体暂停会同时持有 audio_output 的关机/Light-sleep 静默屏障；视频
+     * 需要复用同一个 I2S/DAC，必须只释放音频屏障，否则音频 worker 永远
+     * 不会处理视频 PCM 请求（表现为 open 超时、视频无声）。
+     * MEDIA_PAUSED 仍保持，音乐播放意图已置 false，不会因此恢复出声。 */
+    audio_output_quiesce(false);
     return true;
 }
 
@@ -470,13 +666,13 @@ static void downscale_thumbnail(const uint8_t *src, uint8_t *dst)
     }
 }
 
-static bool make_thumbnail(uint32_t slot, uint32_t index, const char *name,
+static bool make_thumbnail(uint32_t slot, uint32_t index, const video_item_t *item,
                            uint32_t file_size, uint32_t generation, uint32_t token)
 {
     if (slot >= VIDEO_PAGE_SIZE || !s_thumb_jpeg || !s_thumb_decode ||
-        !s_thumb_pixels[slot]) return false;
+        !s_thumb_pixels[slot] || !item) return false;
     char path[VIDEO_NAME_MAX + 80];
-    if (video_library_make_path_name(name, path, sizeof(path)) != ESP_OK) return false;
+    if (video_library_make_video_path(item, path, sizeof(path)) != ESP_OK) return false;
 
     size_t jpeg_bytes = 0;
     uint64_t jpeg_offset = 0;
@@ -543,6 +739,12 @@ static void load_page(uint32_t first)
     esp_err_t ret = video_library_get_page(first, &page);
     uint32_t generation = sd_card_get_generation();
     sd_card_io_unlock();
+    if (ret == ESP_ERR_INVALID_STATE) {
+        /* 旧固件留下的索引布局/截断缓存：重新扫描，成功后会重新请求本页。 */
+        s_library_valid = false;
+        scan_library();
+        return;
+    }
     if (ret != ESP_OK) {
         publish_status("读取视频列表失败");
         return;
@@ -559,7 +761,7 @@ static void load_page(uint32_t first)
     for (uint32_t slot = 0; slot < page.count; ++slot) {
         if (atomic_load(&s_cancel) || atomic_load(&s_page_token) != token ||
             priority_command_pending()) break;
-        make_thumbnail(slot, first + slot, page.names[slot], page.sizes[slot],
+        make_thumbnail(slot, first + slot, &page.items[slot], page.sizes[slot],
                        generation, token);
     }
 }
@@ -612,6 +814,7 @@ static void reset_playback_flags(void)
 static void stop_session(bool release_all, bool notify_idle)
 {
     ++s_page_token; /* 让正在进行的缩略图循环尽快退出 */
+    close_audio_session();
     close_reader();
     atomic_store(&s_playing_flag, false);
     reset_playback_flags();
@@ -639,10 +842,12 @@ static esp_err_t prepare_play(uint32_t index, char *err, size_t err_size)
     }
 
     ++s_page_token;
+    close_audio_session();
     if (s_reader) close_reader();
     reset_playback_flags();
     video_diag_reset();
     s_frame_us = VIDEO_FRAME_US_DEFAULT;
+    s_frame_pos = 0;
     atomic_store(&s_progress, 0);
     s_play_index = index;
     atomic_store(&s_playing_flag, true);
@@ -660,7 +865,10 @@ static esp_err_t prepare_play(uint32_t index, char *err, size_t err_size)
         snprintf(err, err_size, "帧缓冲内存不足");
         return ESP_ERR_NO_MEM;
     }
-    if (open_reader(index, err, err_size) != ESP_OK) return ESP_FAIL;
+    video_item_t item;
+    if (open_reader(index, &item, err, err_size) != ESP_OK) return ESP_FAIL;
+    /* 同名 WAV 是可选音轨：打开/配置失败只记录日志，视频继续静音播放。 */
+    if (item.has_audio) open_audio_session(&item);
     if (atomic_load(&s_cancel)) {
         snprintf(err, err_size, "播放已取消");
         return ESP_ERR_INVALID_STATE;
@@ -687,12 +895,16 @@ static esp_err_t prepare_play(uint32_t index, char *err, size_t err_size)
     publish_frame(s_frames[s_frame_index]);
     update_progress();
     publish_state(VIDEO_STATE_PLAYING, index, NULL);
+    /* 有音轨时首帧已在上面显示，下一帧的PTS是1个帧周期；音频时间从0
+     * 开始时才会继续推进。无音轨仍使用原有esp_timer节拍。 */
+    s_next_frame_us = s_audio_active ? s_frame_us : 0;
     s_deadline = esp_timer_get_time() + s_frame_us;
     return ESP_OK;
 }
 
 static void fail_playback(const char *message)
 {
+    close_audio_session();
     close_reader();
     atomic_store(&s_playing_flag, false);
     s_error = true;
@@ -710,6 +922,7 @@ static void start_play(uint32_t index)
     if (ret == ESP_OK) return;
     if (atomic_load(&s_cancel)) {
         /* 被锁屏/关机取消：不显示错误页，交给排队的 STOP/RELEASE 清理。 */
+        close_audio_session();
         close_reader();
         atomic_store(&s_playing_flag, false);
         free_frames();
@@ -728,6 +941,7 @@ static void decode_one_paused_frame(void)
         if (s_reader && video_mjpeg_at_end(s_reader)) {
             /* 拖到 100% 时没有下一帧是正常结束，不显示错误页。 */
             s_ended = true;
+            audio_output_video_play(false);
             atomic_store(&s_playing_flag, false);
             atomic_store(&s_progress, 1000);
             publish_state(VIDEO_STATE_ENDED, s_play_index, NULL);
@@ -744,17 +958,93 @@ static void decode_one_paused_frame(void)
     s_frame_index ^= 1;
     publish_frame(s_frames[s_frame_index]);
     update_progress();
+    /* 暂停态拖动后显示的是PTS=0的目标帧，恢复时从下一个帧周期继续。 */
+    if (s_audio_active) s_next_frame_us = s_frame_us;
+}
+
+/* 把 WAV 定位到指定绝对时间并清空音频 ring；失败时本次会话改为静音，
+ * 避免继续使用错误的时间轴。 */
+static void seek_audio_to_time_us(uint64_t time_us)
+{
+    if (!s_audio_active) return;
+    uint64_t rate = video_wav_rate(s_wav);
+    uint64_t frames = video_wav_frames(s_wav);
+    uint64_t frame = rate ? time_us * rate / 1000000ULL : 0;
+    if (frames && frame >= frames) frame = frames - 1;
+    bool ok = false;
+    if (sd_card_io_lock(VIDEO_SD_LOCK_MS)) {
+        ok = video_wav_seek(s_wav, frame);
+        sd_card_io_unlock();
+    }
+    if (!ok) {
+        ESP_LOGW(TAG, "WAV seek failed; continuing without audio");
+        close_audio_session();
+        return;
+    }
+    audio_output_video_flush();
+    s_audio_eof = false;
+    s_audio_pending_frames = s_audio_pending_off = 0;
+    s_audio_wait_at = s_audio_last_at = xTaskGetTickCount();
+    s_audio_last_us = 0;
+    s_next_frame_us = 0;
 }
 
 static bool seek_to(uint16_t per_mille)
 {
     if (!s_reader) return false;
+    if (per_mille > 1000) per_mille = 1000;
+
+    /* 有 .vix：按帧号精确定位。检查点直接给出字节偏移，随后顺序解析
+     * 到目标帧（最多一个检查点间隔），音轨按同一帧时间定位，因此拖动
+     * 后音画仍然对齐，与文件码率波动无关。 */
+    if (s_seek_index) {
+        uint32_t total = video_seek_index_total_frames(s_seek_index);
+        uint32_t frame_us = video_seek_index_frame_us(s_seek_index);
+        uint32_t target_frame = 0, checkpoint = 0;
+        uint64_t offset = 0;
+        bool ok = total && frame_us;
+        if (ok) {
+            target_frame = (uint32_t)((uint64_t)total * per_mille / 1000U);
+            if (target_frame >= total) target_frame = total - 1;
+            ok = video_seek_index_lookup(s_seek_index, target_frame,
+                                         &checkpoint, &offset) &&
+                 seek_reader(offset);
+        }
+        /* 索引与文件内容不一致（时间戳正确但偏移不符）时顺序解析会失败；
+         * 此时退回字节比例定位，避免整个拖动失败。 */
+        for (uint32_t f = checkpoint; ok && f < target_frame; ++f) {
+            const uint8_t *frame = NULL;
+            size_t bytes = 0;
+            uint64_t frame_offset = 0;
+            ok = read_frame(&frame, &bytes, &frame_offset);
+        }
+        if (ok) {
+            s_frame_pos = target_frame;
+            s_skip_next = false;
+            seek_audio_to_time_us((uint64_t)target_frame * frame_us);
+            uint32_t progress = (uint32_t)((uint64_t)target_frame * 1000U / total);
+            atomic_store(&s_progress, progress > 1000 ? 1000 : progress);
+            return true;
+        }
+        ESP_LOGW(TAG, "Seek index does not match the video; using byte fraction");
+    }
+
+    /* 无索引：保持原字节比例定位。裸 MJPEG 是变码率，音轨按同一字节
+     * 比例换算时间，码率波动大的文件拖动后可能偏移；连续播放期间仍以
+     * 音频 DMA 时间为主时钟，不存在累积漂移。 */
     uint64_t size = video_mjpeg_size(s_reader);
     uint64_t target = size ? (size * (uint64_t)per_mille / 1000U) : 0;
     if (target >= size) target = size ? size - 1 : 0;
     if (!seek_reader(target)) return false;
     s_skip_next = false;
-    atomic_store(&s_progress, per_mille > 1000 ? 1000 : per_mille);
+    if (s_audio_active) {
+        uint64_t frames = video_wav_frames(s_wav);
+        uint64_t rate = video_wav_rate(s_wav);
+        uint64_t time_us = (frames && rate)
+            ? (uint64_t)per_mille * frames * 1000000ULL / (1000ULL * rate) : 0;
+        seek_audio_to_time_us(time_us);
+    }
+    atomic_store(&s_progress, per_mille);
     return true;
 }
 
@@ -773,6 +1063,10 @@ static void resume_playback(void)
     video_diag_reset(); /* 暂停时长不计入恢复后的 fps */
     s_deadline = esp_timer_get_time() + s_frame_us;
     s_skip_next = false;
+    if (s_audio_active) {
+        s_audio_wait_at = xTaskGetTickCount();
+        audio_output_video_play(true);
+    }
     publish_state(VIDEO_STATE_PLAYING, s_play_index, NULL);
 }
 
@@ -829,12 +1123,58 @@ static void frame_step(void)
 {
     if (!atomic_load(&s_playing_flag) || s_paused || s_ended || s_error) return;
 
+    bool audio = s_audio_active;
+    uint64_t media_us = 0;
     int64_t now = esp_timer_get_time();
-    if (now < s_deadline) return;
-    if (now > s_deadline + s_frame_us) {
-        /* 已经落后超过一帧：丢掉下一帧的解码，只保留时间轴。 */
-        s_skip_next = true;
-        s_deadline = now;
+    if (audio) {
+        if (!audio_output_video_started()) {
+            /* 预缓冲/DAC 尚未就绪：画面停在当前帧。音频层因拔耳机等主动
+             * 暂停时同步界面状态；长期无法启动则退回计时节拍静音播放。 */
+            if (!audio_output_video_play_requested()) {
+                s_paused = true;
+                publish_state(VIDEO_STATE_PAUSED, s_play_index, NULL);
+                return;
+            }
+            if ((TickType_t)(xTaskGetTickCount() - s_audio_wait_at) >
+                pdMS_TO_TICKS(VIDEO_AUDIO_START_TIMEOUT_MS)) {
+                ESP_LOGW(TAG, "Video audio did not start; falling back to timer pacing");
+                close_audio_session();
+                audio = false;
+                s_deadline = now;
+            } else {
+                return;
+            }
+        } else {
+            media_us = audio_output_video_time_us();
+            if (media_us != s_audio_last_us) {
+                s_audio_last_us = media_us;
+                s_audio_last_at = xTaskGetTickCount();
+            } else if (s_audio_eof &&
+                       (TickType_t)(xTaskGetTickCount() - s_audio_last_at) >
+                           pdMS_TO_TICKS(300)) {
+                /* WAV 比视频短：音频时钟已无法前进，剩余画面退回计时播放。 */
+                ESP_LOGW(TAG, "WAV ended before video; timer pacing for the tail");
+                close_audio_session();
+                audio = false;
+                s_deadline = esp_timer_get_time();
+            }
+            if (audio && media_us < s_next_frame_us) return;
+        }
+    } else {
+        if (now < s_deadline) return;
+        if (now > s_deadline + s_frame_us) {
+            /* 已经落后超过一帧：丢掉下一帧的解码，只保留时间轴。 */
+            s_skip_next = true;
+            s_deadline = now;
+        }
+    }
+
+    /* 有音轨时按音频时钟决定是否丢帧；丢帧仍要顺序解析文件。 */
+    bool skip = false;
+    if (audio) skip = media_us > s_next_frame_us + s_frame_us;
+    else if (s_skip_next) {
+        s_skip_next = false;
+        skip = true;
     }
 
     const uint8_t *frame = NULL;
@@ -844,6 +1184,7 @@ static void frame_step(void)
         if (!sd_card_is_present()) {
             fail_playback("SD 卡已移除");
         } else if (s_reader && video_mjpeg_at_end(s_reader)) {
+            audio_output_video_play(false);
             atomic_store(&s_playing_flag, false);
             s_ended = true;
             atomic_store(&s_progress, 1000);
@@ -854,9 +1195,9 @@ static void frame_step(void)
         return;
     }
     update_progress();
-    if (s_skip_next) {
-        s_skip_next = false;
+    if (skip) {
         ++s_diag_drops;
+        if (audio) s_next_frame_us += s_frame_us;
         video_diag_tick(esp_timer_get_time());
         return;
     }
@@ -875,11 +1216,15 @@ static void frame_step(void)
     publish_frame(s_frames[s_frame_index]);
     update_progress();
 
-    s_deadline += s_frame_us;
-    now = esp_timer_get_time();
-    if (now > s_deadline + s_frame_us) {
-        s_skip_next = true;
-        s_deadline = now;
+    if (audio) {
+        s_next_frame_us += s_frame_us;
+    } else {
+        s_deadline += s_frame_us;
+        now = esp_timer_get_time();
+        if (now > s_deadline + s_frame_us) {
+            s_skip_next = true;
+            s_deadline = now;
+        }
     }
     video_diag_tick(now);
 }
@@ -909,6 +1254,7 @@ static void handle_command(const video_cmd_t *cmd)
         if (!current) break;
         if (atomic_load(&s_playing_flag) && !s_ended && !s_error) {
             s_paused = true;
+            audio_output_video_play(false);
             publish_state(VIDEO_STATE_PAUSED, s_play_index, NULL);
         }
         break;
@@ -922,6 +1268,7 @@ static void handle_command(const video_cmd_t *cmd)
         if (s_paused || s_ended) resume_playback();
         else if (atomic_load(&s_playing_flag) && !s_error) {
             s_paused = true;
+            audio_output_video_play(false);
             publish_state(VIDEO_STATE_PAUSED, s_play_index, NULL);
         }
         break;
@@ -941,6 +1288,8 @@ static void handle_command(const video_cmd_t *cmd)
             if (!s_error) publish_state(VIDEO_STATE_PAUSED, s_play_index, NULL);
         } else {
             s_deadline = esp_timer_get_time() + s_frame_us;
+            /* seek_to 已flush音频ring并停止TX；重新填充后由音频worker启动。 */
+            if (s_audio_active) audio_output_video_play(true);
             publish_state(VIDEO_STATE_PLAYING, s_play_index, NULL);
         }
         break;
@@ -973,10 +1322,20 @@ static void video_task(void *arg)
             continue;
         }
 
+        /* 音轨生产者就是本 worker：每轮先补 PCM，再按音频时钟安排下一帧。
+         * ring 满时 feed_audio 会保留尾部并在下一次继续，绝不丢样本。 */
+        if (s_audio_active && atomic_load(&s_playing_flag) &&
+            !s_paused && !s_ended && !s_error)
+            feed_audio();
+
         TickType_t wait = portMAX_DELAY;
         if (atomic_load(&s_playing_flag)) {
             if (s_paused || s_ended || s_error) {
                 wait = pdMS_TO_TICKS(100);
+            } else if (s_audio_active) {
+                /* 5ms 让 24/30/60fps 的帧都能在音频时钟上准时呈现；
+                 * ring 补充和命令处理也保持在这个粒度。 */
+                wait = pdMS_TO_TICKS(5);
             } else {
                 int64_t now = esp_timer_get_time();
                 if (now < s_deadline) {
@@ -1021,8 +1380,10 @@ static bool enqueue(uint8_t type, uint32_t arg, uint16_t arg16)
 
 static void video_detach_cb(void)
 {
-    /* sd_card 已持有 SD 锁；这里只关闭 FILE，不能再次取锁。 */
+    /* sd_card 已持有 SD 锁；这里只关闭文件，不能再次取锁。
+     * WAV 同样必须在 VFS/diskio 卸载前关闭，但对象留给 worker 清理。 */
     if (s_reader) video_mjpeg_detach(s_reader);
+    if (s_wav) video_wav_detach(s_wav);
 }
 
 esp_err_t video_player_init(void)
@@ -1125,9 +1486,11 @@ bool video_player_is_active(void)
 bool video_player_is_idle(void)
 {
     if (!s_task) return true;
+    /* 音轨通道也属于视频会话：锁屏/关机必须等它归还给音乐路径。 */
     return atomic_load(&s_pending) == 0 &&
            !atomic_load(&s_playing_flag) &&
-           !atomic_load(&s_reader_open);
+           !atomic_load(&s_reader_open) &&
+           !atomic_load(&s_audio_open_flag);
 }
 
 video_state_t video_player_get_state(void)

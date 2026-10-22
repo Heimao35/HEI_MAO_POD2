@@ -11,7 +11,7 @@
  */
 
 #include "video_mjpeg.h"
-#include "sd_card.h"
+#include "sd_path.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "ff.h"
@@ -192,26 +192,6 @@ static bool parse_frame(video_mjpeg_t *r)
     }
 }
 
-/*
- * VFS 挂载点不是 FAT 路径的一部分：/sdcard/HEI_MAO_POD_SYS/... 对应
- * FatFs 根目录下的 /HEI_MAO_POD_SYS/...。FF_FS_RPATH=0 时无盘符路径
- * 使用默认卷 0；sd_card 只挂载一个 FAT 卷，且 sd_card.c 的
- * f_getfree(SD_MOUNT_POINT, ...) 也依赖同一个默认卷。
- * 转换失败时直接拒绝，不访问文件系统。
- */
-static bool to_fatfs_path(const char *path, char *out, size_t cap)
-{
-    if (!path) return false;
-    const size_t prefix = sizeof(SD_MOUNT_POINT) - 1;
-    if (strncmp(path, SD_MOUNT_POINT, prefix) || path[prefix] != '/' ||
-        !path[prefix + 1]) return false;
-    const char *relative = path + prefix;
-    size_t len = strlen(relative);
-    if (len >= cap) return false;
-    memcpy(out, relative, len + 1);
-    return true;
-}
-
 /* 取普通文件的真实字节数。FatFs 的 fsize 是 32 位无符号，FAT32 单文件
  * 上限 4 GiB-1，不再有 VFS off_t 的符号回绕问题；目录、空文件和
  * f_stat 失败都视为无效。 */
@@ -230,7 +210,7 @@ esp_err_t video_mjpeg_open(video_mjpeg_t **out, const char *path)
     *out = NULL;
 
     char fat_path[VM_PATH_MAX];
-    if (!to_fatfs_path(path, fat_path, sizeof(fat_path))) return ESP_ERR_NOT_FOUND;
+    if (!sd_path_to_fatfs(path, fat_path, sizeof(fat_path))) return ESP_ERR_NOT_FOUND;
     uint64_t file_size = 0;
     if (!stat_regular_size(fat_path, &file_size)) return ESP_ERR_NOT_FOUND;
 
@@ -433,7 +413,7 @@ esp_err_t video_mjpeg_read_frame_near(const char *path, uint64_t target,
         return ESP_ERR_INVALID_ARG;
 
     char fat_path[VM_PATH_MAX];
-    if (!to_fatfs_path(path, fat_path, sizeof(fat_path))) return ESP_ERR_NOT_FOUND;
+    if (!sd_path_to_fatfs(path, fat_path, sizeof(fat_path))) return ESP_ERR_NOT_FOUND;
     uint64_t size = 0;
     if (!stat_regular_size(fat_path, &size)) return ESP_ERR_NOT_FOUND;
     if (target >= size) target = size / 2;

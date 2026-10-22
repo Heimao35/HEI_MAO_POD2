@@ -31,3 +31,6 @@ FRESULT f_close(FIL *fp);
 FRESULT f_read(FIL *fp, void *buf, UINT btr, UINT *br);
 FRESULT f_lseek(FIL *fp, FSIZE_t ofs);
 FRESULT f_stat(const char *path, FILINFO *fno);
+FSIZE_t f_tell(FIL *fp);
+/* matches the real FatFs inline macro on FILINFO/FIL.obj.objsize */
+#define f_size(fp) ((fp)->objsize)

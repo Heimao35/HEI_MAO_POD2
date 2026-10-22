@@ -3,9 +3,11 @@
  * @brief 无音频裸 MJPEG 视频播放器的后台状态机。
  *
  * 设计边界：
- * - 只接收 460x460、无音频的裸 MJPEG；不做容器解复用、不做音频解码。
- * - 所有 SD/JPEG 工作都在单个 worker 内完成，UI 回调由 worker 在 LVGL
- *   锁内同步调用；UI 的公开函数只投递标量请求，不等待 SD/JPEG/LVGL。
+ * - 只接收 460x460 裸 MJPEG；可选同名 WAV 音轨（PCM 16/24/32bit），由
+ *   audio_output 现有的 I2S/DAC 输出，不做容器解复用、不做音频解码。
+ * - 有音轨时以音频 DMA 时间为视频主时钟；没有音轨时沿用 esp_timer 节拍。
+ * - 所有 SD/JPEG/WAV 工作都在单个 worker 内完成，UI 回调由 worker 在
+ *   LVGL 锁内同步调用；UI 的公开函数只投递标量请求，不等待 SD/JPEG/LVGL。
  * - 播放使用硬件 JPEG 解码到两块 464x464 RGB565 缓冲，交替交给 UI
  *   canvas。464 是 460 按 JPEG 协议对齐到 16 的结果，右边/下边多出的
  *   4 像素由 460x460 的页面裁剪掉。

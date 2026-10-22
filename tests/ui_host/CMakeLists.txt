@@ -46,6 +46,23 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME video_mjpeg COMMAND video_mjpeg_tests)
 
+# Real RIFF/WAVE parsing (PCM 16/24/32, mono/stereo) over a stdio-backed
+# FatFs double; production reads the sidecar track directly through FatFs.
+add_executable(video_wav_tests test_video_wav.c)
+target_include_directories(video_wav_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(video_wav_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+endif()
+add_test(NAME video_wav COMMAND video_wav_tests)
+
+# Optional .vix frame index: header validation, size binding and lookups.
+add_executable(video_seek_index_tests test_video_seek_index.c)
+target_include_directories(video_seek_index_tests PRIVATE ../media_host/stubs "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(video_seek_index_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+endif()
+add_test(NAME video_seek_index COMMAND video_seek_index_tests)
+
 # Exercise production media scheduling separately from the LVGL object tests.
 add_executable(player_adapter_tests test_adapter.c ../media_host/support.c)
 target_include_directories(player_adapter_tests PRIVATE stubs ../media_host/stubs ../screen_host/stubs "${REPO}/main")

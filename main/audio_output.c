@@ -62,6 +62,21 @@ static bool s_input_eof,s_decode_eof,s_dac_ready,s_tx_on,s_format_ready;
 static i2s_chan_handle_t s_tx;
 static TickType_t s_poll_at,s_retry_at;
 static bool s_have_retry,s_hp_dirty,s_hp;
+/* 视频 PCM 模式：共用同一 I2S/DAC/ring，但生产者是视频 worker。
+ * s_video_cmd 与音乐命令共用 s_cmd_mux；serial 只用于 open/close，
+ * play/flush/eof 用独立原子量，避免频繁重配 I2S。 */
+typedef struct {uint32_t serial;bool active,play;uint32_t rate;uint8_t channels,bits;} video_command_t;
+static video_command_t s_video_cmd;
+static uint32_t s_video_serial;              /* worker 已处理的 serial */
+static bool s_video_worker_active;           /* worker-only：stop_tx 不更新音乐进度 */
+static TickType_t s_video_diag_at;           /* worker-only 5s 视频PCM诊断 */
+static unsigned s_video_volume=UINT32_MAX;   /* worker-only 音量缓存 */
+static atomic_uint s_video_ack;              /* worker 已回应到 serial */
+static atomic_bool s_video_failed;           /* 本会话配置失败 */
+static atomic_bool s_video_eof_req;
+static atomic_bool s_video_started;          /* TX 已启动 */
+static atomic_uint s_video_flush_req,s_video_flush_ack;
+static atomic_uint s_video_rate_pub,s_video_frame_bytes_pub,s_video_bits_pub,s_video_ch_pub;
 /* 只在音频任务中计时、每 5s 汇总，ISR 仅维护内部 SRAM 中的无锁计数。
  * max 是单次最大墙钟耗时（包括抢占），work 是本窗口各阶段累计墙钟耗时；
  * decoded 是这些解码调用产出的音频时长，不能把单次 67ms 直接当成实时率。
@@ -120,6 +135,13 @@ static void report_diagnostics(void)
 static command_t command(void)
 {
     portENTER_CRITICAL(&s_cmd_mux);command_t c=s_cmd;portEXIT_CRITICAL(&s_cmd_mux);return c;
+}
+static video_command_t video_command(void)
+{
+    portENTER_CRITICAL(&s_cmd_mux);
+    video_command_t v=s_video_cmd;
+    portEXIT_CRITICAL(&s_cmd_mux);
+    return v;
 }
 static void notify(void) {if(s_task)xTaskNotifyGive(s_task);}
 void audio_output_select(uint32_t index,uint32_t generation,bool autoplay)
@@ -227,7 +249,9 @@ static void stop_tx(void)
         if(ret!=ESP_OK) {ESP_LOGW(TAG,"DAC stop: %s",esp_err_to_name(ret));cs43131_abort();s_dac_ready=false;}
         i2s_channel_disable(s_tx);s_tx_on=false;
     }
-    update_position();atomic_store(&s_playing,false);atomic_store(&s_active,false);
+    /* 视频会话的帧数不属于音乐进度，不能改写音乐进度条/续播位置。 */
+    if(!s_video_worker_active) update_position();
+    atomic_store(&s_playing,false);atomic_store(&s_active,false);
 }
 static bool close_session(void)
 {
@@ -602,8 +626,18 @@ static void poll_headphone(void)
              * 必须在 LVGL 锁外处理，界面繁忙不能推迟暂停。插入只更新
              * 状态栏，绝不恢复播放，也不唤醒屏幕或展开任何控件。 */
             if(unplugged) {
-                audio_output_set_playing(false);
-                ESP_LOGI(TAG,"Headphone removed; playback paused");
+                if(video_command().active) {
+                    /* 视频音轨同样遵守拔出暂停；视频 worker 通过
+                     * audio_output_video_play_requested() 同步界面状态。 */
+                    portENTER_CRITICAL(&s_cmd_mux);
+                    s_video_cmd.play=false;
+                    portEXIT_CRITICAL(&s_cmd_mux);
+                    notify();
+                    ESP_LOGI(TAG,"Headphone removed; video audio paused");
+                } else {
+                    audio_output_set_playing(false);
+                    ESP_LOGI(TAG,"Headphone removed; playback paused");
+                }
             }
         }
     } else if(s_tx_on)fail_current(ret,polled);
@@ -613,8 +647,259 @@ static void poll_headphone(void)
         s_hp_dirty=false;lvgl_port_unlock();
     }
 }
+/* ------------------------------------------------------------------ */
+/* 视频 PCM 模式：生产者是视频 worker，音频 worker 只负责 I2S/DAC/音量、
+ * TX 启停和 ring 复位。音乐命令在视频会话期间被忽略；进入前 video_player
+ * 已暂停音乐并等待其文件关闭。 */
+
+static esp_err_t start_video_tx(void)
+{
+    esp_err_t ret=cs43131_prepare(s_format.sample_rate);
+    if(ret==ESP_OK)ret=clear_dma();
+    if(ret==ESP_OK)ret=i2s_channel_enable(s_tx);
+    if(ret==ESP_OK) {
+        s_dma_primed=false;
+        s_tx_on=true;
+        ret=cs43131_start_hp();
+    }
+    if(ret==ESP_OK) {
+        atomic_store_explicit(&s_pcm.feed,true,memory_order_release);
+        unsigned volume=atomic_load(&s_volume);
+        s_video_volume=volume;
+        ret=cs43131_volume(volume,volume==0);
+    }
+    if(ret!=ESP_OK) {
+        cs43131_abort();s_dac_ready=false;
+        if(s_tx_on) {i2s_channel_disable(s_tx);s_tx_on=false;}
+        atomic_store(&s_active,false);
+        return ret;
+    }
+    atomic_store(&s_active,true);
+    ESP_LOGI(TAG,"Video PCM started: %luHz %ubit %uch",
+        (unsigned long)s_format.sample_rate,s_format.bits_per_sample,s_format.channel);
+    return ESP_OK;
+}
+
+static void video_step(const video_command_t *v)
+{
+    if(v->serial!=s_video_serial) {
+        /* open/close：整个拆除过程都按视频会话处理，stop_tx 不得改写音乐进度。 */
+        s_video_serial=v->serial;
+        s_video_worker_active=true;
+        if(s_tx_on)stop_tx();
+        if(s_decoder||s_file)close_session();
+        else {audio_pcm_reset(&s_pcm,s_ring);s_sent_total=0;s_last_sent=0;}
+        atomic_store(&s_video_started,false);
+        atomic_store(&s_video_eof_req,false);
+        atomic_store(&s_video_failed,false);
+        if(v->active) {
+            memset(&s_format,0,sizeof(s_format));
+            s_format.sample_rate=v->rate;
+            s_format.channel=v->channels;
+            s_format.bits_per_sample=v->bits;
+            s_video_volume=UINT32_MAX;
+            esp_err_t ret=configure_tx();
+            if(ret!=ESP_OK) {
+                atomic_store(&s_video_failed,true);
+                ESP_LOGW(TAG,"Video PCM unsupported: %s",esp_err_to_name(ret));
+            } else {
+                atomic_store(&s_video_rate_pub,v->rate);
+                atomic_store(&s_video_frame_bytes_pub,(unsigned)v->channels*(v->bits/8));
+                atomic_store(&s_video_bits_pub,v->bits);
+                atomic_store(&s_video_ch_pub,v->channels);
+                s_video_diag_at=xTaskGetTickCount();
+                reset_diagnostics();
+            }
+        } else {
+            s_video_worker_active=false;
+            memset(&s_format,0,sizeof(s_format));
+        }
+        atomic_store(&s_video_ack,v->serial);
+        return;
+    }
+    if(!v->active) {
+        s_video_worker_active=false;
+        ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(20));
+        return;
+    }
+    if(atomic_load(&s_video_failed)) {ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(50));return;}
+    /* 拖动进度条：丢弃旧PCM并把音频时间归零，生产者在ack后从新位置重新填充。
+     * 放在 DAC 就绪检查之前，初始化期间拖动也能及时得到 ack。 */
+    unsigned flush=atomic_load(&s_video_flush_req);
+    if(flush!=atomic_load(&s_video_flush_ack)) {
+        if(s_tx_on)stop_tx();
+        audio_pcm_reset(&s_pcm,s_ring);
+        s_sent_total=0;s_last_sent=0;
+        atomic_store(&s_video_started,false);
+        atomic_store(&s_video_flush_ack,flush);
+    }
+    /* DAC 上电/初始化可能晚于视频进入；未就绪时不启动 TX，音频时间保持 0，
+     * 视频停在首帧等待，不会出现无音频却继续播放的静音画面。 */
+    if(!s_dac_ready) {
+        TickType_t now=xTaskGetTickCount();
+        if(pmic_axp2101_outputs_ready() && (!s_have_retry || (TickType_t)(now-s_retry_at)>=pdMS_TO_TICKS(1000))) {
+            s_retry_at=now;s_have_retry=true;
+            esp_err_t ret=cs43131_init();
+            if(ret==ESP_OK) {s_dac_ready=true;s_hp_dirty=true;}
+            else ESP_LOGW(TAG,"DAC init deferred: %s",esp_err_to_name(ret));
+        }
+        if(!s_dac_ready) {ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(50));return;}
+    }
+    if(!v->play) {
+        if(s_tx_on)stop_tx();
+        atomic_store(&s_video_started,false);
+        ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(50));
+        return;
+    }
+    size_t queued=audio_pcm_queued(&s_pcm);
+    if(!s_tx_on && queued && (queued>=AUDIO_PCM_HIGH_BYTES || atomic_load(&s_video_eof_req))) {
+        if(start_video_tx()!=ESP_OK) {ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(50));return;}
+        atomic_store(&s_video_started,true);
+    }
+    if(!s_tx_on || queued>=AUDIO_PCM_HIGH_BYTES) poll_headphone();
+    if(s_tx_on) {
+        unsigned volume=atomic_load(&s_volume);
+        if(volume!=s_video_volume && cs43131_volume(volume,volume==0)==ESP_OK)
+            s_video_volume=volume;
+    }
+    TickType_t now_diag=xTaskGetTickCount();
+    if((TickType_t)(now_diag-s_video_diag_at)>=pdMS_TO_TICKS(5000)) {
+        s_video_diag_at=now_diag;
+        ESP_LOGI(TAG,"Video PCM: queued=%uB, sent=%lu frames, underrun=%lu frames",
+            (unsigned)audio_pcm_queued(&s_pcm),
+            (unsigned long)atomic_load(&s_pcm.sent),
+            (unsigned long)atomic_load(&s_pcm.underrun_frames));
+    }
+    /* 与音乐路径相同的低水位唤醒；生产者由视频 worker 自己按需补充。 */
+    if(s_tx_on && queued>=AUDIO_PCM_HIGH_BYTES)
+        ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(100));
+    else
+        ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(5));
+}
+
+esp_err_t audio_output_video_open(const audio_output_pcm_cfg_t *cfg)
+{
+    if(!s_task || !cfg) return ESP_ERR_INVALID_STATE;
+    if(!supported_rate(cfg->sample_rate) ||
+       (cfg->channels!=1 && cfg->channels!=2) ||
+       (cfg->bits!=16 && cfg->bits!=24 && cfg->bits!=32))
+        return ESP_ERR_NOT_SUPPORTED;
+    portENTER_CRITICAL(&s_cmd_mux);
+    ++s_video_cmd.serial;
+    s_video_cmd.active=true;s_video_cmd.play=true;
+    s_video_cmd.rate=cfg->sample_rate;
+    s_video_cmd.channels=cfg->channels;
+    s_video_cmd.bits=cfg->bits;
+    uint32_t serial=s_video_cmd.serial;
+    portEXIT_CRITICAL(&s_cmd_mux);
+    /* s_cmd.play 已在视频进入前由调用方置 false；这里只清视频专用请求。 */
+    atomic_store(&s_video_eof_req,false);
+    notify();
+    for(unsigned i=0;i<200;++i) {
+        if(atomic_load(&s_video_ack)==serial) {
+            if(atomic_load(&s_video_failed)) {audio_output_video_close();return ESP_ERR_NOT_SUPPORTED;}
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    /* 超时：撤销本次请求，不能让音频 worker 在无人使用的情况下继续占用
+     * 视频模式而阻塞音乐。若期间已有新命令，保持新命令不变。 */
+    portENTER_CRITICAL(&s_cmd_mux);
+    if(s_video_cmd.serial==serial) {s_video_cmd.active=false;s_video_cmd.play=false;}
+    portEXIT_CRITICAL(&s_cmd_mux);
+    notify();
+    return ESP_ERR_TIMEOUT;
+}
+
+void audio_output_video_close(void)
+{
+    if(!s_task) return;
+    portENTER_CRITICAL(&s_cmd_mux);
+    if(!s_video_cmd.active) {portEXIT_CRITICAL(&s_cmd_mux);return;}
+    ++s_video_cmd.serial;
+    s_video_cmd.active=false;s_video_cmd.play=false;
+    uint32_t serial=s_video_cmd.serial;
+    portEXIT_CRITICAL(&s_cmd_mux);
+    atomic_store(&s_video_eof_req,false);
+    notify();
+    for(unsigned i=0;i<200;++i) {
+        if(atomic_load(&s_video_ack)==serial) return;
+        /* 关机/Light-sleep 屏障期间 worker 不会处理命令；active/serial 已
+         * 更新，屏障释放后仍会完成拆除，无需在这里等满1秒。 */
+        if(atomic_load(&s_quiesce)&REQUEST_MASK) return;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void audio_output_video_play(bool play)
+{
+    if(!s_task) return;
+    portENTER_CRITICAL(&s_cmd_mux);
+    if(!s_video_cmd.active) {portEXIT_CRITICAL(&s_cmd_mux);return;}
+    s_video_cmd.play=play;
+    portEXIT_CRITICAL(&s_cmd_mux);
+    notify();
+}
+
+void audio_output_video_flush(void)
+{
+    if(!s_task || !video_command().active) return;
+    uint32_t request=atomic_fetch_add(&s_video_flush_req,1)+1;
+    notify();
+    for(unsigned i=0;i<200;++i) {
+        if(atomic_load(&s_video_flush_ack)==request) return;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void audio_output_video_eof(void)
+{
+    atomic_store(&s_video_eof_req,true);notify();
+}
+
+size_t audio_output_video_write(const void *pcm,size_t frames,uint32_t timeout_ms)
+{
+    if(!pcm || !frames) return 0;
+    unsigned bits=atomic_load(&s_video_bits_pub);
+    unsigned channels=atomic_load(&s_video_ch_pub);
+    unsigned frame_bytes=atomic_load(&s_video_frame_bytes_pub);
+    if(!frame_bytes || !video_command().active) return 0;
+    TickType_t start=xTaskGetTickCount();
+    size_t done=0;
+    while(done<frames) {
+        size_t n=audio_pcm_push(&s_pcm,(const uint8_t*)pcm+done*frame_bytes,
+                                frames-done,bits,channels);
+        done+=n;
+        if(done==frames) break;
+        if((TickType_t)(xTaskGetTickCount()-start)>=pdMS_TO_TICKS(timeout_ms)) break;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return done;
+}
+
+uint64_t audio_output_video_time_us(void)
+{
+    unsigned rate=atomic_load(&s_video_rate_pub);
+    if(!rate) return 0;
+    return (uint64_t)atomic_load_explicit(&s_pcm.sent,memory_order_acquire)
+           *1000000ULL/rate;
+}
+
+bool audio_output_video_started(void) {return atomic_load(&s_video_started);}
+bool audio_output_video_play_requested(void)
+{
+    video_command_t v=video_command();
+    return v.active&&v.play;
+}
+
 static void output_step(void)
 {
+    /* 视频会话独占 I2S/DAC；关闭请求也要由 video_step 处理完再回到音乐路径。 */
+    video_command_t video=video_command();
+    if(video.active || s_video_worker_active || video.serial!=s_video_serial) {
+        video_step(&video);
+        return;
+    }
     if(!s_dac_ready) {
         TickType_t now=xTaskGetTickCount();
         if(pmic_axp2101_outputs_ready() && (!s_have_retry || (TickType_t)(now-s_retry_at)>=pdMS_TO_TICKS(1000))) {

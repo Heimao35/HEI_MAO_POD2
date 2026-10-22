@@ -41,7 +41,18 @@ static void advance_ms(unsigned ms)
         }
     }
 }
-void vTaskDelay(unsigned ms) {advance_ms(ms);}
+/* 视频 PCM API 在 open/flush/close 内等待 worker ack；主机单线程下由
+ * vTaskDelay 推进一次真实 output_iteration，模拟实际 worker 并发。 */
+static bool pump_wait, inside_step;
+void vTaskDelay(unsigned ms)
+{
+    if(pump_wait && !inside_step) {
+        inside_step=true;
+        output_iteration();
+        inside_step=false;
+    }
+    advance_ms(ms);
+}
 uint32_t ulTaskNotifyTake(BaseType_t clear,TickType_t ms)
 {
     ++wait_calls;
@@ -410,6 +421,45 @@ int main(void)
     assert(clock_reconfigs==reconfigs_before && !init_nomem_attempts);
     assert(i2s_del_channel(s_tx)==ESP_OK);s_tx=NULL;s_tx_rate=0;
     puts("PASS repeated DMA init out-of-memory releases channels and permits clean retry");
+    /* 视频 PCM 模式：复用同一I2S/DAC/ring；预缓冲到高水位后启动TX，
+     * DMA消费的真实帧数就是视频主时钟；flush归零、暂停停TX、close归还。 */
+    assert(!s_tx && s_tx_rate==0 && !tx_enabled);
+    rate=48000; /* 本测试的 DMA 样本钟与视频配置一致 */
+    pump_wait=true;
+    audio_output_pcm_cfg_t vcfg={.sample_rate=48000,.channels=2,.bits=16};
+    assert(audio_output_video_open(&vcfg)==ESP_OK);
+    assert(s_tx && s_tx_rate==48000 && !tx_enabled);
+    assert(audio_output_video_play_requested() && !audio_output_video_started());
+    static uint8_t vpcm[4096*4];
+    memset(vpcm,0x5a,sizeof(vpcm));
+    assert(audio_output_video_write(vpcm,4096,20)==4096);
+    assert(audio_output_video_write(vpcm,4096,20)==4096);
+    pump_wait=false;
+    for(unsigned i=0;i<8 && !tx_enabled;++i){output_iteration();advance_ms(1);}
+    assert(tx_enabled && audio_output_video_started());
+    uint64_t before_us=audio_output_video_time_us();
+    advance_ms(100);
+    uint64_t after_us=audio_output_video_time_us();
+    /* 前8个DMA块是启动静音，不计入真实音频时间；100ms模型里已播放的
+     * 真实帧约53ms。允许一个256帧块（5.3ms）的量化误差。 */
+    assert(after_us>=before_us+45000 && after_us<=before_us+65000);
+    puts("PASS video PCM prebuffer start and DMA-driven media clock");
+    pump_wait=true;
+    audio_output_video_flush();
+    assert(!tx_enabled && audio_output_video_time_us()==0);
+    audio_output_video_play(false);
+    assert(audio_output_video_write(vpcm,4096,20)==4096);
+    assert(audio_output_video_write(vpcm,4096,20)==4096);
+    audio_output_video_play(true);
+    pump_wait=false;
+    for(unsigned i=0;i<8 && !tx_enabled;++i){output_iteration();advance_ms(1);}
+    assert(tx_enabled && audio_output_video_started());
+    pump_wait=true;
+    audio_output_video_close();
+    pump_wait=false;
+    assert(!audio_output_video_play_requested() && !tx_enabled);
+    assert(!audio_output_video_started() && audio_output_video_time_us()==0);
+    puts("PASS video PCM flush/pause/resume and channel return");
     heap_caps_free(s_io);heap_caps_free(s_ring);heap_caps_free(s_input);heap_caps_free(s_output);
     assert(wait_calls>0 && dma_wakes>0);
     puts("PASS actual sample-clock DMA cadence wakes blocked producer; startup prebuffer, backpressure and exact EOS");
