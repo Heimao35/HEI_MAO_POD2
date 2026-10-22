@@ -1,5 +1,6 @@
 /* Deliberately NOT a JPEG decoder: checks buffer lifetime/error paths only. */
 #include "driver/jpeg_decode.h"
+#include "jpeg_codec.h"
 #include "esp_heap_caps.h"
 #include <string.h>
 #include <assert.h>
@@ -23,4 +24,15 @@ esp_err_t jpeg_decoder_process(jpeg_decoder_handle_t h, const jpeg_decode_cfg_t 
     *actual = 240*240*2;
     memset(out, data[8], *actual);
     return ESP_OK;
+}
+
+/* Production cover_loader now goes through the shared codec wrapper. */
+esp_err_t jpeg_codec_process(const jpeg_decode_cfg_t *cfg,
+                             const uint8_t *input, uint32_t input_len,
+                             uint8_t *output, uint32_t output_cap,
+                             uint32_t *output_len, uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    return jpeg_decoder_process((jpeg_decoder_handle_t)(void *)1, cfg,
+                                input, input_len, output, output_cap, output_len);
 }

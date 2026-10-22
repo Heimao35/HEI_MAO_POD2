@@ -1,4 +1,5 @@
 #include "cover_loader.h"
+#include "jpeg_codec.h"
 #include "driver/jpeg_decode.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -8,7 +9,6 @@
 #include <sys/stat.h>
 
 #define PIXEL_BYTES (COVER_WIDTH * COVER_HEIGHT * 2U)
-static jpeg_decoder_handle_t s_decoder;
 typedef struct {
     uint8_t *pixels;
     size_t size;
@@ -25,10 +25,7 @@ static const char *TAG = "cover_loader";
 
 esp_err_t cover_loader_init(void)
 {
-    if (s_decoder) return ESP_OK;
-    jpeg_decode_engine_cfg_t cfg = {.intr_priority = 0, .timeout_ms = 250};
-    esp_err_t ret = jpeg_new_decoder_engine(&cfg, &s_decoder);
-    if (ret != ESP_OK) return ret;
+    if (s_slots[0].pixels) return ESP_OK;
     jpeg_decode_memory_alloc_cfg_t mem = {.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER};
     for (int i = 0; i < COVER_CACHE_SLOTS; ++i) {
         s_slots[i].pixels = jpeg_alloc_decoder_mem(PIXEL_BYTES, &mem, &s_slots[i].size);
@@ -134,8 +131,8 @@ esp_err_t cover_loader_load(const char *path, uint32_t generation, uint32_t inde
                                   * LVGL needs native little-endian RGB565 (BGR setting). */
                                  .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR};
         uint32_t out_size = 0;
-        ret = jpeg_decoder_process(s_decoder, &cfg, compressed, read, slot->pixels,
-                                   slot->size, &out_size);
+        ret = jpeg_codec_process(&cfg, compressed, read, slot->pixels,
+                                 slot->size, &out_size, 1000);
         if (ret == ESP_OK && out_size != PIXEL_BYTES) ret = ESP_ERR_INVALID_SIZE;
         if (ret == ESP_OK) {
             portENTER_CRITICAL(&s_cache_lock);
@@ -155,8 +152,7 @@ esp_err_t cover_loader_load(const char *path, uint32_t generation, uint32_t inde
 
 void cover_loader_destroy(void)
 {
-    if (s_decoder) jpeg_del_decoder_engine(s_decoder);
-    s_decoder = NULL;
+    /* 共享 decoder engine 归 jpeg_codec 所有，不能在这里删除。 */
     for (int i = 0; i < COVER_CACHE_SLOTS; ++i) {
         free(s_slots[i].pixels);
         s_slots[i] = (cover_slot_t){0};

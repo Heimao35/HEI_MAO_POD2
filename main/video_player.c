@@ -6,8 +6,8 @@
  * - UI 只把命令写入一个小队列；worker 独占 SD 文件、JPEG 解码器和帧缓冲。
  * - worker 在 LVGL 锁内同步调用 UI 回调，回调只更新控件，不做 I/O。
  * - 两帧 RGB565 缓冲交替使用：解码下一帧时，LVGL 可以继续显示上一帧。
- * - 进入播放前暂停音乐并关闭其 SD 文件；离开视频模式时释放解码器，
- *   避免和锁屏动画的 JPEG 引擎同时工作。
+ * - 进入播放前暂停音乐并关闭其 SD 文件；JPEG 硬件由 jpeg_codec 全局
+ *   串行化，视频、封面和锁屏动画不再各自创建/删除 decoder engine。
  *
  * 60fps 策略：以 1/60 秒为节拍；如果显示/解码落后超过一帧，跳过下一帧
  * 的解码以追上节拍。面板 DPI 实际约 59.7Hz，因此 60fps 片源偶尔会少
@@ -16,6 +16,7 @@
 
 #include "video_player.h"
 #include "video_mjpeg.h"
+#include "jpeg_codec.h"
 #include "sd_card.h"
 #include "music_player_adapter.h"
 #include "audio_output.h"
@@ -44,7 +45,6 @@ static const char *TAG = "video_player";
 #define VIDEO_TASK_STACK  16384
 #define VIDEO_TASK_PRIO   5
 #define VIDEO_SD_LOCK_MS  1000
-#define VIDEO_DECODE_TIMEOUT_MS 100
 
 typedef enum {
     CMD_SCAN = 1,
@@ -87,7 +87,6 @@ static atomic_uint s_page_token;
 
 /* 以下变量只由 worker 访问。 */
 static video_mjpeg_t *s_reader;
-static jpeg_decoder_handle_t s_decoder;
 static uint8_t *s_frames[2];
 static uint8_t s_frame_index;
 static uint32_t s_frame_seq;
@@ -202,24 +201,6 @@ static void free_thumb_buffers(void);
 static void scan_library(void);
 static void video_diag_reset(void);
 
-static esp_err_t ensure_decoder(void)
-{
-    if (s_decoder) return ESP_OK;
-    jpeg_decode_engine_cfg_t cfg = {
-        .intr_priority = 0,
-        .timeout_ms = VIDEO_DECODE_TIMEOUT_MS,
-    };
-    return jpeg_new_decoder_engine(&cfg, &s_decoder);
-}
-
-static void release_decoder(void)
-{
-    if (s_decoder) {
-        jpeg_del_decoder_engine(s_decoder);
-        s_decoder = NULL;
-    }
-}
-
 static esp_err_t ensure_frames(void)
 {
     if (s_frames[0] && s_frames[1]) return ESP_OK;
@@ -308,15 +289,15 @@ static void free_thumb_buffers(void)
 
 static bool decode_frame(const uint8_t *jpeg, size_t bytes, uint8_t *out)
 {
-    if (!s_decoder || !jpeg || !bytes || !out) return false;
+    if (!jpeg || !bytes || !out) return false;
     jpeg_decode_cfg_t cfg = {
         .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
         /* 与锁屏一致：BGR 选择 LVGL 需要的原生小端 RGB565。 */
         .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
     };
     uint32_t out_size = 0;
-    esp_err_t ret = jpeg_decoder_process(s_decoder, &cfg, jpeg, (uint32_t)bytes,
-                                         out, VIDEO_FRAME_BYTES, &out_size);
+    esp_err_t ret = jpeg_codec_process(&cfg, jpeg, (uint32_t)bytes,
+                                       out, VIDEO_FRAME_BYTES, &out_size, 1000);
     return ret == ESP_OK && out_size == VIDEO_FRAME_BYTES;
 }
 
@@ -552,8 +533,6 @@ static void load_page(uint32_t first)
         publish_status("视频列表为空");
         return;
     }
-    esp_err_t ret = ensure_decoder();
-    if (ret != ESP_OK) ESP_LOGW(TAG, "JPEG decoder unavailable for thumbnails");
     if (ensure_thumb_buffers() != ESP_OK) ESP_LOGW(TAG, "Thumbnail buffers unavailable");
 
     video_page_t page;
@@ -561,7 +540,7 @@ static void load_page(uint32_t first)
         publish_status("SD 卡忙，请稍后重试");
         return;
     }
-    ret = video_library_get_page(first, &page);
+    esp_err_t ret = video_library_get_page(first, &page);
     uint32_t generation = sd_card_get_generation();
     sd_card_io_unlock();
     if (ret != ESP_OK) {
@@ -575,7 +554,7 @@ static void load_page(uint32_t first)
 
     uint32_t token = atomic_load(&s_page_token);
     publish_page(&page, generation);
-    if (!s_thumb_jpeg || !s_thumb_decode || !s_decoder) return;
+    if (!s_thumb_jpeg || !s_thumb_decode) return;
 
     for (uint32_t slot = 0; slot < page.count; ++slot) {
         if (atomic_load(&s_cancel) || atomic_load(&s_page_token) != token ||
@@ -639,7 +618,6 @@ static void stop_session(bool release_all, bool notify_idle)
     free_frames();
     if (release_all) {
         free_thumb_buffers();
-        release_decoder();
     }
     if (notify_idle) {
         publish_state(VIDEO_STATE_IDLE, UINT32_MAX, NULL);
@@ -677,10 +655,6 @@ static esp_err_t prepare_play(uint32_t index, char *err, size_t err_size)
     if (atomic_load(&s_cancel)) {
         snprintf(err, err_size, "播放已取消");
         return ESP_ERR_INVALID_STATE;
-    }
-    if (ensure_decoder() != ESP_OK) {
-        snprintf(err, err_size, "JPEG 解码器不可用");
-        return ESP_ERR_NO_MEM;
     }
     if (ensure_frames() != ESP_OK) {
         snprintf(err, err_size, "帧缓冲内存不足");

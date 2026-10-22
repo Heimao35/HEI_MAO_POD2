@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c"
+idf_component_register(SRCS "jpeg_codec.c" "main.c"
                               "sd_card.c"
                               "lock_animation.c"
                               "video_mjpeg.c"

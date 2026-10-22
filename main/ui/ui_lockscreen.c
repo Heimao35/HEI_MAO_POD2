@@ -4,6 +4,7 @@
 #include "lock_animation.h"
 #include "music_player_adapter.h"
 #include "video_player.h"
+#include "jpeg_codec.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/jpeg_decode.h"
@@ -61,21 +62,10 @@ static void play_mjpeg(unsigned generation)
     const uint8_t *frame=NULL;
     if (!lock_animation_next_frame(&position,&frame,&frame_len)) return;
 
-    /* 视频播放器可能正在停止/释放它自己的 JPEG 引擎。先等它空闲，
-     * 避免视频首帧和锁屏动画同时进入硬件 codec；最多等 500ms，超时后
-     * 仍由驱动内部的 codec mutex 串行化。 */
+    /* 视频播放器可能正在停止；先等它空闲再开始动画，避免 UI 帧缓冲交接
+     * 与锁屏重播重叠。JPEG 引擎本身由 jpeg_codec 全局共享并串行化。 */
     for (unsigned i=0; i<100 && !video_player_is_idle(); ++i)
         vTaskDelay(pdMS_TO_TICKS(5));
-
-    jpeg_decoder_handle_t decoder = NULL;
-    jpeg_decode_engine_cfg_t eng_cfg = {
-        .intr_priority = 0,
-        .timeout_ms = 100,
-    };
-    if (jpeg_new_decoder_engine(&eng_cfg, &decoder) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create JPEG decoder");
-        return;
-    }
 
     jpeg_decode_cfg_t dec_cfg = {
         .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
@@ -86,10 +76,10 @@ static void play_mjpeg(unsigned generation)
     while (atomic_load(&s_visible) && generation == atomic_load(&s_anim_generation)) {
         TickType_t t0 = xTaskGetTickCount();
         uint32_t out_size = 0;
-        esp_err_t ret = jpeg_decoder_process(decoder, &dec_cfg,
-                                              frame, (uint32_t)frame_len,
-                                              s_decode_buf, DECODE_BUF_SZ,
-                                              &out_size);
+        esp_err_t ret = jpeg_codec_process(&dec_cfg,
+                                            frame, (uint32_t)frame_len,
+                                            s_decode_buf, DECODE_BUF_SZ,
+                                            &out_size, 1000);
         if (ret == ESP_OK) {
             if (lvgl_port_lock(50)) {
                 /* 先确认本轮仍有效，再在 LVGL 锁内更新可见 canvas。
@@ -117,7 +107,6 @@ static void play_mjpeg(unsigned generation)
         if (!lock_animation_next_frame(&position,&frame,&frame_len)) break;
     }
 
-    jpeg_del_decoder_engine(decoder);
     ESP_LOGI(TAG, "Lock animation finished");
 }
 

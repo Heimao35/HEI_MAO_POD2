@@ -31,6 +31,7 @@
 #include "pmic_axp2101.h"
 #include "music_player_adapter.h"
 #include "video_player.h"
+#include "jpeg_codec.h"
 #include "audio_output.h"
 #include "ui_fonts.h"
 #include "ui_boot.h"
@@ -322,6 +323,12 @@ void app_main(void)
 
     /* LVGL initialization */
     ESP_ERROR_CHECK(app_lvgl_init());
+
+    /* 封面、锁屏动画和视频统一使用一个 JPEG 解码引擎；必须在任何模块
+     * 开始解码前创建互斥锁。具体 engine 在第一次解码时惰性创建。 */
+    esp_err_t jpeg_ret = jpeg_codec_init();
+    if (jpeg_ret != ESP_OK)
+        ESP_LOGE(TAG, "JPEG codec init failed: %s", esp_err_to_name(jpeg_ret));
 
     /* 第一幅提示画面不依赖 NVS、字库或 SD。启动完成前暂停触摸输入，
      * 避免用户在加载阶段的触摸被底层锁屏/播放器当成正常手势。 */

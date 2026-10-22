@@ -66,6 +66,16 @@ esp_err_t jpeg_decoder_process(jpeg_decoder_handle_t decoder, const jpeg_decode_
     if (cancel_during_decode) ui_lockscreen_stop_anim();
     return ESP_OK;
 }
+esp_err_t jpeg_codec_process(const jpeg_decode_cfg_t *cfg,
+                             const uint8_t *input, uint32_t input_len,
+                             uint8_t *output, uint32_t output_cap,
+                             uint32_t *output_len, uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    if (fail_engine) return ESP_FAIL;
+    return jpeg_decoder_process((jpeg_decoder_handle_t)(void *)2, cfg,
+                                input, input_len, output, output_cap, output_len);
+}
 static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels)
 { (void)area; (void)pixels; lv_display_flush_ready(display); }
 static void advance(void)
