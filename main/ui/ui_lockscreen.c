@@ -7,6 +7,7 @@
 #include "jpeg_codec.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/jpeg_decode.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -72,9 +73,11 @@ static void play_mjpeg(unsigned generation)
         .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
     };
 
-    TickType_t frame_ticks = pdMS_TO_TICKS(1000 / ANIM_FPS);
+    /* 用微秒截止时间累加，避免 1000/60 的整数毫秒截断导致动画持续快放。
+     * FreeRTOS 的 tick 仍用于睡眠，但余数会在后续帧由截止时间补偿。 */
+    const int64_t frame_us = 1000000LL / ANIM_FPS;
+    int64_t next_us = esp_timer_get_time();
     while (atomic_load(&s_visible) && generation == atomic_load(&s_anim_generation)) {
-        TickType_t t0 = xTaskGetTickCount();
         uint32_t out_size = 0;
         esp_err_t ret = jpeg_codec_process(&dec_cfg,
                                             frame, (uint32_t)frame_len,
@@ -100,9 +103,17 @@ static void play_mjpeg(unsigned generation)
             ESP_LOGW(TAG, "JPEG decode err: %s", esp_err_to_name(ret));
         }
 
-        TickType_t elapsed = xTaskGetTickCount() - t0;
-        if (elapsed < frame_ticks) {
-            vTaskDelay(frame_ticks - elapsed);
+        next_us += frame_us;
+        int64_t now = esp_timer_get_time();
+        if (now < next_us) {
+            int64_t wait_us = next_us - now;
+            TickType_t ticks = pdMS_TO_TICKS((wait_us + 999) / 1000);
+            if (!ticks) ticks = 1;
+            vTaskDelay(ticks);
+        } else if (now > next_us + frame_us) {
+            /* 解码/绘制已经落后超过一帧时丢弃累计欠账，避免随后连续
+             * 无间隔刷新；不跳过动画帧内容。 */
+            next_us = now;
         }
         if (!lock_animation_next_frame(&position,&frame,&frame_len)) break;
     }

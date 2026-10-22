@@ -9,7 +9,7 @@
 #define LOCK_ANIMATION_MAX_BYTES (4U * 1024U * 1024U)
 #define LOCK_ANIMATION_WIDTH 460U
 #define LOCK_ANIMATION_HEIGHT 460U
-#define LOCK_ANIMATION_FPS 24U
+#define LOCK_ANIMATION_FPS 60U
 
 /* 仅在app_main启动音频/电源任务前调用一次，且必须在LVGL锁外。
  * 校验Flash双槽，尝试从已挂载SD导入更换的动画，再发布只读PSRAM缓存。

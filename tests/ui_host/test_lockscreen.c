@@ -40,6 +40,7 @@ bool lock_animation_next_frame(size_t *position,const uint8_t **frame,size_t *by
     *frame=data; *bytes=sizeof(data); *position=sizeof(data); return true;
 }
 TickType_t xTaskGetTickCount(void) { return ticks++; }
+int64_t esp_timer_get_time(void) { return (int64_t)ticks * 1000; }
 void xTaskNotifyGive(TaskHandle_t task) { assert(task == (void *)1); ++notifications; }
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t delay) { (void)clear; (void)delay; return 0; }
 BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack, void *arg,
