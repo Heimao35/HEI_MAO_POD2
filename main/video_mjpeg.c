@@ -195,14 +195,36 @@ static bool parse_frame(video_mjpeg_t *r)
     }
 }
 
+/*
+ * ESP-IDF VFS/newlib 的 off_t 是 32 位有符号，而 FATFS 的 fsize 是 32 位
+ * 无符号：文件达到 2 GiB（2^31 字节）后 stat 的 st_size 会回绕成负值。
+ * FAT32 单文件上限是 4 GiB-1，因此负值按 32 位无符号还原就是真实大小。
+ * 注意 VFS 的 lseek 仍是 32 位有符号：2 GiB 之后的位置无法直接定位，
+ * 大文件只能从头顺序播放到结尾，见 video_mjpeg_seek。
+ */
+static uint64_t size_from_stat(off_t value)
+{
+    return value < 0 ? (uint64_t)(uint32_t)value : (uint64_t)value;
+}
+
+/* 取普通文件的真实字节数；目录、空文件和 stat 失败都视为无效。 */
+static bool stat_regular_size(const char *path, uint64_t *size)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    uint64_t bytes = size_from_stat(st.st_size);
+    if (!bytes) return false;
+    *size = bytes;
+    return true;
+}
+
 esp_err_t video_mjpeg_open(video_mjpeg_t **out, const char *path)
 {
     if (!out || !path || !path[0]) return ESP_ERR_INVALID_ARG;
     *out = NULL;
 
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
-        return ESP_ERR_NOT_FOUND;
+    uint64_t file_size = 0;
+    if (!stat_regular_size(path, &file_size)) return ESP_ERR_NOT_FOUND;
 
     video_mjpeg_t *r = heap_caps_calloc(1, sizeof(*r),
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -227,7 +249,7 @@ esp_err_t video_mjpeg_open(video_mjpeg_t **out, const char *path)
         video_mjpeg_close(r);
         return ESP_ERR_NOT_FOUND;
     }
-    r->size = (uint64_t)st.st_size;
+    r->size = file_size;
     r->read_base = 0;
     r->next_read = 0;
     r->read_len = 0;
@@ -283,6 +305,9 @@ bool video_mjpeg_seek(video_mjpeg_t *reader, uint64_t offset)
     /* 向下对齐到扇区边界，保证后续 read() 的目标地址和 FATFS 起始偏移
      * 都满足 SDMMC 直接多块 DMA 条件。解析器会从该位置向后找 SOI。 */
     offset &= ~((uint64_t)VIDEO_MJPEG_IO_ALIGN - 1U);
+    /* VFS lseek 的 off_t 是 32 位有符号，2 GiB 之后无法定位。大文件仍可
+     * 从头顺序播放到结尾；进度条拖到该区域会安全失败并提示“无法跳转”。 */
+    if (offset > (uint64_t)INT32_MAX) return false;
     if (lseek(reader->fd, (off_t)offset, SEEK_SET) < 0) return false;
     reader->read_base = offset;
     reader->next_read = offset;
@@ -400,10 +425,8 @@ esp_err_t video_mjpeg_read_frame_near(const char *path, uint64_t target,
     if (!path || !out || !out_len || !out_offset || out_cap < 4)
         return ESP_ERR_INVALID_ARG;
 
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
-        return ESP_ERR_NOT_FOUND;
-    uint64_t size = (uint64_t)st.st_size;
+    uint64_t size = 0;
+    if (!stat_regular_size(path, &size)) return ESP_ERR_NOT_FOUND;
     if (target >= size) target = size / 2;
     /* 目标文件偏移也向下对齐；多读的几百字节由 SOI 扫描自然跳过。 */
     target &= ~((uint64_t)VIDEO_MJPEG_IO_ALIGN - 1U);
@@ -419,7 +442,9 @@ esp_err_t video_mjpeg_read_frame_near(const char *path, uint64_t target,
     const size_t chunk = 64U * 1024U;
     for (unsigned attempt = 0; attempt < 2 && result != ESP_OK; ++attempt) {
         uint64_t read_at = attempts[attempt];
-        if (read_at >= size) continue;
+        /* 32 位 off_t 无法定位 2 GiB 之后的位置；FAT32 文件的中点仍在
+         * 2 GiB 内，超过时直接回退到文件开头取首帧。 */
+        if (read_at >= size || read_at > (uint64_t)INT32_MAX) continue;
         if (lseek(fd, (off_t)read_at, SEEK_SET) < 0) continue;
 
         size_t total = 0;

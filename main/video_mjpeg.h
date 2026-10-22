@@ -9,6 +9,11 @@
  * 所有 fopen/fread/fseek 都由调用方持有 sd_card_io_lock()。播放线程长期
  * 持有一个 video_mjpeg_t；缩略图使用 video_mjpeg_read_frame_near() 短时
  * 打开文件，读完立即关闭。这样 SD 卸载时只需要关闭播放线程的文件句柄。
+ *
+ * 文件大小：ESP-IDF 的 off_t/st_size 是 32 位有符号，而 FATFS 的 fsize 是
+ * 32 位无符号，因此 2 GiB 以上的文件在 stat 中表现为负值。本模块会按无符号
+ * 还原真实大小，支持顺序播放到 FAT32 上限 4 GiB-1；但 VFS lseek 仍受 32 位
+ * 有符号限制，2 GiB 之后的随机跳转不可用。
  */
 
 #ifndef VIDEO_MJPEG_H
@@ -70,7 +75,11 @@ void video_mjpeg_detach(video_mjpeg_t *reader);
 bool video_mjpeg_next(video_mjpeg_t *reader, const uint8_t **frame,
                       size_t *bytes, uint64_t *frame_offset);
 
-/** @brief 跳到文件偏移。下一帧会从该位置之后的下一个 SOI 开始。 */
+/**
+ * @brief 跳到文件偏移。下一帧会从该位置之后的下一个 SOI 开始。
+ * @note  2 GiB（2^31 字节）之后的位置受 32 位有符号 off_t 限制，返回 false；
+ *        2 GiB 以内以及文件开头的跳转不受影响。
+ */
 bool video_mjpeg_seek(video_mjpeg_t *reader, uint64_t offset);
 
 /** @brief 当前逻辑文件偏移（已消费到解析器缓冲中的位置）。 */

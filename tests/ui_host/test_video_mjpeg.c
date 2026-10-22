@@ -40,6 +40,13 @@ int main(void)
     assert(video_mjpeg_fps_from_name("clip_360p.mjpeg") == 0);
     assert(video_mjpeg_fps_from_name("clip.mjpeg") == 0);
 
+    /* 32 位 off_t 下 >=2 GiB 的文件 stat 会回绕成负值，必须还原为
+     * FATFS 的 32 位无符号大小；FAT32 单文件上限 4 GiB-1。 */
+    assert(size_from_stat((off_t)0) == 0);
+    assert(size_from_stat((off_t)2147483647) == UINT64_C(2147483647));
+    assert(size_from_stat((off_t)-2147483648LL) == UINT64_C(2147483648));
+    assert(size_from_stat((off_t)-1) == UINT64_C(4294967295));
+
     const char *path = VIDEO_FIXTURE;
     video_mjpeg_t *reader = NULL;
     assert(video_mjpeg_open(&reader, path) == ESP_OK);
@@ -84,6 +91,15 @@ int main(void)
     assert(near[near_bytes - 2] == 0xFF && near[near_bytes - 1] == 0xD9);
     free(near);
 
-    puts("PASS video MJPEG parsing/seek/thumbnail");
+    /* 2 GiB 边界：VFS lseek 无法定位之后的位置，必须安全失败；2 GiB 内
+     * 的跳转保持原行为（真机 FAT32 单文件上限 4 GiB-1）。 */
+    video_mjpeg_t *probe = NULL;
+    assert(video_mjpeg_open(&probe, path) == ESP_OK);
+    probe->size = UINT64_C(0xFFFFFFFF);
+    assert(!video_mjpeg_seek(probe, UINT64_C(0x80000000)));
+    assert(video_mjpeg_seek(probe, UINT64_C(0x7FFFFC00)));
+    video_mjpeg_close(probe);
+
+    puts("PASS video MJPEG parsing/seek/thumbnail and 2 GiB size recovery");
     return 0;
 }

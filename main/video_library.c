@@ -78,7 +78,9 @@ static bool regular_entry(const char *name, const struct dirent *entry)
     int n = snprintf(path, sizeof(path), "%s/%s", VIDEO_DIR, name);
     if (n < 0 || (size_t)n >= sizeof(path)) return false;
     struct stat st;
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+    /* 32 位 off_t 让 2 GiB 以上的文件 st_size 变成负值，不能因此跳过；
+     * 0 字节文件仍视为无效。 */
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size != 0;
 }
 
 esp_err_t video_library_scan(atomic_bool *cancel)
