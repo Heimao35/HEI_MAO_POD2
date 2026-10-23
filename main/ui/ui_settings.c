@@ -11,9 +11,26 @@
 #include "ui_fonts.h"
 #include "ui_clock_settings.h"
 #include "ui_motion_settings.h"
+#include "ui_bluetooth_settings.h"
+#include "bt_audio.h"
 
 static lv_obj_t *s_page = NULL; /**< 设置页面容器 */
 static bool s_visible = false;
+
+/* 蓝牙入口按钮及其内部对象。用于在蓝牙开/关时切换按钮配色，
+ * 让网格里的入口本身也能表示当前开关状态（不只依赖子页里的开关）。
+ * 只保存指针，不改按钮尺寸、网格位置、图标或点击逻辑。 */
+static lv_obj_t *s_bt_button = NULL;
+static lv_obj_t *s_bt_icon = NULL;
+static lv_obj_t *s_bt_caption = NULL;
+static bool s_bt_visual_on = false;
+
+/* 蓝牙入口的长按消费标志。
+ *
+ * LVGL 在 LONG_PRESSED 之后，用户松手时仍会向同一对象发送 CLICKED。
+ * 如果不做区分，长按进入蓝牙页面的同时还会执行一次短按的开关切换。
+ * 每次新的 PRESSED 先把标志清零，保证上一轮残留不影响下一次短按。 */
+static bool s_bt_long_pressed = false;
 
 /** 设置项信息表 */
 static const struct {
@@ -32,16 +49,92 @@ static const struct {
 #define ITEM_COUNT (sizeof(s_items) / sizeof(s_items[0]))
 
 /**
- * @brief 设置项按钮点击回调：姿态感应/时钟进入各自的独立子页
+ * @brief 把蓝牙入口按钮绘制成“开/关”两种颜色状态。
  *
- * 索引 2 是“姿态感应”，索引 3 是“时钟”。两个子页都只是覆盖在设置
- * 主页上的全屏页面，隐藏/显示不改变设置主页的网格、状态栏和手势；
- * 其余条目保留原入口，后续按各自功能接入。
+ * 开：白色圆形底 + 黑色蓝牙图标 + 白色“蓝牙”文字，与蓝牙子页里
+ *     白色选中轨道的大开关保持一致；
+ * 关：深灰圆底 + 白色图标 + 灰色文字，与其他设置按钮完全一致。
+ *
+ * 只改变颜色，不改变 100px 圆形按钮的尺寸、两列网格位置、图标字形
+ * 或触摸目标；也不新增动画，避免影响原有设置页手势和布局。
+ */
+static void bt_button_apply(bool on)
+{
+    if (!s_bt_button || !s_bt_icon || !s_bt_caption) return;
+    if (on) {
+        lv_obj_set_style_bg_color(s_bt_button, UI_COLOR_TEXT, 0);
+        lv_obj_set_style_text_color(s_bt_icon, UI_COLOR_ON_ACCENT, 0);
+        lv_obj_set_style_text_color(s_bt_caption, UI_COLOR_TEXT, 0);
+    } else {
+        lv_obj_set_style_bg_color(s_bt_button, UI_COLOR_CONTROL_BG, 0);
+        lv_obj_set_style_text_color(s_bt_icon, UI_COLOR_TEXT, 0);
+        lv_obj_set_style_text_color(s_bt_caption, UI_COLOR_TEXT_CAPTION, 0);
+    }
+}
+
+void ui_settings_refresh_bluetooth(void)
+{
+    if (!s_bt_button) return;
+    bool on = bt_audio_is_enabled();
+    /* 状态未变化时避免重复设置样式，减少无意义的重绘。 */
+    if (on == s_bt_visual_on) return;
+    s_bt_visual_on = on;
+    bt_button_apply(on);
+}
+
+/**
+ * @brief 蓝牙入口的新按下回调：清除上一轮的长按消费标志。
+ *
+ * 每次短按/长按都以 PRESSED 开始，先复位标志，再等待本次手势的
+ * LONG_PRESSED 或 CLICKED。这样即使某次长按后系统没有派发 CLICKED，
+ * 也不会让下一次短按被误吞。
+ */
+static void bt_item_pressed_cb(lv_event_t *e)
+{
+    (void)e;
+    s_bt_long_pressed = false;
+}
+
+/**
+ * @brief 蓝牙入口长按：进入蓝牙设置子页。
+ *
+ * 长按只负责打开页面，不切换开关；松手后的 CLICKED 由
+ * item_click_cb() 根据 s_bt_long_pressed 丢弃。页面样式、动画和返回
+ * 行为与时钟/姿态感应子页一致，不改设置主页布局。
+ */
+static void bt_item_long_pressed_cb(lv_event_t *e)
+{
+    unsigned idx = (unsigned)(uintptr_t)lv_event_get_user_data(e);
+    if (idx != 1) return;
+    s_bt_long_pressed = true;
+    ui_bluetooth_settings_show();
+}
+
+/**
+ * @brief 设置项按钮点击回调。
+ *
+ * 索引 1 是“蓝牙”：短按切换电源意图（开关状态不写 NVS，上电默认
+ * 关闭），长按已由 bt_item_long_pressed_cb() 打开设置页，这里必须
+ * 丢弃同一次交互产生的 CLICKED，避免“进页面顺带切换开关”。
+ * 索引 2 是“姿态感应”，索引 3 是“时钟”；其余条目保留原入口，
+ * 后续按各自功能接入。两个已存在的子页都只是覆盖在设置主页上的
+ * 全屏页面，隐藏/显示不改变设置主页的网格、状态栏和手势。
  */
 static void item_click_cb(lv_event_t *e)
 {
     int idx = (int)(uintptr_t)lv_event_get_user_data(e);
-    if(idx==2) ui_motion_settings_show();
+    if (idx == 1) {
+        if (s_bt_long_pressed) {
+            s_bt_long_pressed = false;
+            return;
+        }
+        /* 只记录用户意图并更新开关；真正的 U4 链路启停由 bt_audio
+         * 后端异步完成。短按不打开页面，页面内另有同样的开关。
+         * 立即刷新按钮颜色，让用户在网格上就能看出开关已经切换。 */
+        bt_audio_set_enabled(!bt_audio_is_enabled());
+        ui_settings_refresh_bluetooth();
+    }
+    else if(idx==2) ui_motion_settings_show();
     else if(idx==3) ui_clock_settings_show();
     /* 其余设置项保留原入口，后续按各自功能接入。 */
 }
@@ -121,6 +214,16 @@ void ui_settings_create(lv_obj_t *parent)
         lv_obj_add_event_cb(btn, item_click_cb, LV_EVENT_CLICKED,
                             (void *)(uintptr_t)i);
 
+        /* 仅蓝牙入口（索引 1）注册长按：短按切换开关，长按进入设置
+         * 子页。默认长按阈值沿用 LVGL 的 400ms，不修改全局输入参数；
+         * 其他设置项保持原有单击行为。 */
+        if (i == 1) {
+            lv_obj_add_event_cb(btn, bt_item_pressed_cb, LV_EVENT_PRESSED,
+                                (void *)(uintptr_t)i);
+            lv_obj_add_event_cb(btn, bt_item_long_pressed_cb,
+                                LV_EVENT_LONG_PRESSED, (void *)(uintptr_t)i);
+        }
+
         /* 图标字体 26px，增大使图标更醒目 */
         if(i==3) {
             /* 时钟图标为 40px 圆形表盘加两根指针。保持原 100px 按钮、
@@ -152,6 +255,9 @@ void ui_settings_create(lv_obj_t *parent)
             lv_obj_set_style_text_color(ico, UI_COLOR_TEXT, 0);
             lv_obj_set_style_text_font(ico, &lv_font_montserrat_26, 0);
             lv_obj_center(ico);
+            /* 蓝牙图标在开启时反色，需要保留指针。其他图标仍由 LVGL
+             * 正常管理，不额外保存。 */
+            if (i == 1) s_bt_icon = ico;
         }
 
         /* 按钮下方文字 */
@@ -160,7 +266,16 @@ void ui_settings_create(lv_obj_t *parent)
         lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT_CAPTION, 0);
         lv_obj_set_style_text_font(lbl, ui_font_14(), 0);
         lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
+        if (i == 1) {
+            s_bt_button = btn;
+            s_bt_caption = lbl;
+        }
     }
+
+    /* 按当前蓝牙电源意图初始化入口外观（上电默认关闭）。这里只设置
+     * 颜色，不读取 NVS、不启动链路，也不改变任何按钮位置。 */
+    s_bt_visual_on = bt_audio_is_enabled();
+    bt_button_apply(s_bt_visual_on);
 
     lv_obj_add_flag(s_page, LV_OBJ_FLAG_HIDDEN);
     s_visible = false;
@@ -193,6 +308,10 @@ static void hide_ready(lv_anim_t *a)
 void ui_settings_show(void)
 {
     if (!s_page || s_visible) return;
+
+    /* 蓝牙子页的开关可能在设置主页被覆盖期间改变电源意图；展开设置
+     * 主页时先同步入口按钮颜色。只比较 RAM 状态，不访问后端硬件。 */
+    ui_settings_refresh_bluetooth();
 
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_page);

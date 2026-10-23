@@ -23,6 +23,12 @@ void ui_statusbar_set_visible(bool visible) { status_visible=visible; }
 /* Settings-page regression includes the real ui_settings.c; the motion page is
  * out of scope here, so its entry point is a no-op double. */
 void ui_motion_settings_show(void) {}
+/* ui_settings.c 的蓝牙入口同样只做链接占位：时钟测试不点击蓝牙按钮，
+ * 也不验证蓝牙状态机；最小 double 保持该页面可独立编译。 */
+static bool bt_power_double;
+void bt_audio_set_enabled(bool enabled) { bt_power_double=enabled; }
+bool bt_audio_is_enabled(void) { return bt_power_double; }
+void ui_bluetooth_settings_show(void) {}
 void pmic_axp2101_notify_service(void) { assert(!in_isr);++notify_count; }
 void pmic_axp2101_notify_service_from_isr(void) { assert(in_isr);++isr_notify_count; }
 TickType_t xTaskGetTickCount(void) { return ticks; }

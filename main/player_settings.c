@@ -1,5 +1,6 @@
 #include "player_settings.h"
 #include "ui/ui_motion_settings.h"
+#include "bt_audio.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include <string.h>
@@ -48,6 +49,17 @@ static size_t encode(const player_settings_t *v, uint8_t *b)
     /* 7/8 为新增的可选单字节开关字段。旧固件按未知 ID 跳过，因此不需要
      * 升级版本；旧数据缺少这两个字段时解码默认值保持关闭。 */
     n=add_field(b,n,7,&motion_steps,1); n=add_field(b,n,8,&motion_wake,1);
+    /* 9 为可选配对记录：[valid][bda 6][name<=32]。未配对时不写该字段，
+     * 旧固件按未知 ID 跳过，因此同样不需要升级版本。 */
+    if (v->bt_paired) {
+        uint8_t pair[1+6+PLAYER_SETTINGS_BT_NAME_MAX];
+        size_t pair_len=0;
+        pair[pair_len++]=1;
+        memcpy(pair+pair_len,v->bt_paired_bda,6); pair_len+=6;
+        size_t name_len=strnlen(v->bt_paired_name,sizeof(v->bt_paired_name));
+        memcpy(pair+pair_len,v->bt_paired_name,name_len); pair_len+=name_len;
+        n=add_field(b,n,9,pair,(uint16_t)pair_len);
+    }
     put16(b+6,n); put32(b+8,crc32(b+SETTINGS_HEADER,n-SETTINGS_HEADER));
     return n;
 }
@@ -63,7 +75,7 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
         if (n-off<3) return ESP_ERR_INVALID_SIZE;
         uint8_t id=b[off++]; uint16_t len=get16(b+off); off+=2;
         if (len>n-off) return ESP_ERR_INVALID_SIZE;
-        if (id>=1 && id<=8) {
+        if (id>=1 && id<=9) {
             if (seen & (1U<<id)) return ESP_ERR_INVALID_RESPONSE;
             seen |= 1U<<id;
         }
@@ -85,6 +97,25 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
             if (len!=1) return ESP_ERR_INVALID_SIZE;
             if (b[off]>1) return ESP_ERR_INVALID_ARG;
             if (id==7) tmp.motion_steps=b[off]; else tmp.motion_wake=b[off];
+        } else if (id==9) {
+            /* 配对记录：valid + 6 字节 BDA + 至多 32 字节名称。名称必须
+             * 以 TLV 长度结束，不接受内嵌 NUL；全 0 BDA 视为损坏。 */
+            if (len<7 || len>1+6+PLAYER_SETTINGS_BT_NAME_MAX-1)
+                return ESP_ERR_INVALID_SIZE;
+            if (b[off]>1) return ESP_ERR_INVALID_ARG;
+            if (!b[off]) {
+                if (len!=7) return ESP_ERR_INVALID_SIZE;
+            } else {
+                uint8_t any=0;
+                for (unsigned k=0;k<6;++k) any|=(uint8_t)b[off+1+k];
+                if (!any) return ESP_ERR_INVALID_ARG;
+                size_t name_len=(size_t)len-7;
+                if (memchr(b+off+7,0,name_len)) return ESP_ERR_INVALID_SIZE;
+                tmp.bt_paired=true;
+                memcpy(tmp.bt_paired_bda,b+off+1,6);
+                memcpy(tmp.bt_paired_name,b+off+7,name_len);
+                tmp.bt_paired_name[name_len]=0;
+            }
         }
         off+=len;
     }
@@ -125,6 +156,18 @@ void player_settings_get_motion(bool *steps, bool *wake)
     if (steps) *steps=s_ram.motion_steps;
     if (wake) *wake=s_ram.motion_wake;
 }
+void player_settings_get_bluetooth(bool *valid, uint8_t bda[6],
+                                   char *name, size_t name_size)
+{
+    /* 只读 RAM 快照；不访问 Flash/蓝牙链路。 */
+    if (valid) *valid=s_ram.bt_paired;
+    if (bda) memcpy(bda,s_ram.bt_paired_bda,6);
+    if (name && name_size) {
+        size_t len=strnlen(s_ram.bt_paired_name,sizeof(s_ram.bt_paired_name));
+        if (len>=name_size) len=name_size-1;
+        memcpy(name,s_ram.bt_paired_name,len); name[len]=0;
+    }
+}
 void player_settings_capture(player_settings_t *out)
 {
     ui_device_state_t *st=ui_get_device_state();
@@ -139,6 +182,11 @@ void player_settings_capture(player_settings_t *out)
      * 但生产路径中 capture 只在 ui_manager_init() 之后才被调用。 */
     s_ram.motion_steps=ui_motion_settings_steps_enabled();
     s_ram.motion_wake=ui_motion_settings_wake_enabled();
+    /* 配对记录由链路 worker 在 A2DP 连接成功后发布；这里只取 RAM 快照。
+     * 未配对时 get_paired 会清零输出，s_ram 中不会残留旧地址。 */
+    s_ram.bt_paired=bt_audio_get_paired(s_ram.bt_paired_bda,
+                                        s_ram.bt_paired_name,
+                                        sizeof(s_ram.bt_paired_name));
     *out=s_ram;
 }
 void player_settings_get_song(char *folder, char *audio)
@@ -153,13 +201,17 @@ bool player_settings_equal(const player_settings_t *a, const player_settings_t *
     return a->brightness==b->brightness && a->volume==b->volume &&
         a->muted==b->muted && a->auto_brightness==b->auto_brightness &&
         a->motion_steps==b->motion_steps && a->motion_wake==b->motion_wake &&
+        a->bt_paired==b->bt_paired &&
+        !memcmp(a->bt_paired_bda,b->bt_paired_bda,6) &&
+        !strcmp(a->bt_paired_name,b->bt_paired_name) &&
         !strcmp(a->song_folder,b->song_folder) && !strcmp(a->song_audio,b->song_audio);
 }
 esp_err_t player_settings_save(const player_settings_t *v)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (v->brightness<5 || v->brightness>100 || v->volume>100 ||
-        !memchr(v->song_folder,0,MUSIC_NAME_MAX) || !memchr(v->song_audio,0,MUSIC_NAME_MAX))
+        !memchr(v->song_folder,0,MUSIC_NAME_MAX) || !memchr(v->song_audio,0,MUSIC_NAME_MAX) ||
+        !memchr(v->bt_paired_name,0,sizeof(v->bt_paired_name)))
         return ESP_ERR_INVALID_ARG;
     if (s_have_saved && player_settings_equal(v,&s_saved))
         return ESP_OK;

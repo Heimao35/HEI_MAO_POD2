@@ -14,6 +14,20 @@ ui_device_state_t *ui_get_device_state(void) { return &state; }
 static bool motion_steps, motion_wake;
 bool ui_motion_settings_steps_enabled(void) { return motion_steps; }
 bool ui_motion_settings_wake_enabled(void) { return motion_wake; }
+/* 配对记录由蓝牙 worker 维护；本测试用可变替身验证快照会读取/保存它。 */
+static bool bt_paired_double;
+static uint8_t bt_bda_double[6];
+static char bt_name_double[PLAYER_SETTINGS_BT_NAME_MAX];
+bool bt_audio_get_paired(uint8_t bda[6], char *name, size_t name_size)
+{
+    memset(bda,0,6); name[0]=0;
+    if(!bt_paired_double) return false;
+    memcpy(bda,bt_bda_double,6);
+    size_t n=strlen(bt_name_double);
+    if(n>=name_size) n=name_size-1;
+    memcpy(name,bt_name_double,n); name[n]=0;
+    return true;
+}
 esp_err_t nvs_flash_init(void) { return init_result; }
 esp_err_t nvs_open(const char *ns,int mode,nvs_handle_t *h)
 { assert(!opened && !strcmp(ns,"player")); opened=true; writable=mode==NVS_READWRITE; *h=1; ++opens; return ESP_OK; }
@@ -129,5 +143,27 @@ int main(void)
     reboot_ram(); init_result=ESP_FAIL;
     assert(player_settings_init()==ESP_FAIL && !s_ready && sets==written);
     puts("PASS unsupported versions/init failures preserve NVS and disable writes; no erase API exists in double");
+
+    /* 蓝牙配对记录：连接成功后的 BDA/名称必须进入同一快照并在重启后读回，
+     * 供 bt_audio 在下次打开蓝牙时自动重连。 */
+    init_result=ESP_OK;
+    player_settings_t seed=before;
+    bt_paired_double=false;
+    disk_len=encode(&seed,disk);
+    reboot_ram(); assert(player_settings_init()==ESP_OK && s_ready);
+    bt_paired_double=true;
+    const uint8_t pair_bda[6]={0x11,0x22,0x33,0x44,0x55,0x66};
+    memcpy(bt_bda_double,pair_bda,6);
+    memset(bt_name_double,0,sizeof(bt_name_double));
+    strcpy(bt_name_double,"客厅音箱");
+    player_settings_capture(&after);
+    assert(after.bt_paired && !memcmp(after.bt_paired_bda,pair_bda,6) &&
+           !strcmp(after.bt_paired_name,"客厅音箱"));
+    assert(player_settings_save(&after)==ESP_OK);
+    reboot_ram(); assert(player_settings_init()==ESP_OK);
+    bool pair_valid=false; uint8_t pair_read[6]; char pair_name[PLAYER_SETTINGS_BT_NAME_MAX];
+    player_settings_get_bluetooth(&pair_valid,pair_read,pair_name,sizeof(pair_name));
+    assert(pair_valid && !memcmp(pair_read,pair_bda,6) && !strcmp(pair_name,"客厅音箱"));
+    puts("PASS Bluetooth pairing record round-trips through the settings TLV/NVS snapshot");
     return 0;
 }

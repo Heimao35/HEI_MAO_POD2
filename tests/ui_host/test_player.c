@@ -24,6 +24,14 @@ void ui_clock_settings_close_for_lock(void) {}
 bool ui_motion_settings_is_visible(void) { return false; }
 void ui_motion_settings_create(lv_obj_t *parent) { (void)parent; }
 void ui_motion_settings_close_for_lock(void) {}
+/* Bluetooth subpage and facade are inert here: ui_manager.c only needs their
+ * link symbols for gesture/init/lock paths, and status must stay disconnected. */
+bool ui_bluetooth_settings_is_visible(void) { return false; }
+void ui_bluetooth_settings_create(lv_obj_t *parent) { (void)parent; }
+void ui_bluetooth_settings_close_for_lock(void) {}
+bool bt_audio_is_connected(void) { return false; }
+/* ui_manager.c publishes the Bluetooth icon through the shared device state. */
+ui_device_state_t *ui_get_device_state(void) { static ui_device_state_t state; return &state; }
 bool ui_power_dialog_is_visible(void) { return false; }
 bool ui_lockscreen_is_visible(void) { return false; }
 bool ui_mode_panel_is_visible(void) { return false; }

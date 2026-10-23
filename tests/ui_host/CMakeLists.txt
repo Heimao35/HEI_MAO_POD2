@@ -274,6 +274,40 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME motion COMMAND motion_tests)
 
+# Bluetooth settings subpage: power switch, scan-result rows, 18px names and
+# backend-confirmed status against a RAM facade double; no SDIO/Bluetooth.
+add_executable(bluetooth_tests test_bluetooth.c)
+target_include_directories(bluetooth_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(bluetooth_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(bluetooth_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+  target_link_options(bluetooth_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME bluetooth COMMAND bluetooth_tests)
+
+# Settings grid Bluetooth entry: short click toggles power, long press opens
+# the subpage and must suppress the CLICKED emitted on release.
+add_executable(settings_bt_tests test_settings_bt.c "${REPO}/main/ui/ui_settings.c")
+target_include_directories(settings_bt_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(settings_bt_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(settings_bt_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+  target_link_options(settings_bt_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME settings_bt COMMAND settings_bt_tests)
+
+# Bluetooth facade state machine: user intent, link-ready auto-connect, scan
+# cache, pairing RAM and error fallback. Transport and mutex are doubles.
+add_executable(bt_audio_tests test_bt_audio.c)
+target_include_directories(bt_audio_tests PRIVATE stubs ../media_host/stubs
+                           "${REPO}/main" "${REPO}/u4_a2dp/main")
+target_link_libraries(bt_audio_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(bt_audio_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+  target_link_options(bt_audio_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME bt_audio COMMAND bt_audio_tests)
+
 # Real Bosch SensorAPI + production adapter against paged BMI270 hardware doubles.
 add_executable(motion_sensor_tests test_motion_sensor.c
     "${REPO}/main/third_party/bmi270/bmi2.c"

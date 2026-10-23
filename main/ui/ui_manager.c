@@ -25,6 +25,8 @@
 #include "ui_settings.h"
 #include "ui_clock_settings.h"
 #include "ui_motion_settings.h"
+#include "ui_bluetooth_settings.h"
+#include "bt_audio.h"
 #include "esp_log.h"
 
 static const char *TAG = "ui_manager";
@@ -95,8 +97,10 @@ static void gesture_released_cb(lv_event_t *e)
     if (ui_power_dialog_is_visible()) return;
     /* 子页滚轮/开关独占触摸，不让边缘/底部滑动穿透到原设置页或播放器。
      * 姿态感应子页没有滚轮，但同样必须独占，否则在返回动画途中从底部
-     * 上滑会把下层的设置主页收起，留下一个悬空的子页。 */
-    if (ui_clock_settings_is_visible() || ui_motion_settings_is_visible()) return;
+     * 上滑会把下层的设置主页收起，留下一个悬空的子页。蓝牙子页含可
+     * 滚动设备列表，也必须独占，否则列表拖到端部会把设置主页收起。 */
+    if (ui_clock_settings_is_visible() || ui_motion_settings_is_visible() ||
+        ui_bluetooth_settings_is_visible()) return;
     lv_indev_t *indev = lv_indev_active();
     if (!indev) return;
 
@@ -236,6 +240,11 @@ static void periodic_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     ui_clock_settings_update(); /* RAM 快照，无 I2C；先发布再绘制真实时间。 */
+    /* 状态栏蓝牙图标只表示“A2DP 链路已连接”，不表示“蓝牙开关已打开”
+     * 或“正在扫描”。这里在后端先确认连接后写共享状态，随后
+     * ui_statusbar_update() 才会显示图标；断开或关闭时同样在本周期内
+     * 隐藏。读取是原子快照，不访问 SDIO/协议栈。 */
+    ui_get_device_state()->bt_connected = bt_audio_is_connected();
     ui_statusbar_update();
     ui_lockscreen_update();
 }
@@ -307,6 +316,10 @@ void ui_manager_init(void)
      * 创建顺序在状态栏之前，保持原有 z-order；显示时再 move_foreground，
      * 不改变各模式页面、锁屏、面板和状态栏的既有顺序。 */
     ui_motion_settings_create(scr);
+    /* 蓝牙设置子页与时钟/姿态子页同级，创建在状态栏之前以保持原有
+     * z-order；显示时再 move_foreground。它上电默认关闭，不读 NVS、
+     * 不启动扫描，因此这里只建对象，不影响开机时间。 */
+    ui_bluetooth_settings_create(scr);
 
     /* ---- 5. 状态栏（最顶层） ---- */
     ui_statusbar_create(scr);
@@ -397,6 +410,8 @@ void ui_manager_lock(void)
      * 仅复用原收起动画，不改变这些页面自身的手势、布局及动画曲线。 */
     ui_clock_settings_close_for_lock();
     ui_motion_settings_close_for_lock();
+    /* 蓝牙子页同样收起并停止扫描；蓝牙连接和音频输出不在锁屏时断开。 */
+    ui_bluetooth_settings_close_for_lock();
     /* 锁屏 MJPEG 和视频播放器不能同时占用硬件 JPEG。这里先隐藏播放器并
      * 投递停止/释放请求，锁屏动画会等待视频 worker 空闲后再解码。 */
     ui_video_player_close_for_lock();

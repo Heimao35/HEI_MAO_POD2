@@ -1,4 +1,4 @@
-idf_component_register(SRCS "jpeg_codec.c" "main.c"
+idf_component_register(SRCS "bt_audio.c" "jpeg_codec.c" "main.c"
                               "sd_card.c"
                               "lock_animation.c"
                               "video_mjpeg.c"
@@ -15,6 +15,7 @@ idf_component_register(SRCS "jpeg_codec.c" "main.c"
                               "ambient_light.c"
                               "system_power.c"
                               "player_settings.c"
+                              "bt_link.c"
                               "volume_keys.c"
                               "music_library.c"
                               "audio_player.c"
@@ -40,10 +41,12 @@ idf_component_register(SRCS "jpeg_codec.c" "main.c"
                               "ui/ui_settings.c"
                               "ui/ui_clock_settings.c"
                               "ui/ui_motion_settings.c"
+                              "ui/ui_bluetooth_settings.c"
                               "ui/ui_manager.c"
                               "ui/ui_power_dialog.c"
-                    INCLUDE_DIRS "." "ui"
-                    PRIV_REQUIRES fatfs sdmmc esp_driver_jpeg esp_partition
+                    INCLUDE_DIRS "." "ui" "../u4_a2dp/main"
+                    PRIV_REQUIRES fatfs sdmmc esp_driver_sdmmc esp_driver_jpeg esp_partition
+                                  esp_serial_slave_link
                                   esp_lcd esp_lcd_touch_cst820
                                   esp_hw_support esp_timer driver
                                   esp_lvgl_port

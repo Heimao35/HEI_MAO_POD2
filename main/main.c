@@ -18,6 +18,8 @@
 #include "player_settings.h"
 #include "volume_keys.h"
 #include "motion_sensor.h"
+#include "bt_audio.h"
+#include "bt_link.h"
 
 #include "esp_lcd_co5300.h"
 #include "co5300_init_cmds.h"
@@ -343,6 +345,20 @@ void app_main(void)
     esp_err_t settings_ret=player_settings_init();
     if (settings_ret!=ESP_OK) ESP_LOGW(TAG,"Settings unavailable: %s",esp_err_to_name(settings_ret));
 
+    /* 蓝牙应用层状态机：上电默认关闭，不读 NVS、不启动 SDIO 或 Bluetooth。
+     * 提前初始化是为了让随后创建的蓝牙设置页/状态栏读取确定的 OFF 状态；
+     * 配对记录在下面恢复，真正的 SDIO worker 在 SD 卡初始化完成后启动。 */
+    esp_err_t bt_ret=bt_audio_init();
+    if (bt_ret!=ESP_OK) ESP_LOGW(TAG,"Bluetooth facade init failed: %s",esp_err_to_name(bt_ret));
+    /* 配对记录只恢复 RAM：下次用户打开蓝牙时由 bt_audio 自动发起连接。
+     * 开关状态不持久化，上电仍默认关闭。 */
+    bool bt_paired=false;
+    uint8_t bt_paired_bda[6]={0};
+    char bt_paired_name[PLAYER_SETTINGS_BT_NAME_MAX]={0};
+    player_settings_get_bluetooth(&bt_paired,bt_paired_bda,bt_paired_name,
+                                  sizeof(bt_paired_name));
+    if (bt_paired) bt_audio_set_paired(bt_paired_bda,bt_paired_name);
+
     /* Show LVGL objects */
     lvgl_port_lock(0);
     player_settings_restore_ui();
@@ -387,6 +403,13 @@ void app_main(void)
     /* 放在 UI 初始化之后，确保 lockscreen 等 UI 对象已创建 */
     esp_err_t sd_ret = sd_card_init();
     if (sd_ret != ESP_OK) ESP_LOGE(TAG, "SD init failed: %s", esp_err_to_name(sd_ret));
+
+    /* SD 卡 slot0 初始化完成后再启动 slot1 的 SDIO worker，避免两个
+     * slot 并发调用非线程安全的 sdmmc_host_init_slot。worker 在后台
+     * 探测/重试 U4，不阻塞后续动画和音频初始化。 */
+    esp_err_t bt_link_ret = bt_link_init();
+    if (bt_link_ret != ESP_OK)
+        ESP_LOGW(TAG, "Bluetooth link init failed: %s", esp_err_to_name(bt_link_ret));
 
     app_boot_progress(82,"Preparing lock animation...");
     /* 动画资源只在本次启动导入一次，此时音频/屏幕电源任务尚未启动。
