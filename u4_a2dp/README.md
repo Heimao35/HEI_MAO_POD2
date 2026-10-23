@@ -20,6 +20,146 @@ idf.py build
 
 默认配置为 4 MB Flash、`Single factory app (large)`。
 
+## 一次性硬件准备：烧写 eFuse 固定 VDD_SDIO = 3.3 V
+
+### 为什么必须烧
+
+ESP32-U4WDH 使用 **3.3 V 片内 Flash**。ESP32 每次复位时用 strapping 引脚
+MTDI（GPIO12）选择 VDD_SDIO 电压：低电平 = 3.3 V，高电平 = 1.8 V。
+而 4-bit SDIO 的 DAT2 恰好也是 GPIO12，按 SDIO 规范需要 10–90 kΩ 上拉，
+两者直接冲突：
+
+- DAT2 加上拉 → 复位时 GPIO12 为高 → ROM 按 1.8 V 给 Flash 供电，3.3 V Flash 无法启动；
+- DAT2 不加拉 → 启动正常，但 4-bit SDIO 缺少一条数据线。
+
+烧写 `XPD_SDIO_FORCE` / `XPD_SDIO_REG` / `XPD_SDIO_TIEH` 三个 eFuse 后，
+VDD_SDIO 被永久固定为 3.3 V，GPIO12 不再参与电压选择，DAT2 上拉可以保留，
+4-bit SDIO 正常工作。本工程固件（`main/sdio_link.c`）默认按 4-bit 打开，
+即依赖该 eFuse。
+
+> ⚠️ **eFuse 是一次性、不可逆操作**。只能对确认是 3.3 V Flash 的芯片
+> （ESP32-U4WDH 符合）执行；烧写期间断电可能永久损坏芯片。若无法接受，
+> 请改用文末的 1-bit SDIO / SPI 方案。
+
+### 1. 准备
+
+- 确认芯片型号为 ESP32-U4WDH（4 MB 片内 3.3 V Flash）；
+- 提供稳定 3.3 V 供电和可靠的 UART（TX / RX / GND）；
+- 在 ESP-IDF 命令行环境中操作（`espefuse.py` 随 IDF 一起提供，esptool v4.12）。
+  若提示找不到命令，先运行 `export.bat` / `export.ps1`，或直接使用
+  `%IDF_PATH%\components\esptool_py\esptool\espefuse.py`（其本质是
+  `python -m espefuse`）；
+- 在 Windows 设备管理器中确认 U4 的串口号，下文用 `COMx` 表示；
+- 先按下一节进入下载模式，确认能正常连上芯片：
+
+```bat
+esptool.py -p COMx --chip esp32 read_mac
+```
+
+### 2. 进入下载模式（关键）
+
+```text
+复位瞬间：GPIO0 = 0，GPIO2 = 0，CHIP_PU(EN) 走一次低 → 高
+```
+
+- ROM 的 UART 下载模式要求 **GPIO0 和 GPIO2 同时为低**；
+- 本项目 PCB 上 IO2/DAT0 有 SDIO 上拉电阻，会把 GPIO2 拉高，从而阻止进入下载
+  模式。首次烧录和烧 eFuse 时必须临时断开该上拉，或在复位期间用跳线把 IO2
+  拉到 GND；此时 P4 必须复位/断电，否则 P4 的 IO14 会驱动同一网络。若 PCB
+  没有给 DAT0/IO2 加上拉，IO2 悬空时 ROM 内部默认下拉即可满足 GPIO2=0，
+  不需要额外处理；
+- **IO12/DAT2 的上拉不需要拆除**：烧写走 UART 下载模式，不访问片内 Flash，
+  上拉不影响；烧写完成后它正好保留给 4-bit SDIO；
+- PCB 上 `CHIP_PU` 接在 P4 的 IO54：烧写时需让 P4 不再驱动该脚（P4 复位/断电，
+  或用临时固件把 IO54 设为输入），避免与编程器抢 EN；
+- `CHIP_PU` 只能复位，不能烧录；必须有 UART0 TX/RX 通路。建议在 PCB 上预留
+  U4 的 EN / GPIO0 / GPIO2 / TX / RX 测试点。
+
+### 3. 备份当前 eFuse
+
+```bat
+espefuse.py -p COMx --chip esp32 summary
+```
+
+- 输出包含 MAC 和全部 eFuse 字段，建议保存一份文本备份；
+- 烧写前，最后一行通常为：
+
+```text
+Flash voltage (VDD_SDIO) determined by GPIO12 on reset (High for 1.8V, Low/NC for 3.3V)
+```
+
+### 4. 烧写
+
+```bat
+espefuse.py -p COMx --chip esp32 set_flash_voltage 3.3V
+```
+
+工具会打印将要烧写的位：
+
+```text
+Enable internal flash voltage regulator (VDD_SDIO) to 3.3V.
+The following eFuses are burned: XPD_SDIO_FORCE, XPD_SDIO_REG, XPD_SDIO_TIEH.
+```
+
+随后要求输入 `BURN` 确认。**确认电压是 3.3V、芯片是 ESP32-U4WDH 后再输入**；
+烧写期间不要断电、不要拔线。成功后会看到 `BURN BLOCK0 - OK` 等输出。
+
+- `--do-not-confirm` 可以跳过输入确认，但不清楚后果时不要使用；
+- 该操作不会擦除 Flash，不影响已烧录的固件；
+- 新版 esptool（5.x）命令改为连字符：`espefuse set-flash-voltage 3.3V`。
+
+### 5. 验证
+
+```bat
+espefuse.py -p COMx --chip esp32 summary
+```
+
+确认以下三项为 1（字段顺序因版本略有差异）：
+
+```text
+XPD_SDIO_FORCE   1
+XPD_SDIO_REG     1
+XPD_SDIO_TIEH    1
+```
+
+并且 summary 末尾变为：
+
+```text
+Flash voltage (VDD_SDIO) set to 3.3V by efuse.
+```
+
+此时 VDD_SDIO 永久为 3.3 V，GPIO12 高低不再影响 Flash 电压，DAT2 上拉可保留，
+4-bit SDIO 可用。
+
+### 6. 之后每次给 U4 刷固件
+
+- eFuse 只固定电压，不改变下载模式要求：仍然需要复位瞬间 GPIO0=0、GPIO2=0；
+- 也就是说 **IO2/DAT0 上拉的问题每次烧录都会遇到**，建议在 PCB 上为
+  IO0 / IO2 / EN / TX / RX 预留测试点或跳线；
+- 正常运行时（GPIO0=1）GPIO2 是 don't-care，上拉照常保留，不影响 SDIO 工作；
+- 刷固件使用 `idf.py -p COMx flash monitor` 即可。
+
+### 7. 常见错误
+
+| 现象 | 原因 |
+| --- | --- |
+| `Wrong boot mode detected (0x13)` / `Failed to connect ... Wrong boot mode` | 复位时 GPIO0、GPIO2 没有同时为低，检查 IO2 上拉和跳线 |
+| `Timed out waiting for packet header` | 没有进入下载模式，或 TX/RX 接反、供电不稳 |
+| `espefuse.py: command not found` | 不在 IDF 命令行环境，运行 `export.bat`/`export.ps1`，或用完整路径 |
+| `Can't set regulator to 1.8V if XPD_SDIO_TIEH efuse is already burned` | 该芯片已固定 3.3 V，无需（也无法）再改回 1.8 V |
+
+### 8. 不烧 eFuse 的替代方案
+
+如果不想做不可逆操作，可以改用：
+
+1. **1-bit SDIO**：把 `main/sdio_link.c` 中 `sdio_slave_config_t.flags` 从 `0`
+   改为 `SDIO_SLAVE_FLAG_DAT2_DISABLED`，P4 侧按 1-bit 连接；
+2. **SPI 模式**：使用 CLK / MOSI / MISO / CS + DAT1 中断，P4 作为 SPI 主机，
+   协议需自行实现。PCM 码率约 1.5 Mbps，SPI 足以胜任。
+
+这两种方案都要求 U4 复位时 DAT2 不被外部上拉保持为高；若 PCB 已焊上拉，
+就需要改板，或者仍然烧 eFuse。
+
 ## 烧录前必须设置音箱名称
 
 独立验证时，固件会按 `CONFIG_EXAMPLE_PEER_DEVICE_NAME` 自动连接音箱：
@@ -38,8 +178,10 @@ CONFIG_EXAMPLE_PEER_DEVICE_NAME="你的音箱名称"
 名称必须与音箱实际广播名称完全一致；否则会一直扫描。接入 P4 后可以由
 `LINK_CMD_CONNECT` 按 Bluetooth 地址连接，不再依赖该名称。
 
-U4 下载模式：GPIO0=0、GPIO2=0；`CHIP_PU` 复位。该板已烧写
-`XPD_SDIO_*` eFuse 固定 VDD_SDIO=3.3 V，IO12 的 SDIO DAT2 上拉可保留。
+U4 下载模式：GPIO0=0、GPIO2=0；`CHIP_PU` 复位。注意 IO2/DAT0 的 SDIO 上拉会阻止
+进入下载模式，处理方式见「一次性硬件准备」一节。烧写 `XPD_SDIO_*` eFuse 后
+VDD_SDIO 固定为 3.3 V，IO12 的 SDIO DAT2 上拉可以保留（本项目所用 U4 已完成烧写，
+复刻时必须自行完成）。
 
 ## 与 P4 的接口
 
