@@ -139,6 +139,15 @@ esp_err_t bt_audio_connect(const uint8_t bda[6]);
 bool bt_audio_is_connected(void);
 
 /**
+ * @brief 更新 A2DP 绝对音量意图（0..100，muted 为 true 时发送 0）。
+ *
+ * 由音量滑条/物理按键经 audio_output_set_volume 调用；连接后通过 U4
+ * 的 AVRCP 发送 0..127。本机 DAC 的音量叠加“蓝牙连接时静音”策略，
+ * 与本函数的用户意图分开保存。
+ */
+void bt_audio_set_volume(uint8_t volume, bool muted);
+
+/**
  * @brief 复制已连接设备名称（线程安全）。
  *
  * @param out 输出缓冲区；未连接时写入空字符串

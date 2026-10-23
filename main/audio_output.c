@@ -10,6 +10,8 @@
 #include "driver/gpio.h"
 #include "esp_audio_simple_dec.h"
 #include "audio_mp3.h"
+#include "bt_audio.h"
+#include "bt_audio_stream.h"
 #include "esp_flac_dec.h"
 #include "esp_heap_caps.h"
 #include "esp_lvgl_port.h"
@@ -85,6 +87,12 @@ static atomic_uint s_video_rate_pub,s_video_frame_bytes_pub,s_video_bits_pub,s_v
 static TickType_t s_diag_at,s_read_max,s_decode_max,s_push_max,s_step_max,s_poll_max;
 static uint64_t s_read_ticks,s_decode_ticks,s_push_ticks,s_decoded_frames;
 static uint32_t s_diag_underrun,s_decode_peak_frames;
+/* A2DP 已连接时本机 DAC 静音，但 I2S/DMA 继续运行以维持视频主时钟和
+ * 音乐进度；蓝牙断开后恢复用户音量。 */
+static unsigned dac_volume(void)
+{
+    return bt_audio_is_connected()?0:atomic_load(&s_volume);
+}
 static TickType_t record_max(TickType_t *maximum,TickType_t start)
 {
     TickType_t elapsed=xTaskGetTickCount()-start;
@@ -169,7 +177,14 @@ void audio_output_set_playing(bool play)
     portEXIT_CRITICAL(&s_cmd_mux);notify();
 }
 void audio_output_set_volume(uint8_t volume)
-{atomic_store(&s_volume,volume>100?100:volume);notify();}
+{
+    volume=volume>100?100:volume;
+    atomic_store(&s_volume,volume);
+    /* 用户音量同时作为 A2DP 绝对音量意图保存；BT 未连接时只记录，
+     * 连接成功后由 bt_audio 补发。 */
+    bt_audio_set_volume(volume,volume==0);
+    notify();
+}
 uint32_t audio_output_time_ms(void) {return atomic_load(&s_position);}
 uint32_t audio_output_duration_sec(void) {return atomic_load(&s_duration);}
 bool audio_output_is_play_requested(void) {return command().play;}
@@ -242,6 +257,8 @@ static void update_position(void)
 static void stop_tx(void)
 {
     atomic_store_explicit(&s_pcm.feed,false,memory_order_release);
+    /* 暂停/停止时清空蓝牙侧残留 PCM，恢复播放不能从旧位置继续。 */
+    bt_stream_reset();
     if(s_tx_on) {
         /* mute ramp期间DAC继续供时钟，已经排入DMA的有效样本仍计入进度。
          * 新ring数据停止进入DMA，所以暂停后保留的PCM不会被静音消耗。 */
@@ -263,6 +280,7 @@ static bool close_session(void)
     s_read_size=0;
     s_input_eof=s_decode_eof=s_format_ready=s_flac_prefix=false;
     audio_pcm_reset(&s_pcm,s_ring);
+    bt_stream_reset();
     reset_diagnostics();
     return true;
 }
@@ -500,7 +518,7 @@ static esp_err_t start_tx(void)
     if(ret==ESP_OK && (latest.serial!=s_current.serial || !latest.play)) {stop_tx();return ESP_OK;}
     if(ret==ESP_OK) {
         atomic_store_explicit(&s_pcm.feed,true,memory_order_release);
-        unsigned volume=atomic_load(&s_volume);
+        unsigned volume=dac_volume();
         ret=cs43131_volume(volume,volume==0);
     }
     if(ret!=ESP_OK) {
@@ -520,10 +538,16 @@ static size_t push_decoded(void)
 {
     size_t frame_bytes=s_format.channel*(s_format.bits_per_sample/8);
     size_t frames=(s_pcm_bytes-s_pcm_offset)/frame_bytes;
+    const uint8_t *source=s_output+s_pcm_offset;
     TickType_t before=xTaskGetTickCount();
-    size_t pushed=audio_pcm_push(&s_pcm,s_output+s_pcm_offset,frames,
+    size_t pushed=audio_pcm_push(&s_pcm,source,frames,
                                  s_format.bits_per_sample,s_format.channel);
     s_push_ticks+=record_max(&s_push_max,before);
+    /* 仅蓝牙已连接时复制一份到重采样/发送缓冲；本机 I2S ring 仍是
+     * 主路径，蓝牙拥塞不会反压或改变解码节奏。 */
+    if(pushed && bt_audio_is_connected())
+        bt_stream_write(source,pushed,s_format.bits_per_sample,
+                        s_format.channel,s_format.sample_rate);
     s_pcm_offset+=pushed*frame_bytes;
     return pushed;
 }
@@ -626,7 +650,11 @@ static void poll_headphone(void)
              * 必须在 LVGL 锁外处理，界面繁忙不能推迟暂停。插入只更新
              * 状态栏，绝不恢复播放，也不唤醒屏幕或展开任何控件。 */
             if(unplugged) {
-                if(video_command().active) {
+                if(bt_audio_is_connected()) {
+                    /* 蓝牙优先于耳机：拔出只更新状态栏，暂停/恢复本机
+                     * DAC 交给蓝牙连接状态；A2DP 继续输出。 */
+                    ESP_LOGI(TAG,"Headphone removed; Bluetooth output continues");
+                } else if(video_command().active) {
                     /* 视频音轨同样遵守拔出暂停；视频 worker 通过
                      * audio_output_video_play_requested() 同步界面状态。 */
                     portENTER_CRITICAL(&s_cmd_mux);
@@ -664,7 +692,7 @@ static esp_err_t start_video_tx(void)
     }
     if(ret==ESP_OK) {
         atomic_store_explicit(&s_pcm.feed,true,memory_order_release);
-        unsigned volume=atomic_load(&s_volume);
+        unsigned volume=dac_volume();
         s_video_volume=volume;
         ret=cs43131_volume(volume,volume==0);
     }
@@ -758,7 +786,7 @@ static void video_step(const video_command_t *v)
     }
     if(!s_tx_on || queued>=AUDIO_PCM_HIGH_BYTES) poll_headphone();
     if(s_tx_on) {
-        unsigned volume=atomic_load(&s_volume);
+        unsigned volume=dac_volume();
         if(volume!=s_video_volume && cs43131_volume(volume,volume==0)==ESP_OK)
             s_video_volume=volume;
     }
@@ -779,6 +807,7 @@ static void video_step(const video_command_t *v)
 
 esp_err_t audio_output_video_open(const audio_output_pcm_cfg_t *cfg)
 {
+    bt_stream_reset();
     if(!s_task || !cfg) return ESP_ERR_INVALID_STATE;
     if(!supported_rate(cfg->sample_rate) ||
        (cfg->channels!=1 && cfg->channels!=2) ||
@@ -813,6 +842,7 @@ esp_err_t audio_output_video_open(const audio_output_pcm_cfg_t *cfg)
 
 void audio_output_video_close(void)
 {
+    bt_stream_reset();
     if(!s_task) return;
     portENTER_CRITICAL(&s_cmd_mux);
     if(!s_video_cmd.active) {portEXIT_CRITICAL(&s_cmd_mux);return;}
@@ -834,6 +864,7 @@ void audio_output_video_close(void)
 void audio_output_video_play(bool play)
 {
     if(!s_task) return;
+    if(!play) bt_stream_reset();
     portENTER_CRITICAL(&s_cmd_mux);
     if(!s_video_cmd.active) {portEXIT_CRITICAL(&s_cmd_mux);return;}
     s_video_cmd.play=play;
@@ -847,9 +878,11 @@ void audio_output_video_flush(void)
     uint32_t request=atomic_fetch_add(&s_video_flush_req,1)+1;
     notify();
     for(unsigned i=0;i<200;++i) {
-        if(atomic_load(&s_video_flush_ack)==request) return;
+        if(atomic_load(&s_video_flush_ack)==request) break;
         vTaskDelay(pdMS_TO_TICKS(5));
     }
+    /* seek/刷新后不能让蓝牙继续播放旧位置的数据。 */
+    bt_stream_reset();
 }
 
 void audio_output_video_eof(void)
@@ -863,12 +896,15 @@ size_t audio_output_video_write(const void *pcm,size_t frames,uint32_t timeout_m
     unsigned bits=atomic_load(&s_video_bits_pub);
     unsigned channels=atomic_load(&s_video_ch_pub);
     unsigned frame_bytes=atomic_load(&s_video_frame_bytes_pub);
+    unsigned rate=atomic_load(&s_video_rate_pub);
     if(!frame_bytes || !video_command().active) return 0;
     TickType_t start=xTaskGetTickCount();
     size_t done=0;
     while(done<frames) {
-        size_t n=audio_pcm_push(&s_pcm,(const uint8_t*)pcm+done*frame_bytes,
-                                frames-done,bits,channels);
+        const uint8_t *source=(const uint8_t*)pcm+done*frame_bytes;
+        size_t n=audio_pcm_push(&s_pcm,source,frames-done,bits,channels);
+        if(n && bt_audio_is_connected() && rate)
+            bt_stream_write(source,n,bits,channels,rate);
         done+=n;
         if(done==frames) break;
         if((TickType_t)(xTaskGetTickCount()-start)>=pdMS_TO_TICKS(timeout_ms)) break;
@@ -949,7 +985,7 @@ static void output_step(void)
     }
     if(s_tx_on) {
         static unsigned applied=UINT32_MAX;
-        unsigned volume=atomic_load(&s_volume);
+        unsigned volume=dac_volume();
         if(volume!=applied) {
             esp_err_t ret=cs43131_volume(volume,volume==0);
             if(ret!=ESP_OK) {fail_current(ret,c);return;}

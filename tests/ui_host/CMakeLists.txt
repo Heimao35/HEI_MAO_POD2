@@ -308,6 +308,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME bt_audio COMMAND bt_audio_tests)
 
+# Bluetooth PCM stream: 16/24/32-bit conversion, mono duplication, linear
+# 44.1/48 kHz resampling, bounded ring and target-rate flush.
+add_executable(bt_stream_tests test_bt_stream.c)
+target_include_directories(bt_stream_tests PRIVATE ../audio_host/stubs ../media_host/stubs
+                           "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(bt_stream_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+  target_link_options(bt_stream_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME bt_stream COMMAND bt_stream_tests)
+
 # Real Bosch SensorAPI + production adapter against paged BMI270 hardware doubles.
 add_executable(motion_sensor_tests test_motion_sensor.c
     "${REPO}/main/third_party/bmi270/bmi2.c"

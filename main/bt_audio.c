@@ -45,6 +45,9 @@ static atomic_bool s_auto_connecting = false;
  * U4 的 UNCONNECTED/IDLE 状态事件不得把 UI 从 CONNECTING 拉回 ON。 */
 static atomic_bool s_connect_waiting = false;
 static atomic_bool s_initialized = false;
+/* 用户音量意图（0..127 绝对音量）。蓝牙连接时由 AVRCP 应用；本机 DAC
+ * 的“连接即静音”由 audio_output 单独处理，不改变这里保存的用户值。 */
+static atomic_uint s_volume127 = 64;
 
 /* 保护下面三组 RAM 数据。s_lock 由 bt_audio_init 创建。 */
 static SemaphoreHandle_t s_lock;
@@ -149,6 +152,7 @@ esp_err_t bt_audio_init(void)
     atomic_store(&s_scan_requested, false);
     atomic_store(&s_auto_connecting, false);
     atomic_store(&s_connect_waiting, false);
+    atomic_store(&s_volume127, 64);
 
     s_lock = xSemaphoreCreateMutex();
     if (!s_lock) {
@@ -278,6 +282,16 @@ esp_err_t bt_audio_connect(const uint8_t bda[6])
 bool bt_audio_is_connected(void)
 {
     return atomic_load(&s_state) == BT_AUDIO_STATE_CONNECTED;
+}
+
+void bt_audio_set_volume(uint8_t volume, bool muted)
+{
+    if (volume > 100) volume = 100;
+    unsigned vol127 = muted ? 0 : ((unsigned)volume * 127U + 50U) / 100U;
+    atomic_store(&s_volume127, vol127);
+    /* 链路未就绪时只保存；连接成功后会补发一次。 */
+    if (atomic_load(&s_link_ready))
+        bt_link_set_volume((uint8_t)vol127);
 }
 
 size_t bt_audio_get_connected_name(char *out, size_t size)
@@ -472,6 +486,8 @@ void bt_audio_link_connected(const uint8_t bda[6])
     atomic_store(&s_auto_connecting, false);
     atomic_store(&s_connect_waiting, false);
     atomic_store(&s_state, BT_AUDIO_STATE_CONNECTED);
+    /* 连接时不再自动发送 AVRCP 音量：AVRCP 通常比 A2DP 晚 3～4 秒
+     * 连接，早发的命令可能让部分耳机断开。用户调节音量时再发送。 */
     ESP_LOGI(TAG, "A2DP connected");
 }
 

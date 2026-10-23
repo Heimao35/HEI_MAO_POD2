@@ -29,7 +29,9 @@
 #include <string.h>
 
 #include "bt_audio.h"
+#include "bt_audio_stream.h"
 #include "link_protocol.h"
+#include "u4_power.h"
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "esp_attr.h"
@@ -60,9 +62,13 @@ static const char *TAG = "bt_link";
 #define BT_LINK_TASK_STACK  6144
 #define BT_LINK_TASK_PRIO   5
 #define BT_LINK_WAIT_MS     20
-#define BT_LINK_OPEN_RETRY_MS 1000
+/* U4 由 ALDO3（额定 300 mA）供电，蓝牙 PHY 校准/发射峰值可能触发
+ * brownout。启动和重开链路都留出 3 秒，让 U4 完成 BT 初始化；SDIO
+ * 失败时也先完全松开总线，避免持续轮询叠加负载。 */
+#define BT_LINK_OPEN_RETRY_MS 3000
 #define BT_LINK_HELLO_RETRY_MS 1000
 #define BT_LINK_REG_POLL_MS 500
+#define BT_LINK_REG_FAIL_LIMIT 3
 #define BT_LINK_MAX_SEND_FAILS 20
 
 /* ============================ 命令队列 ============================ */
@@ -74,6 +80,7 @@ enum {
     BT_LINK_MSG_DISCONNECT,
     BT_LINK_MSG_MEDIA_START,
     BT_LINK_MSG_MEDIA_STOP,
+    BT_LINK_MSG_VOLUME,
 };
 
 typedef struct {
@@ -107,10 +114,19 @@ static int64_t s_connect_deadline_us;
 static int64_t s_last_hello_us;
 static int64_t s_last_reg_us;
 static int64_t s_last_open_log_us;
+static int64_t s_u4_reset_us;
 static uint16_t s_tx_seq;
 static unsigned s_send_failures;
 static unsigned s_reg_failures;
 static uint16_t s_audio_rate;
+static bool s_media_streaming;
+static int64_t s_last_pcm_us;
+static int64_t s_last_media_start_us;
+static int64_t s_pcm_diag_us;
+static int s_media_state = LINK_MEDIA_IDLE;
+static int64_t s_media_retry_us;
+static unsigned s_media_retry_count;
+static uint8_t s_volume_127 = 127;
 
 /* U4 发送的事件包 ≤ 128 字节；4 KiB 足够吸收一次扫描结果突发。 */
 static uint8_t s_rx_stream[4096];
@@ -222,14 +238,54 @@ static void handle_event(const uint8_t *payload, size_t len)
         bt_audio_link_scan_add(p, rssi, name);
         break;
     }
-    case LINK_EVT_CONNECTED:
+    case LINK_EVT_CONNECTED: {
+        /* 新连接从干净的 PCM 缓冲开始，避免重连时发送上一次会话残留。 */
+        s_media_streaming = false;
+        bt_stream_reset();
         if (len >= 7) bt_audio_link_connected(payload + 1);
+
+        /* 连接成功就启动 A2DP 媒体流，即使当前没有音乐。U4 数据回调会
+         * 用静音填充空 ring，保持 AVDTP 流活跃；否则部分耳机在 5 秒左右
+         * 检测到 source 未推流会主动断开。 */
+        if (atomic_load(&s_enabled)) {
+            int64_t now = esp_timer_get_time();
+            /* 不在连接瞬间发送 AVRCP 音量：此时 AVRCP 通常尚未连接，
+             * 早发的绝对音量命令可能让部分耳机在数秒后断开。音量只在
+             * 用户主动调节时发送。 */
+            send_cmd(LINK_CMD_MEDIA_START, NULL, 0);
+            s_media_state = LINK_MEDIA_IDLE;
+            s_media_streaming = true;
+            s_media_retry_count = 0;
+            s_media_retry_us = now + 700000LL;
+            s_last_media_start_us = now;
+            s_last_pcm_us = now;
+            ESP_LOGI(TAG, "A2DP media stream started (idle silence until PCM)");
+        }
         break;
+    }
     case LINK_EVT_DISCONNECTED:
+        ESP_LOGW(TAG, "U4 disconnected: media_state=%d streaming=%d queued=%u dropped=%u",
+                 s_media_state, s_media_streaming ? 1 : 0,
+                 (unsigned)bt_stream_queued(),
+                 (unsigned)bt_stream_dropped_bytes());
+        s_media_streaming = false;
+        s_media_state = LINK_MEDIA_IDLE;
+        s_media_retry_us = 0;
+        bt_stream_reset();
         bt_audio_link_disconnected();
         break;
     case LINK_EVT_MEDIA:
-        if (len >= 2) ESP_LOGD(TAG, "media state %u", (unsigned)payload[1]);
+        if (len >= 2) {
+            s_media_state = payload[1];
+            if (payload[1] == LINK_MEDIA_STARTED) {
+                s_media_streaming = true;
+                s_media_retry_count = 0;
+                ESP_LOGI(TAG, "U4 media STARTED");
+            } else if (payload[1] == LINK_MEDIA_IDLE) {
+                s_media_streaming = false;
+                ESP_LOGW(TAG, "U4 media IDLE");
+            }
+        }
         break;
     case LINK_EVT_ERROR:
         if (len >= 2) {
@@ -246,6 +302,7 @@ static void handle_event(const uint8_t *payload, size_t len)
     case LINK_EVT_AUDIO_RATE:
         if (len >= 3) {
             s_audio_rate = (uint16_t)(payload[1] | (payload[2] << 8));
+            bt_stream_set_target_rate(s_audio_rate);
             ESP_LOGI(TAG, "A2DP rate %u Hz", (unsigned)s_audio_rate);
         }
         break;
@@ -345,6 +402,9 @@ static void link_close(void)
     s_scan_active = false;
     s_bt_state = LINK_BT_IDLE;
     s_connect_pending = false;
+    s_media_streaming = false;
+    s_media_state = LINK_MEDIA_IDLE;
+    bt_stream_reset();
     s_rx_len = 0;
     s_send_failures = 0;
     s_reg_failures = 0;
@@ -378,7 +438,9 @@ static esp_err_t link_open(void)
         s_host = (sdmmc_host_t)SDMMC_HOST_DEFAULT();
         s_host.slot = SDMMC_HOST_SLOT_1;
         s_host.flags = SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
-        s_host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+        /* 10 MHz 对 PCM（约 1.5 Mbps）绰绰有余，同时降低 U4 SDIO
+         * 引脚翻转电流，给 ALDO3 留出蓝牙峰值余量。 */
+        s_host.max_freq_khz = 10000;
 
         sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
         slot.clk = BT_LINK_PIN_CLK;
@@ -441,6 +503,9 @@ static esp_err_t link_open(void)
     s_send_failures = 0;
     s_reg_failures = 0;
     s_audio_rate = 0;
+    s_media_streaming = false;
+    s_last_pcm_us = 0;
+    bt_stream_reset();
     s_last_hello_us = 0;
     s_last_reg_us = 0;
 
@@ -553,6 +618,16 @@ static void handle_msg(const bt_link_msg_t *msg)
         if (s_hello_confirmed)
             send_cmd(LINK_CMD_MEDIA_STOP, NULL, 0);
         break;
+    case BT_LINK_MSG_VOLUME: {
+        uint8_t volume = msg->bda[0] > 127 ? 127 : msg->bda[0];
+        s_volume_127 = volume;
+        /* 没有 A2DP 连接时 AVRCP 音量命令无意义，等连接/推流时补发。 */
+        if (enabled && s_hello_confirmed && bt_audio_is_connected()) {
+            ESP_LOGI(TAG, "AVRCP volume %u", (unsigned)volume);
+            send_cmd(LINK_CMD_VOLUME, &volume, 1);
+        }
+        break;
+    }
     default:
         break;
     }
@@ -563,15 +638,102 @@ static void apply_disabled(void)
 {
     s_scan_active = false;
     s_connect_pending = false;
+    s_media_streaming = false;
+    s_media_state = LINK_MEDIA_IDLE;
+    bt_stream_reset();
     if (!s_hello_confirmed) return;
     send_cmd(LINK_CMD_MEDIA_STOP, NULL, 0);
     send_cmd(LINK_CMD_DISCONNECT, NULL, 0);
+}
+
+/**
+ * @brief 按 U4 的 PCM credit 发送已重采样的 16-bit 立体声数据。
+ *
+ * credit 以 256 字节为单位，表示 U4 16 KiB PCM ring 的空闲空间。每轮
+ * 最多读一次寄存器，然后连续发送到本次 credit 用完；下一轮再读。
+ * A2DP 媒体流在连接后保持活跃（无 PCM 时由 U4 填静音），本函数在
+ * U4 未确认 STARTED 时快速重发 MEDIA_START。
+ */
+static void send_pcm(int64_t now)
+{
+    if (!s_essl || !s_hello_confirmed || !bt_audio_is_connected()) {
+        if (s_media_streaming) {
+            send_cmd(LINK_CMD_MEDIA_STOP, NULL, 0);
+            s_media_streaming = false;
+        }
+        return;
+    }
+
+    /* U4 尚未确认 STARTED 时快速重发 MEDIA_START（700 ms，超过 6 次
+     * 后退到 2 s）。重连后 A2DP 就绪时序可能与首次配对不同，单次发送
+     * 容易落在 CHECK_SRC_RDY 失败窗口，耳机就会把空闲 source 断开。 */
+    if (s_media_state != LINK_MEDIA_STARTED && now >= s_media_retry_us) {
+        send_cmd(LINK_CMD_MEDIA_START, NULL, 0);
+        s_media_streaming = true;
+        ++s_media_retry_count;
+        s_media_retry_us = now + (s_media_retry_count < 6 ? 700000LL : 2000000LL);
+        ESP_LOGI(TAG, "media start retry %u (U4 state %d)",
+                 s_media_retry_count, s_media_state);
+    }
+
+    if (bt_stream_queued() >= 4U) {
+        uint8_t credit = 0;
+        if (essl_read_reg(s_essl, LINK_REG_PCM_CREDIT, &credit, 50) == ESP_OK) {
+            size_t allow = (size_t)credit * 256U;
+            while (allow >= 16U) {
+                size_t want = allow - LINK_HEADER_BYTES;
+                if (want > 1016U) want = 1016U;
+                want &= ~(size_t)3U;
+                if (!want) break;
+
+                size_t got = bt_stream_read(s_tx_buf + LINK_HEADER_BYTES, want);
+                if (!got) break;
+
+                link_header_t *hdr = (link_header_t *)s_tx_buf;
+                hdr->magic = LINK_MAGIC;
+                hdr->type = LINK_MSG_PCM;
+                hdr->len = (uint16_t)got;
+                hdr->seq = s_tx_seq++;
+                hdr->flags = 0;
+                hdr->crc = link_crc_packet(s_tx_buf,
+                                           s_tx_buf + LINK_HEADER_BYTES, got);
+                size_t total = LINK_HEADER_BYTES + got;
+                size_t padded = (total + 3U) & ~(size_t)3U;
+                if (padded > total) memset(s_tx_buf + total, 0, padded - total);
+
+                if (essl_send_packet(s_essl, s_tx_buf, padded, 50) != ESP_OK) {
+                    ++s_send_failures;
+                    break;
+                }
+                s_send_failures = 0;
+                allow -= got;
+                s_last_pcm_us = now;
+
+            }
+        }
+    }
+
+    /* 5 秒诊断：帮助区分“没有 PCM 生产者”和“U4 不消费导致丢帧”。 */
+    if (now - s_pcm_diag_us > 5000000LL) {
+        s_pcm_diag_us = now;
+        if (s_media_streaming || bt_stream_queued())
+            ESP_LOGI(TAG, "PCM queued=%u dropped=%u streaming=%d",
+                     (unsigned)bt_stream_queued(),
+                     (unsigned)bt_stream_dropped_bytes(),
+                     s_media_streaming ? 1 : 0);
+    }
 }
 
 static void link_task(void *arg)
 {
     (void)arg;
     int64_t last_open_attempt = 0;
+
+    /* U4 刚释放 CHIP_PU 时会经历 ROM/应用启动和蓝牙 RF 初始化，峰值
+     * 电流最高。先等它完成启动再探测 SDIO，避免主机总线活动叠加到
+     * 本来已紧张的 ALDO3 上。 */
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    s_u4_reset_us = esp_timer_get_time();
 
     for (;;) {
         bool enabled = atomic_load(&s_enabled);
@@ -591,7 +753,18 @@ static void link_task(void *arg)
                         ESP_LOGW(TAG, "Open U4 SDIO link failed: %s (retrying)",
                                  esp_err_to_name(err));
                     }
+                    /* U4 持续无响应（典型为蓝牙初始化 Brownout 反复重启）
+                     * 时给一次干净的 CHIP_PU 复位。1 秒低电平只复位 U4，
+                     * 不关闭 ALDO3；若供电本身不足，可能再次 Brownout，
+                     * 这里每 10 秒最多重试一次并持续记录。 */
+                    if (now - s_u4_reset_us > 10000000LL) {
+                        ESP_LOGW(TAG, "U4 unresponsive for 10 s; pulsing CHIP_PU");
+                        u4_power_pulse_reset(1000);
+                        s_u4_reset_us = esp_timer_get_time();
+                        last_open_attempt = s_u4_reset_us;
+                    }
                 } else {
+                    s_u4_reset_us = now;
                     ESP_LOGI(TAG, "U4 SDIO link opened");
                 }
             }
@@ -624,6 +797,7 @@ static void link_task(void *arg)
             ESP_LOGI(TAG, "discovery stopped, connecting now");
         }
 
+        send_pcm(now);
         poll_registers(now);
 
         if (!s_hello_confirmed && s_last_hello_us &&
@@ -648,6 +822,11 @@ esp_err_t bt_link_init(void)
 
     s_queue = xQueueCreate(8, sizeof(bt_link_msg_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
+
+    esp_err_t stream_ret = bt_stream_init();
+    if (stream_ret != ESP_OK)
+        ESP_LOGW(TAG, "Bluetooth PCM stream unavailable: %s",
+                 esp_err_to_name(stream_ret));
 
     BaseType_t ok = xTaskCreate(link_task, "bt_link", BT_LINK_TASK_STACK, NULL,
                                 BT_LINK_TASK_PRIO, &s_task);
@@ -713,4 +892,12 @@ void bt_link_media_start(void)
 void bt_link_media_stop(void)
 {
     push_msg(BT_LINK_MSG_MEDIA_STOP, NULL);
+}
+
+void bt_link_set_volume(uint8_t volume)
+{
+    if (!s_queue) return;
+    bt_link_msg_t msg = {.cmd = BT_LINK_MSG_VOLUME};
+    msg.bda[0] = volume > 127 ? 127 : volume;
+    (void)xQueueSend(s_queue, &msg, 0);
 }

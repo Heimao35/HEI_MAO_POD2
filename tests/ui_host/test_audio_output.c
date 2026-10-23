@@ -6,6 +6,22 @@ static ssize_t checked_audio_read(int fd,void *buf,size_t bytes);
 #define read checked_audio_read
 #include "../../main/audio_output.c"
 #undef read
+
+/* Bluetooth audio routing doubles: this regression runs the local DAC path
+ * only, so BT is never connected and the PCM tap/reset are no-ops. */
+static bool bt_connected_double;
+bool bt_audio_is_connected(void) { return bt_connected_double; }
+size_t bt_stream_write(const void *pcm,size_t frames,unsigned bits,
+                       unsigned channels,uint32_t rate)
+{
+    (void)pcm;(void)bits;(void)channels;(void)rate;return frames;
+}
+void bt_stream_reset(void) { }
+static uint8_t bt_volume_double;
+void bt_audio_set_volume(uint8_t volume,bool muted)
+{
+    (void)muted;bt_volume_double=volume;
+}
 static bool sd_locked,ui_locked,mounted=true,tx_enabled,hp_present;
 static bool decoder_fail,quiesce_in_poll,switch_in_decode,decoder_header_seen,oversize_output;
 static TickType_t ticks;
@@ -463,5 +479,13 @@ int main(void)
     heap_caps_free(s_io);heap_caps_free(s_ring);heap_caps_free(s_input);heap_caps_free(s_output);
     assert(wait_calls>0 && dma_wakes>0);
     puts("PASS actual sample-clock DMA cadence wakes blocked producer; startup prebuffer, backpressure and exact EOS");
+    /* 蓝牙优先于本机 DAC：连接后有效音量强制为 0，但用户音量值不变；
+     * 断开后立即恢复同一用户音量。 */
+    unsigned user_volume=atomic_load(&s_volume);
+    bt_connected_double=true;
+    assert(dac_volume()==0);
+    bt_connected_double=false;
+    assert(dac_volume()==user_volume);
+    puts("PASS Bluetooth connection mutes the local DAC and restores user volume on disconnect");
     return 0;
 }

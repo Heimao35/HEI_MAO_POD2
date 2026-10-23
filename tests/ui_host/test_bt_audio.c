@@ -47,6 +47,8 @@ esp_err_t bt_link_connect(const uint8_t bda[6])
 void bt_link_disconnect(void) {}
 void bt_link_media_start(void) {}
 void bt_link_media_stop(void) {}
+static uint8_t last_volume;
+void bt_link_set_volume(uint8_t volume) { last_volume = volume; }
 
 static const uint8_t bda_a[6] = {0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6};
 static const uint8_t bda_b[6] = {0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6};

@@ -54,9 +54,12 @@ esp_err_t bt_link_connect(const uint8_t bda[6]);
 /** 请求断开当前连接（若 U4 已连接）。 */
 void bt_link_disconnect(void);
 
-/** 媒体流控制（当前阶段只发命令，PCM 数据后续接入）。 */
+/** 媒体流控制（PCM 数据到达时由 worker 自动启停，接口保留给显式控制）。 */
 void bt_link_media_start(void);
 void bt_link_media_stop(void);
+
+/** 设置 A2DP 绝对音量（0..127，经 U4 的 AVRCP 发送）。 */
+void bt_link_set_volume(uint8_t volume);
 
 #ifdef __cplusplus
 }

@@ -20,6 +20,7 @@
 #include "motion_sensor.h"
 #include "bt_audio.h"
 #include "bt_link.h"
+#include "u4_power.h"
 
 #include "esp_lcd_co5300.h"
 #include "co5300_init_cmds.h"
@@ -316,6 +317,11 @@ static void app_font_progress(unsigned completed, unsigned total,
 
 void app_main(void)
 {
+    /* U4 由 ALDO3（额定 300 mA）供电，蓝牙 RF 初始化峰值可能超过该
+     * 额定值。P4 启动阶段先保持 U4 复位，避免其蓝牙峰值与 P4 显示/
+     * PSRAM/音频初始化重叠；等主要初始化完成后再释放 CHIP_PU。 */
+    u4_power_hold_reset();
+
     /* LCD HW initialization */
     ESP_ERROR_CHECK(app_lcd_init());
     ESP_ERROR_CHECK(app_lcd_te_init());
@@ -404,13 +410,6 @@ void app_main(void)
     esp_err_t sd_ret = sd_card_init();
     if (sd_ret != ESP_OK) ESP_LOGE(TAG, "SD init failed: %s", esp_err_to_name(sd_ret));
 
-    /* SD 卡 slot0 初始化完成后再启动 slot1 的 SDIO worker，避免两个
-     * slot 并发调用非线程安全的 sdmmc_host_init_slot。worker 在后台
-     * 探测/重试 U4，不阻塞后续动画和音频初始化。 */
-    esp_err_t bt_link_ret = bt_link_init();
-    if (bt_link_ret != ESP_OK)
-        ESP_LOGW(TAG, "Bluetooth link init failed: %s", esp_err_to_name(bt_link_ret));
-
     app_boot_progress(82,"Preparing lock animation...");
     /* 动画资源只在本次启动导入一次，此时音频/屏幕电源任务尚未启动。
      * 全部SD读取和Flash擦写均在LVGL锁外，且不受曲库扫描是否成功影响。
@@ -450,6 +449,14 @@ void app_main(void)
     app_boot_progress(98,"Starting system controls...");
     esp_err_t system_ret=system_power_init();
     if (system_ret!=ESP_OK) ESP_LOGE(TAG,"System power init failed: %s",esp_err_to_name(system_ret));
+
+    /* P4 的主要显示/音频/电源初始化已完成，此时再释放 U4 并启动 SDIO
+     * worker，降低两套系统同时取峰值电流的概率。U4 启动较慢时 worker
+     * 会按既有间隔重试 SDIO。 */
+    u4_power_release();
+    esp_err_t bt_link_ret = bt_link_init();
+    if (bt_link_ret != ESP_OK)
+        ESP_LOGW(TAG, "Bluetooth link init failed: %s", esp_err_to_name(bt_link_ret));
 
     /* BMI270复用现有I2C1；8KiB功能配置由独立低优先级worker分块加载，
      * 不持有LVGL锁、不阻塞开机提示/音频/PMIC。先准备好显示与关机接口，
