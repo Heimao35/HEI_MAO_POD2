@@ -31,6 +31,11 @@ CONFIG_LV_FONT_MONTSERRAT_18=y
 CONFIG_LV_FONT_MONTSERRAT_22=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 CONFIG_LV_USE_FONT_COMPRESSED=y
+# The 18 px full CJK binary font has >1 MiB of glyph bitmaps. Without LARGE,
+# lv_font_fmt_txt_glyph_dsc_t.bitmap_index is a 20-bit field and offsets past
+# 1 MiB are silently truncated, so those glyphs render as garbage instead of
+# the missing-glyph placeholder. Fonts do not need to be regenerated.
+CONFIG_LV_FONT_FMT_TXT_LARGE=y
 CONFIG_LV_TXT_BREAK_CHARS=" ,.;:-_"
 CONFIG_LV_USE_SYSMON=n
 CONFIG_LV_USE_PERF_MONITOR=n
