@@ -289,9 +289,8 @@ void bt_audio_set_volume(uint8_t volume, bool muted)
     if (volume > 100) volume = 100;
     unsigned vol127 = muted ? 0 : ((unsigned)volume * 127U + 50U) / 100U;
     atomic_store(&s_volume127, vol127);
-    /* 链路未就绪时只保存；连接成功后会补发一次。 */
-    if (atomic_load(&s_link_ready))
-        bt_link_set_volume((uint8_t)vol127);
+    /* 蓝牙响度由 bt_audio_stream 的 PCM 增益控制；这里只保存意图，
+     * 避免与连接时固定到最大的 AVRCP 音量叠加成双重衰减。 */
 }
 
 size_t bt_audio_get_connected_name(char *out, size_t size)

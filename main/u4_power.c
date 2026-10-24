@@ -13,11 +13,13 @@
 #include "u4_power.h"
 
 #include "driver/gpio.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #define U4_EN_GPIO GPIO_NUM_54
 
+static const char *TAG = "u4_power";
 static bool s_configured;
 
 static void configure_output(int level)
@@ -31,9 +33,13 @@ static void configure_output(int level)
     };
     /* 外部上拉保证 P4 复位/掉电时 U4 仍能独立启动；P4 运行时推挽
      * 输出高电平，避免 EN 浮空。 */
-    if (gpio_config(&cfg) == ESP_OK) {
+    esp_err_t err = gpio_config(&cfg);
+    if (err == ESP_OK) {
         gpio_set_level(U4_EN_GPIO, level);
         s_configured = true;
+        ESP_LOGI(TAG, "U4 CHIP_PU -> %d (GPIO54 configured)", level);
+    } else {
+        ESP_LOGE(TAG, "U4 CHIP_PU GPIO54 config failed: %s", esp_err_to_name(err));
     }
 }
 
@@ -45,7 +51,10 @@ void u4_power_hold_reset(void)
 void u4_power_release(void)
 {
     if (!s_configured) configure_output(1);
-    else gpio_set_level(U4_EN_GPIO, 1);
+    else {
+        gpio_set_level(U4_EN_GPIO, 1);
+        ESP_LOGI(TAG, "U4 CHIP_PU released (GPIO54 high)");
+    }
 }
 
 void u4_power_pulse_reset(unsigned low_ms)

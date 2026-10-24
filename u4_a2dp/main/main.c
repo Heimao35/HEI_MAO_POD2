@@ -37,6 +37,9 @@
 /* AVRCP used transaction label */
 #define APP_RC_CT_TL_GET_CAPS            (0)
 #define APP_RC_CT_TL_RN_VOLUME_CHANGE    (1)
+/* SetAbsoluteVolume needs its own AVCTP transaction label: the volume-change
+ * notification registered with label 1 can stay outstanding indefinitely. */
+#define APP_RC_CT_TL_SET_VOLUME          (2)
 
 enum {
     BT_APP_STACK_UP_EVT   = 0x0000,    /* event for stack up */
@@ -763,9 +766,10 @@ void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *event_param
     switch (event_id) {
     /* when volume changed locally on target, this event comes */
     case ESP_AVRC_RN_VOLUME_CHANGE: {
-        ESP_LOGI(BT_RC_CT_TAG, "Volume changed: %d", event_parameter->volume);
-        ESP_LOGI(BT_RC_CT_TAG, "Set absolute volume: volume %d", event_parameter->volume + 5);
-        esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_RN_VOLUME_CHANGE, event_parameter->volume + 5);
+        /* 远端（耳机/音箱）自己调整了音量：只记录并重新注册通知，
+         * 不能回发 volume+5。回发会与 P4 的音量意图互相覆盖，且原例程
+         * 的 +5 是演示值，容易造成音量跳变/协议事务标签冲突。 */
+        ESP_LOGI(BT_RC_CT_TAG, "Remote volume changed: %d", event_parameter->volume);
         bt_av_volume_changed();
         break;
     }
@@ -936,7 +940,13 @@ static void bt_av_hdl_link_cmd(uint16_t event, void *p_param)
             link_send_error(6);
             break;
         }
-        esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_RN_VOLUME_CHANGE, cmd->data[0]);
+        {
+            esp_err_t vol_err = esp_avrc_ct_send_set_absolute_volume_cmd(
+                APP_RC_CT_TL_SET_VOLUME, cmd->data[0]);
+            if (vol_err != ESP_OK)
+                ESP_LOGW(BT_RC_CT_TAG, "set absolute volume %u failed: %s",
+                         (unsigned)cmd->data[0], esp_err_to_name(vol_err));
+        }
         break;
     case LINK_CMD_MEDIA_START:
         bt_app_media_start();

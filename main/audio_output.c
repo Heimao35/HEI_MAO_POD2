@@ -180,9 +180,10 @@ void audio_output_set_volume(uint8_t volume)
 {
     volume=volume>100?100:volume;
     atomic_store(&s_volume,volume);
-    /* 用户音量同时作为 A2DP 绝对音量意图保存；BT 未连接时只记录，
-     * 连接成功后由 bt_audio 补发。 */
+    /* 用户音量同时保存为 A2DP 绝对音量意图；实际蓝牙响度由 P4 侧
+     * 16-bit PCM 增益控制，兼容不执行 AVRCP 音量的音箱。 */
     bt_audio_set_volume(volume,volume==0);
+    bt_stream_set_volume(volume,volume==0);
     notify();
 }
 uint32_t audio_output_time_ms(void) {return atomic_load(&s_position);}

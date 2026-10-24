@@ -17,6 +17,10 @@ size_t bt_stream_write(const void *pcm,size_t frames,unsigned bits,
     (void)pcm;(void)bits;(void)channels;(void)rate;return frames;
 }
 void bt_stream_reset(void) { }
+void bt_stream_set_volume(uint8_t volume,bool muted)
+{
+    (void)volume;(void)muted;
+}
 static uint8_t bt_volume_double;
 void bt_audio_set_volume(uint8_t volume,bool muted)
 {

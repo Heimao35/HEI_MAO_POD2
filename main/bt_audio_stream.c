@@ -40,6 +40,8 @@ static int16_t s_prev_l;
 static int16_t s_prev_r;
 static uint32_t s_frac; /* Q16，当前输出在 prev->cur 之间的位置 */
 static atomic_uint s_dropped;
+/* Q15 线性 PCM 增益；连接音箱时由 UI 音量更新，100=32768。 */
+static atomic_uint s_gain_q15 = 32768;
 static int16_t s_chunk_out[STREAM_OUT_FRAMES * 2];
 
 static int16_t decode_sample(const uint8_t *p, unsigned bits)
@@ -74,6 +76,8 @@ static size_t resample_block(const uint8_t *pcm, size_t frames, unsigned bits,
     const size_t frame_bytes = channels * stride;
     size_t produced = 0;
 
+    const int32_t gain = (int32_t)atomic_load_explicit(&s_gain_q15,
+                                                       memory_order_relaxed);
     for (size_t f = 0; f < frames; ++f) {
         const uint8_t *p = pcm + f * frame_bytes;
         int16_t l = decode_sample(p, bits);
@@ -81,8 +85,8 @@ static size_t resample_block(const uint8_t *pcm, size_t frames, unsigned bits,
 
         if (!s_have_prev) {
             if (produced < out_frames) {
-                out[produced * 2] = l;
-                out[produced * 2 + 1] = r;
+                out[produced * 2] = (int16_t)(((int32_t)l * gain + 16384) >> 15);
+                out[produced * 2 + 1] = (int16_t)(((int32_t)r * gain + 16384) >> 15);
             }
             ++produced;
             s_prev_l = l;
@@ -97,6 +101,8 @@ static size_t resample_block(const uint8_t *pcm, size_t frames, unsigned bits,
                          + s_prev_l;
             int32_t or_ = (int32_t)(((int64_t)(r - s_prev_r) * s_frac) >> 16)
                           + s_prev_r;
+            ol = ((int32_t)ol * gain + 16384) >> 15;
+            or_ = ((int32_t)or_ * gain + 16384) >> 15;
             if (ol > 32767) ol = 32767;
             if (ol < -32768) ol = -32768;
             if (or_ > 32767) or_ = 32767;
@@ -175,6 +181,13 @@ void bt_stream_set_target_rate(uint32_t rate)
 uint32_t bt_stream_target_rate(void)
 {
     return s_dst_rate;
+}
+
+void bt_stream_set_volume(uint8_t volume, bool muted)
+{
+    if (volume > 100) volume = 100;
+    unsigned gain = muted ? 0U : ((unsigned)volume * 32768U + 50U) / 100U;
+    atomic_store_explicit(&s_gain_q15, gain, memory_order_relaxed);
 }
 
 size_t bt_stream_write(const void *pcm, size_t frames, unsigned bits,

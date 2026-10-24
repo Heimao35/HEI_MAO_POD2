@@ -196,6 +196,18 @@ static esp_err_t initialize_power_outputs(void)
      * cycle. Readback confirms register configuration, not measured pin voltage.
      * ALDO3 is rated at 300mA: this does not establish sufficient current for
      * ESP32-U4WDH radio operation (ESP32 supply recommendation is >=500mA). */
+    /* 记录配置前的 ALDO3 状态：若这里已经是 enabled，说明 U4 在 P4
+     * 设置 CHIP_PU 之前就已由 PMIC 默认上电启动，软件无法阻止第一次
+     * 蓝牙射频初始化峰值；硬件需要 EN 下拉或可控电源轨。 */
+    uint8_t pre_enable = 0, pre_voltage = 0;
+    if (read_register(REG_LDO_ENABLE, &pre_enable) == ESP_OK &&
+        read_register(REG_ALDO3_VOLTAGE, &pre_voltage) == ESP_OK) {
+        unsigned code = pre_voltage & ALDO3_VOLTAGE_MASK;
+        ESP_LOGI(TAG, "ALDO3 before config: %s, %u mV",
+                 (pre_enable & ALDO3_ENABLE) ? "ON" : "OFF",
+                 500U + code * 100U);
+    }
+
     esp_err_t ret = update_field_checked(REG_DCDC4_VOLTAGE, DCDC4_VOLTAGE_MASK, DCDC4_1800MV);
     if (ret == ESP_OK) ret = update_field_checked(REG_ALDO3_VOLTAGE, ALDO3_VOLTAGE_MASK, ALDO3_3300MV);
     if (ret == ESP_OK) ret = update_field_checked(REG_DCDC_ENABLE, DCDC4_ENABLE, DCDC4_ENABLE);

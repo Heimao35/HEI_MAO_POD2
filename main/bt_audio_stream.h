@@ -46,6 +46,14 @@ void bt_stream_set_target_rate(uint32_t rate);
 uint32_t bt_stream_target_rate(void);
 
 /**
+ * @brief 设置 P4 侧 PCM 数字音量（0..100，muted 为 true 时静音）。
+ *
+ * 为兼容不执行 AVRCP 绝对音量的音箱，实际响度由 P4 对 16-bit PCM
+ * 做增益控制；U4/音箱的 AVRCP 音量在连接时固定为最大。
+ */
+void bt_stream_set_volume(uint8_t volume, bool muted);
+
+/**
  * @brief 转换并重采样一段源 PCM，写入环形缓冲。
  *
  * @param pcm   源 PCM 起始地址

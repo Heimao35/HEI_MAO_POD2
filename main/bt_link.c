@@ -249,9 +249,12 @@ static void handle_event(const uint8_t *payload, size_t len)
          * 检测到 source 未推流会主动断开。 */
         if (atomic_load(&s_enabled)) {
             int64_t now = esp_timer_get_time();
-            /* 不在连接瞬间发送 AVRCP 音量：此时 AVRCP 通常尚未连接，
-             * 早发的绝对音量命令可能让部分耳机在数秒后断开。音量只在
-             * 用户主动调节时发送。 */
+            /* PCM 响度由 P4 侧数字增益控制；音箱端 AVRCP 固定在最大，
+             * 避免同时衰减。命令失败会由 U4 打印。 */
+            uint8_t sink_max = 127;
+            s_volume_127 = sink_max;
+            send_cmd(LINK_CMD_VOLUME, &sink_max, 1);
+            ESP_LOGI(TAG, "AVRCP sink volume -> 127 (P4 PCM gain controls loudness)");
             send_cmd(LINK_CMD_MEDIA_START, NULL, 0);
             s_media_state = LINK_MEDIA_IDLE;
             s_media_streaming = true;
