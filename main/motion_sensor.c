@@ -33,11 +33,20 @@
 #define OWNER_SHUTDOWN 2U
 #define WORK_BUSY 4U
 
-/* Board-to-watch coordinates, DS p53. No mechanical orientation was supplied:
- * start with Bosch's identity mapping. Change ONLY this map after board tests;
- * e.g. swap X/Y and negate one axis if the sensor is rotated on the PCB.
+/* Board-to-watch coordinates, DS p53/p155. User confirmed 2026-10-24 that the
+ * BMI270 is mounted on the PCB top side with +z pointing out of the screen,
+ * but the package +x points to the dial's 12 o'clock and +y points left.
+ * Wrist wear wakeup expects +x = 3 o'clock, +y = 12 o'clock, +z = out of the
+ * dial, so the dial axes must be taken from the sensor axes as:
+ *   dial +x (right) = -sensor Y
+ *   dial +y (12:00) = +sensor X
+ *   dial +z (out)   = +sensor Z
+ * The previous identity map fed the algorithm the left/right axis as portrait
+ * up and the 12 o'clock axis as landscape right, so normal viewing poses fell
+ * outside its asymmetric focus limits. Axis remapping applies only to the
+ * feature engine; DATA_x/FIFO remain raw and keep the sensor frame.
  * These are BMI2_X/Y/Z or BMI2_NEG_X/Y/Z, not numeric axis indexes. */
-static const struct bmi2_remap s_board_axes = {BMI2_X, BMI2_Y, BMI2_Z};
+static const struct bmi2_remap s_board_axes = {BMI2_NEG_Y, BMI2_X, BMI2_Z};
 static const char *TAG = "motion_sensor";
 static i2c_master_dev_handle_t s_device;
 static struct bmi2_dev s_bmi;
