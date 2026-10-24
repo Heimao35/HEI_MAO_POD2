@@ -935,6 +935,31 @@ static void bt_av_hdl_link_cmd(uint16_t event, void *p_param)
             notify_link_state();
         }
         break;
+    case LINK_CMD_FORGET:
+        if (cmd->len != 6) {
+            link_send_error(2);
+            break;
+        }
+        s_host_controlled = true;
+        if (memcmp(s_peer_bda, cmd->data, 6) == 0 &&
+            (s_a2d_state == APP_AV_STATE_CONNECTED ||
+             s_a2d_state == APP_AV_STATE_CONNECTING ||
+             s_a2d_state == APP_AV_STATE_DISCONNECTING)) {
+            s_media_want = false;
+            esp_a2d_source_disconnect(s_peer_bda);
+            s_a2d_state = APP_AV_STATE_DISCONNECTING;
+            notify_link_state();
+        }
+        {
+            /* API 需要可写 esp_bd_addr_t；命令缓冲区是 const，复制一份。 */
+            esp_bd_addr_t bond;
+            memcpy(bond, cmd->data, sizeof(bond));
+            esp_err_t err = esp_bt_gap_remove_bond_device(bond);
+            ESP_LOGI(BT_AV_TAG, "Remove bond %02x:%02x:%02x:%02x:%02x:%02x: %s",
+                     bond[0], bond[1], bond[2], bond[3], bond[4], bond[5],
+                     esp_err_to_name(err));
+        }
+        break;
     case LINK_CMD_VOLUME:
         if (cmd->len != 1 || cmd->data[0] > 127) {
             link_send_error(6);

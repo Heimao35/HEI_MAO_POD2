@@ -49,6 +49,13 @@ void bt_link_media_start(void) {}
 void bt_link_media_stop(void) {}
 static uint8_t last_volume;
 void bt_link_set_volume(uint8_t volume) { last_volume = volume; }
+static unsigned forget_calls;
+static uint8_t forgotten_bda[6];
+void bt_link_forget(const uint8_t bda[6])
+{
+    ++forget_calls;
+    memcpy(forgotten_bda, bda, 6);
+}
 
 static const uint8_t bda_a[6] = {0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6};
 static const uint8_t bda_b[6] = {0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6};
@@ -162,5 +169,16 @@ int main(void)
     assert(bt_audio_get_paired(pair, pair_name, sizeof(pair_name)));
     assert(memcmp(pair, bda_a, 6) == 0);
     puts("PASS link loss clears connection but keeps the paired device");
+
+    /* 取消配对：清除 RAM 记录并把 BDA 交给 U4 删除绑定。 */
+    unsigned before_forget = forget_calls;
+    bt_audio_forget_paired();
+    assert(forget_calls == before_forget + 1);
+    assert(memcmp(forgotten_bda, bda_a, 6) == 0);
+    assert(!bt_audio_get_paired(pair, pair_name, sizeof(pair_name)));
+    /* 已无配对记录时再次调用不应重复发送命令。 */
+    bt_audio_forget_paired();
+    assert(forget_calls == before_forget + 1);
+    puts("PASS unpair clears the single pairing record and asks U4 to remove the bond");
     return 0;
 }

@@ -450,10 +450,9 @@ void app_main(void)
     esp_err_t system_ret=system_power_init();
     if (system_ret!=ESP_OK) ESP_LOGE(TAG,"System power init failed: %s",esp_err_to_name(system_ret));
 
-    /* P4 的主要显示/音频/电源初始化已完成，此时再释放 U4 并启动 SDIO
-     * worker，降低两套系统同时取峰值电流的概率。U4 启动较慢时 worker
-     * 会按既有间隔重试 SDIO。 */
-    u4_power_release();
+    /* P4 主要初始化已完成。U4 仍保持 CHIP_PU 低电平：蓝牙默认关闭，
+     * 只有用户打开蓝牙时 bt_link worker 才释放 EN、等待 U4 启动并
+     * 初始化 SDIO；关闭蓝牙时 worker 会断开链路并再次拉低 EN。 */
     esp_err_t bt_link_ret = bt_link_init();
     if (bt_link_ret != ESP_OK)
         ESP_LOGW(TAG, "Bluetooth link init failed: %s", esp_err_to_name(bt_link_ret));

@@ -81,6 +81,7 @@ enum {
     BT_LINK_MSG_MEDIA_START,
     BT_LINK_MSG_MEDIA_STOP,
     BT_LINK_MSG_VOLUME,
+    BT_LINK_MSG_FORGET,
 };
 
 typedef struct {
@@ -123,6 +124,11 @@ static bool s_media_streaming;
 static int64_t s_last_pcm_us;
 static int64_t s_last_media_start_us;
 static int64_t s_pcm_diag_us;
+/* 用户开关同时控制 U4 CHIP_PU：关闭时在断开 A2DP 后拉低 EN，打开时
+ * 释放 EN 并等待 U4 启动，再重新初始化 SDIO 链路。 */
+static bool s_u4_powered;
+static int64_t s_link_open_after_us;
+static int64_t s_power_off_at_us;
 static int s_media_state = LINK_MEDIA_IDLE;
 static int64_t s_media_retry_us;
 static unsigned s_media_retry_count;
@@ -621,6 +627,10 @@ static void handle_msg(const bt_link_msg_t *msg)
         if (s_hello_confirmed)
             send_cmd(LINK_CMD_MEDIA_STOP, NULL, 0);
         break;
+    case BT_LINK_MSG_FORGET:
+        if (s_hello_confirmed)
+            send_cmd(LINK_CMD_FORGET, msg->bda, 6);
+        break;
     case BT_LINK_MSG_VOLUME: {
         uint8_t volume = msg->bda[0] > 127 ? 127 : msg->bda[0];
         s_volume_127 = volume;
@@ -732,21 +742,74 @@ static void link_task(void *arg)
     (void)arg;
     int64_t last_open_attempt = 0;
 
-    /* U4 刚释放 CHIP_PU 时会经历 ROM/应用启动和蓝牙 RF 初始化，峰值
-     * 电流最高。先等它完成启动再探测 SDIO，避免主机总线活动叠加到
-     * 本来已紧张的 ALDO3 上。 */
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    /* P4 启动时 main 已经拉低 CHIP_PU。蓝牙默认关闭，因此 U4 保持
+     * 复位；只有用户打开蓝牙后才释放 EN、等待其启动并重新初始化
+     * SDIO。U4 的 VDD 仍由 ALDO3 供电，这里只控制 EN。 */
     s_u4_reset_us = esp_timer_get_time();
+    s_u4_powered = false;
+    s_link_open_after_us = 0;
+    s_power_off_at_us = 0;
+    if (!atomic_load(&s_enabled)) u4_power_hold_reset();
 
     for (;;) {
         bool enabled = atomic_load(&s_enabled);
+        int64_t now = esp_timer_get_time();
+
         if (enabled != s_applied_enabled) {
             s_applied_enabled = enabled;
-            if (!enabled) apply_disabled();
+            if (enabled) {
+                /* 快速 off→on 时取消仍在等待的断电，链路无需重建。 */
+                s_power_off_at_us = 0;
+                if (!s_u4_powered) {
+                    u4_power_release();
+                    s_u4_powered = true;
+                    /* U4 刚释放 CHIP_PU 时要经历 ROM/应用启动和蓝牙 RF
+                     * 初始化，先等它完成启动再探测 SDIO。 */
+                    s_link_open_after_us = now + 1500000;
+                    s_u4_reset_us = now;
+                    last_open_attempt = 0;
+                    ESP_LOGI(TAG, "U4 powered on; waiting for boot");
+                }
+            } else {
+                /* 先在链路仍可用时通知 U4 停止媒体并断开 A2DP/AVRCP，
+                 * 留 600ms 处理事件；之后关闭 SDIO 并拉低 CHIP_PU。
+                 * 只动 EN，不关闭 ALDO3。 */
+                apply_disabled();
+                s_power_off_at_us = now + 600000;
+                ESP_LOGI(TAG, "Bluetooth off; U4 power-off in 600 ms");
+            }
+        }
+
+        if (!enabled) {
+            /* 断电等待窗口内链路仍打开，继续处理事件；到期后关闭
+             * SDIO 再把 U4 拉回复位。 */
+            if (s_power_off_at_us && now >= s_power_off_at_us) {
+                if (s_essl) link_close();
+                if (s_u4_powered) {
+                    u4_power_hold_reset();
+                    s_u4_powered = false;
+                }
+                s_power_off_at_us = 0;
+                s_link_open_after_us = 0;
+                ESP_LOGI(TAG, "U4 powered off (CHIP_PU low)");
+            }
+            if (!s_essl) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
         }
 
         if (!s_essl) {
-            int64_t now = esp_timer_get_time();
+            /* 关闭状态或 U4 尚未释放时绝不探测 SDIO。 */
+            if (!enabled || !s_u4_powered) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            now = esp_timer_get_time();
+            if (now < s_link_open_after_us) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
             if (now - last_open_attempt >= (int64_t)BT_LINK_OPEN_RETRY_MS * 1000) {
                 last_open_attempt = now;
                 esp_err_t err = link_open();
@@ -758,12 +821,12 @@ static void link_task(void *arg)
                     }
                     /* U4 持续无响应（典型为蓝牙初始化 Brownout 反复重启）
                      * 时给一次干净的 CHIP_PU 复位。1 秒低电平只复位 U4，
-                     * 不关闭 ALDO3；若供电本身不足，可能再次 Brownout，
-                     * 这里每 10 秒最多重试一次并持续记录。 */
+                     * 不关闭 ALDO3；复位后重新等待启动。 */
                     if (now - s_u4_reset_us > 10000000LL) {
                         ESP_LOGW(TAG, "U4 unresponsive for 10 s; pulsing CHIP_PU");
                         u4_power_pulse_reset(1000);
                         s_u4_reset_us = esp_timer_get_time();
+                        s_link_open_after_us = s_u4_reset_us + 1500000;
                         last_open_attempt = s_u4_reset_us;
                     }
                 } else {
@@ -788,7 +851,7 @@ static void link_task(void *arg)
         /* 即使没有中断也轮询一次，防止漏中断后事件滞留。 */
         rx_poll();
 
-        int64_t now = esp_timer_get_time();
+        now = esp_timer_get_time();
 
         /* 扫描停止后的待连接：优先等 U4 的非 DISCOVERING 状态事件，
          * 事件丢失则 2 秒后仍然尝试，避免 UI 永远停在 CONNECTING。 */
@@ -895,6 +958,12 @@ void bt_link_media_start(void)
 void bt_link_media_stop(void)
 {
     push_msg(BT_LINK_MSG_MEDIA_STOP, NULL);
+}
+
+void bt_link_forget(const uint8_t bda[6])
+{
+    if (!bda) return;
+    (void)push_msg(BT_LINK_MSG_FORGET, bda);
 }
 
 void bt_link_set_volume(uint8_t volume)

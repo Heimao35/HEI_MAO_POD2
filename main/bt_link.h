@@ -38,7 +38,11 @@ extern "C" {
 /** 创建链路 worker 与命令队列。不初始化 SDMMC/ESSL，失败可重试。 */
 esp_err_t bt_link_init(void);
 
-/** 记录用户开关意图；worker 在未连接时用于抑制扫描/连接。 */
+/**
+ * 记录用户开关意图。关闭时 worker 先停止媒体/断开 A2DP，再关闭 SDIO
+ * 链路并拉低 U4 CHIP_PU（只控制 EN，不关闭 ALDO3）；打开时释放 EN、
+ * 等待 U4 启动并重新初始化链路。
+ */
 void bt_link_set_enabled(bool enabled);
 
 /** 链路是否已完成 ESSL 初始化并收到 U4 的 READY 事件。 */
@@ -60,6 +64,9 @@ void bt_link_media_stop(void);
 
 /** 设置 A2DP 绝对音量（0..127，经 U4 的 AVRCP 发送）。 */
 void bt_link_set_volume(uint8_t volume);
+
+/** 请求 U4 删除指定设备的蓝牙绑定（若已连接则先断开）。 */
+void bt_link_forget(const uint8_t bda[6]);
 
 #ifdef __cplusplus
 }

@@ -59,6 +59,7 @@ enum {
     LINK_CMD_VOLUME         = 6, /* 1 byte absolute volume 0..127 */
     LINK_CMD_MEDIA_START    = 7, /* no args */
     LINK_CMD_MEDIA_STOP     = 8, /* no args */
+    LINK_CMD_FORGET         = 9, /* 6-byte Bluetooth address: remove bond */
 };
 
 /* Events (U4 -> P4). */

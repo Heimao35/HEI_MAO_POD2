@@ -171,6 +171,14 @@ void bt_audio_set_paired(const uint8_t bda[6], const char *name);
  */
 bool bt_audio_get_paired(uint8_t bda[6], char *name, size_t name_size);
 
+/**
+ * @brief 取消最近配对设备：清除 P4 记录并通知 U4 删除蓝牙绑定。
+ *
+ * 只清除一条配对记录；若该设备当前已连接，U4 会先断开 A2DP 再删除
+ * 绑定。NVS 由现有 player_settings 快照在 3 秒内合并保存。
+ */
+void bt_audio_forget_paired(void);
+
 /* =====================================================================
  * 以下为链路内部发布接口：只允许 bt_link.c 的 worker 调用。
  * 这些函数只更新 RAM/原子状态，不访问 LVGL、不阻塞；UI 通过上面的

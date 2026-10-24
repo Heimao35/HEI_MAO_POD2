@@ -320,6 +320,25 @@ void bt_audio_set_paired(const uint8_t bda[6], const char *name)
     unlock_data();
 }
 
+void bt_audio_forget_paired(void)
+{
+    uint8_t bda[6] = {0};
+    bool valid = false;
+
+    if (!lock_data()) return;
+    valid = s_paired_valid;
+    if (valid) memcpy(bda, s_paired_bda, sizeof(bda));
+    s_paired_valid = false;
+    memset(s_paired_bda, 0, sizeof(s_paired_bda));
+    s_paired_name[0] = 0;
+    unlock_data();
+
+    if (!valid) return;
+    /* U4 持有蓝牙绑定；命令在 worker 中发送，不在 UI 回调解锁/断链。 */
+    bt_link_forget(bda);
+    ESP_LOGI(TAG, "Pairing record cleared");
+}
+
 bool bt_audio_get_paired(uint8_t bda[6], char *name, size_t name_size)
 {
     if (!bda || !name || !name_size) return false;

@@ -78,6 +78,17 @@ static bool s_paired_valid;
 static uint8_t s_paired_bda[6];
 static char s_paired_display[BT_AUDIO_NAME_MAX + 16];
 
+/* 长按已配对设备后的“取消配对”确认弹窗。与关机弹窗一样放在
+ * lv_layer_top()，使用全屏半透明遮罩和 382x204 深色卡片；它是独立
+ * 顶层对象，不随蓝牙子页滚动/滑动，页面隐藏或锁屏时必须显式收起。 */
+static lv_obj_t *s_unpair_overlay;
+static lv_obj_t *s_unpair_hint;
+static lv_obj_t *s_unpair_confirm;
+static lv_obj_t *s_unpair_cancel;
+/* LVGL 长按后松手仍会发送 CLICKED；用按下时复位的标志丢弃这一次点击，
+ * 避免“弹出取消配对”同时触发重新连接。 */
+static bool s_paired_long_pressed;
+
 /* 设备行池。LVGL 对象只在第一次需要时创建，之后只改文字/BDA/位置，
  * 不随每次扫描重建，避免拖动列表时对象被删除导致触摸丢失。 */
 typedef struct {
@@ -390,6 +401,138 @@ static void refresh_paired(void)
                                 valid ? UI_COLOR_TEXT : UI_COLOR_TEXT_MUTED, 0);
 }
 
+/** @brief 收起取消配对弹窗（不改变配对记录）。 */
+static void hide_unpair_dialog(void)
+{
+    if (s_unpair_overlay) lv_obj_add_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+/** @brief 弹窗“取消”：只关闭弹窗，保留配对。 */
+static void unpair_cancel_cb(lv_event_t *event)
+{
+    (void)event;
+    hide_unpair_dialog();
+}
+
+/**
+ * @brief 弹窗“确认”：清除后端配对记录并通知 U4 删除绑定。
+ *
+ * 只投递请求，不等待 U4/Flash；250ms 页面定时器随后把卡片刷新为
+ * “暂无已配对设备”。NVS 由现有 player_settings 快照合并保存。
+ */
+static void unpair_confirm_cb(lv_event_t *event)
+{
+    (void)event;
+    hide_unpair_dialog();
+    bt_audio_forget_paired();
+    set_notice("已取消配对");
+    refresh_all();
+}
+
+/**
+ * @brief 创建取消配对确认弹窗（首次长按时惰性创建）。
+ *
+ * 尺寸、颜色、圆角、18 号全字库、半透明遮罩和按钮样式全部复用关机
+ * 弹窗；按钮改为两个：左侧“确认”、右侧“取消”。所有新文字都用 18 号
+ * 全字库，不要求重新制作 16/22 号字库。
+ */
+static void create_unpair_dialog(void)
+{
+    s_unpair_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_unpair_overlay);
+    lv_obj_set_size(s_unpair_overlay, UI_HOR_RES, UI_VER_RES);
+    lv_obj_set_style_bg_color(s_unpair_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_unpair_overlay, LV_OPA_60, 0);
+    lv_obj_add_flag(s_unpair_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_unpair_overlay, LV_OBJ_FLAG_SCROLLABLE |
+                                       LV_OBJ_FLAG_EVENT_BUBBLE |
+                                       LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    lv_obj_t *card = lv_obj_create(s_unpair_overlay);
+    lv_obj_set_size(card, 382, 204);
+    lv_obj_center(card);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE |
+                             LV_OBJ_FLAG_EVENT_BUBBLE |
+                             LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x242424), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(card, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_style_text_color(card, lv_color_white(), 0);
+    lv_obj_set_style_text_font(card, ui_font_18(), 0);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "取消配对");
+    lv_obj_set_width(title, 350);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+    s_unpair_hint = lv_label_create(card);
+    lv_obj_set_width(s_unpair_hint, 350);
+    lv_label_set_long_mode(s_unpair_hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(s_unpair_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_opa(s_unpair_hint, LV_OPA_70, 0);
+    lv_label_set_text(s_unpair_hint, "确定取消与该设备的配对吗？");
+    lv_obj_align(s_unpair_hint, LV_ALIGN_TOP_MID, 0, 56);
+
+    s_unpair_confirm = lv_button_create(card);
+    lv_obj_set_size(s_unpair_confirm, 166, 44);
+    lv_obj_align(s_unpair_confirm, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(s_unpair_confirm, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_unpair_confirm, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_width(s_unpair_confirm, 0, 0);
+    lv_obj_remove_flag(s_unpair_confirm, LV_OBJ_FLAG_EVENT_BUBBLE |
+                                        LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_unpair_confirm, unpair_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *confirm_label = lv_label_create(s_unpair_confirm);
+    lv_label_set_text(confirm_label, "确认");
+    lv_obj_center(confirm_label);
+
+    s_unpair_cancel = lv_button_create(card);
+    lv_obj_set_size(s_unpair_cancel, 166, 44);
+    lv_obj_align(s_unpair_cancel, LV_ALIGN_BOTTOM_LEFT, 180, 0);
+    lv_obj_set_style_bg_color(s_unpair_cancel, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_unpair_cancel, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_width(s_unpair_cancel, 0, 0);
+    lv_obj_remove_flag(s_unpair_cancel, LV_OBJ_FLAG_EVENT_BUBBLE |
+                                       LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_unpair_cancel, unpair_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_label = lv_label_create(s_unpair_cancel);
+    lv_label_set_text(cancel_label, "取消");
+    lv_obj_center(cancel_label);
+}
+
+/** @brief 长按已配对卡片：显示确认弹窗，并显示当前设备名。 */
+static void show_unpair_dialog(void)
+{
+    if (!s_paired_valid) return;
+    if (!s_unpair_overlay) create_unpair_dialog();
+    char text[sizeof(s_paired_display) + 32];
+    snprintf(text, sizeof(text), "确定取消与%s的配对吗？", s_paired_display);
+    lv_label_set_text(s_unpair_hint, text);
+    lv_obj_remove_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_unpair_overlay);
+}
+
+/** @brief 新按下：清除上一轮长按的点击消费标志。 */
+static void paired_pressed_cb(lv_event_t *event)
+{
+    (void)event;
+    s_paired_long_pressed = false;
+}
+
+/** @brief 长按已配对卡片：只有存在配对记录时才弹确认框。 */
+static void paired_long_pressed_cb(lv_event_t *event)
+{
+    (void)event;
+    if (!s_paired_valid) return;
+    s_paired_long_pressed = true;
+    show_unpair_dialog();
+}
+
 /**
  * @brief 点击已配对设备：重新连接这一台，或在蓝牙关闭时先打开蓝牙。
  *
@@ -402,6 +545,11 @@ static void refresh_paired(void)
 static void paired_clicked_cb(lv_event_t *event)
 {
     (void)event;
+    /* 长按已经打开取消配对弹窗；丢弃松手时补发的 CLICKED。 */
+    if (s_paired_long_pressed) {
+        s_paired_long_pressed = false;
+        return;
+    }
     if (!s_paired_valid) return;
 
     if (!bt_audio_is_enabled()) {
@@ -571,6 +719,10 @@ static void create_paired_row(lv_obj_t *parent)
     lv_obj_remove_flag(s_paired_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_paired_row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_paired_row, paired_clicked_cb, LV_EVENT_CLICKED, NULL);
+    /* 短按重连，长按弹取消配对；PRESSED 先复位点击消费标志。 */
+    lv_obj_add_event_cb(s_paired_row, paired_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_paired_row, paired_long_pressed_cb,
+                        LV_EVENT_LONG_PRESSED, NULL);
 
     /* 内置 Montserrat 的蓝牙符号，不依赖自制字库。 */
     s_paired_icon = lv_label_create(s_paired_row);
@@ -701,6 +853,9 @@ void ui_bluetooth_settings_show(void)
 {
     if (!s_page || s_visible) return;
 
+    /* 上一次离开页面时可能留下确认弹窗；重新进入时先收起。 */
+    hide_unpair_dialog();
+    s_paired_long_pressed = false;
     lv_anim_delete(s_page, anim_x);
     /* 与另外两个子页一致：每次从右侧边界重新开始。 */
     lv_obj_set_x(s_page, UI_HOR_RES);
@@ -728,8 +883,10 @@ void ui_bluetooth_settings_show(void)
 void ui_bluetooth_settings_hide(void)
 {
     if (!s_page || !s_visible) return;
-    /* 先停搜索和轮询，再播退出动画；已建立的 A2DP 连接不因离开页面
-     * 断开，音乐/视频可以继续从蓝牙输出。 */
+    /* 先收起顶层确认弹窗，再停搜索和轮询，最后播退出动画；已建立的
+     * A2DP 连接不因离开页面断开，音乐/视频可以继续从蓝牙输出。 */
+    hide_unpair_dialog();
+    s_paired_long_pressed = false;
     lv_timer_pause(s_timer);
     bt_audio_scan_stop();
     slide_out();
@@ -739,6 +896,8 @@ void ui_bluetooth_settings_close_for_lock(void)
 {
     /* 锁屏只收起浮层并停止搜索；不改变蓝牙电源意图，也不等待后台。 */
     if (!s_page || !s_visible) return;
+    hide_unpair_dialog();
+    s_paired_long_pressed = false;
     lv_timer_pause(s_timer);
     bt_audio_scan_stop();
     slide_out();

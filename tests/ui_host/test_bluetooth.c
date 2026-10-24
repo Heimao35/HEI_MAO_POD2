@@ -79,6 +79,15 @@ size_t bt_audio_get_connected_name(char *out, size_t size)
     return strlen(out);
 }
 
+static unsigned forget_calls;
+void bt_audio_forget_paired(void)
+{
+    ++forget_calls;
+    mock_paired_valid = false;
+    memset(mock_paired_bda, 0, 6);
+    mock_paired_name[0] = 0;
+}
+
 bool bt_audio_get_paired(uint8_t bda[6], char *name, size_t name_size)
 {
     if (!bda || !name || !name_size) return false;
@@ -122,6 +131,19 @@ static void advance(unsigned ms)
         lv_timer_handler();
     }
     lv_obj_update_layout(lv_screen_active());
+}
+
+static void long_press_obj(lv_indev_t *indev, lv_obj_t *obj)
+{
+    lv_area_t area;
+    lv_obj_get_coords(obj, &area);
+    pointer_point = (lv_point_t){(area.x1 + area.x2) / 2, (area.y1 + area.y2) / 2};
+    pointer_state = LV_INDEV_STATE_PRESSED;
+    lv_indev_read(indev);
+    advance(700);
+    pointer_state = LV_INDEV_STATE_RELEASED;
+    lv_indev_read(indev);
+    advance(100);
 }
 
 static void click_obj(lv_indev_t *indev, lv_obj_t *obj)
@@ -286,6 +308,23 @@ int main(void)
     click_obj(pointer, s_paired_row);
     assert(connect_calls == before_paired_connect + 1);
     puts("PASS paired card reconnects its saved device and ignores taps while connected");
+
+    /* Long press the paired card: a modal confirmation appears; cancel keeps
+     * the pairing and confirm clears it through the facade. */
+    long_press_obj(pointer, s_paired_row);
+    assert(!lv_obj_has_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN));
+    assert(forget_calls == 0 && mock_paired_valid);
+    click_obj(pointer, s_unpair_cancel);
+    assert(lv_obj_has_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN));
+    assert(forget_calls == 0 && mock_paired_valid);
+    long_press_obj(pointer, s_paired_row);
+    assert(!lv_obj_has_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN));
+    click_obj(pointer, s_unpair_confirm);
+    assert(lv_obj_has_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN));
+    assert(forget_calls == 1 && !mock_paired_valid);
+    advance(300);
+    assert(strcmp(lv_label_get_text(s_paired_label), "暂无已配对设备") == 0);
+    puts("PASS long press opens unpair dialog; cancel keeps pairing, confirm clears it");
 
     /* Back stops scanning and hides the page with the shared 350ms slide;
      * the connection/power intent is not changed by leaving the page. The
