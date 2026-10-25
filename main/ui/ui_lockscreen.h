@@ -64,6 +64,23 @@ void ui_lockscreen_show(void);
 void ui_lockscreen_hide(void);
 
 /**
+ * @brief 锁屏遮挡状态回调。
+ * @param covered true：锁屏页已完全覆盖屏幕，下层模式页可安全隐藏；
+ *                false：锁屏页即将滑出，下层模式页必须先恢复可见。
+ * @note 回调在 LVGL 锁内执行。锁屏页滑入动画完成前不会报告 true，
+ *       以保留原有“锁屏页滑过下层页面”的过渡画面。
+ */
+typedef void (*ui_lockscreen_visibility_cb_t)(bool covered);
+
+/**
+ * @brief 注册锁屏遮挡状态回调（仅保存一个监听者）。
+ * @param cb 回调函数；传 NULL 取消注册。
+ * @note ui_manager 在初始化时注册，用于锁屏期间隐藏当前模式页，
+ *       避免不透明锁屏页下方的页面在每个 MJPEG 帧被重复绘制。
+ */
+void ui_lockscreen_set_visibility_cb(ui_lockscreen_visibility_cb_t cb);
+
+/**
  * @brief 查询锁屏页面是否当前可见
  * @return true=锁屏页面正在显示
  */

@@ -37,6 +37,30 @@ static ui_mode_t s_current_mode = UI_MODE_MUSIC;
 /* ---- 各模式页面指针数组，按 ui_mode_t 索引 ---- */
 static lv_obj_t *s_mode_pages[UI_MODE_MAX] = {NULL};
 
+/* ---- 锁屏遮挡时临时隐藏当前模式页 ----
+ * 锁屏页是不透明的全屏对象，但 LVGL 不会因为上层完全遮挡而跳过下层
+ * 绘制：锁屏 MJPEG 每帧 invalidate 全屏时，下面的音乐页（全屏模糊背景、
+ * 封面、歌词/播放列表）仍会被重新绘制。这里只在锁屏页完全覆盖屏幕后
+ * 隐藏当前模式页，滑入/滑出动画期间仍显示，保持原有过渡画面。
+ * 仅隐藏 ui_manager 自己显示的模式页；若页面本来就被其他流程隐藏，
+ * 不设置标志，解锁时也不会错误地把它显示出来。 */
+static bool s_mode_page_hidden_for_lock;
+
+static void lock_page_visibility_cb(bool covered)
+{
+    lv_obj_t *page = s_mode_pages[s_current_mode];
+    if (!page) return;
+    if (covered) {
+        if (!lv_obj_has_flag(page, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
+            s_mode_page_hidden_for_lock = true;
+        }
+    } else if (s_mode_page_hidden_for_lock) {
+        lv_obj_remove_flag(page, LV_OBJ_FLAG_HIDDEN);
+        s_mode_page_hidden_for_lock = false;
+    }
+}
+
 /* ---- 手势检测状态 ---- */
 static lv_point_t s_press_point;   /**< 按下时的坐标 */
 static bool s_gesture_detected;    /**< 本次触摸是否已识别手势 */
@@ -302,6 +326,10 @@ void ui_manager_init(void)
 
     /* ---- 2. 锁屏页面（默认可见） ---- */
     ui_lockscreen_create(scr);
+    /* 锁屏默认可见：注册遮挡回调并同步当前状态。锁屏 MJPEG 运行时
+     * 不再重绘被不透明锁屏页遮住的模式页；滑入/滑出期间仍显示。 */
+    ui_lockscreen_set_visibility_cb(lock_page_visibility_cb);
+    lock_page_visibility_cb(ui_lockscreen_is_visible());
 
     /* ---- 3. 面板 ---- */
     ui_mode_panel_create(scr);
@@ -348,6 +376,10 @@ void ui_manager_init(void)
 void ui_manager_switch_mode(ui_mode_t mode)
 {
     if (mode == s_current_mode || mode >= UI_MODE_MAX) return;
+    /* 锁屏遮挡期间当前模式页被临时隐藏。锁屏手势已经禁止打开模式栏，
+     * 这里兜底阻止其他调用路径在隐藏状态下切换页面，避免解锁后残留
+     * 一个被错误隐藏的旧页面。 */
+    if (ui_lockscreen_is_visible()) return;
 
     /* 离开视频模式前先停播放并释放视频 JPEG/缩略图资源；该调用只投递
      * 请求，不等待 SD/解码，因此可以在 LVGL 回调中安全执行。 */

@@ -16,6 +16,9 @@ static bool cancel_during_decode, fail_engine;
 static bool show_status_time;
 static TickType_t ticks;
 static lv_obj_t *bar;
+static unsigned cover_events;
+static bool covered_state;
+static void visibility_cb(bool covered) { ++cover_events; covered_state = covered; }
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 static ui_device_state_t state = {.time_valid=true, .weekday=0, .hour=16, .minute=45, .year=2026, .month=10, .day=18};
 
@@ -119,6 +122,8 @@ int main(void)
     ui_lockscreen_create(lv_screen_active());
     bar=lv_obj_create(lv_screen_active());
     assert(task_creations==1 && ui_lockscreen_is_visible());
+    ui_lockscreen_set_visibility_cb(visibility_cb);
+    assert(cover_events==0);
     ui_lockscreen_update();
     assert(!strcmp(lv_label_get_text(s_time_label),"16:45"));
     assert(!strcmp(lv_label_get_text(s_date_label),"2026-10-18"));
@@ -144,6 +149,7 @@ int main(void)
     assert(first && !ui_lockscreen_anim_is_idle());
     ui_lockscreen_show(); unsigned second=atomic_load(&s_anim_requested);
     assert(second>first && task_creations==1 && !show_status_time);
+    assert(covered_state && cover_events==1);
     /* Initial lock is already visible: replay changes only the MJPEG request,
      * never schedules a second top-down page entry animation. */
     assert(lv_anim_get(s_lock_page,anim_y_cb)==NULL);
@@ -152,10 +158,16 @@ int main(void)
     assert(lv_obj_get_index(bar)>lv_obj_get_index(s_lock_page));
     puts("PASS already-visible lock replays MJPEG in place with no page slide and preserves status-bar layer");
 
-    ui_lockscreen_hide(); ui_lockscreen_show(); advance();
+    ui_lockscreen_hide();
+    assert(!covered_state);
+    ui_lockscreen_show();
+    assert(covered_state);
+    advance();
     assert(ui_lockscreen_is_visible() && !lv_obj_has_flag(s_lock_page,LV_OBJ_FLAG_HIDDEN));
     assert(lv_anim_get(s_lock_page,anim_y_cb)==NULL);
-    ui_lockscreen_hide(); advance();
+    ui_lockscreen_hide();
+    assert(!covered_state);
+    advance();
     assert(!ui_lockscreen_is_visible() && show_status_time && scans==1);
     assert(ui_lockscreen_anim_is_idle());
     unsigned notify_before=notifications; ui_lockscreen_start_boot_anim();
@@ -168,11 +180,15 @@ int main(void)
     lv_anim_t *slide=lv_anim_get(s_lock_page,anim_y_cb);
     assert(slide && slide->start_value==-(int)UI_VER_RES && slide->end_value==0);
     assert(slide->path_cb==UI_ANIM_PATH);
+    /* 模式页在滑入完成前仍可见，滑入完成后才收到 covered=true。 */
+    assert(!covered_state);
     advance(); assert(lv_obj_get_y(s_lock_page)==0);
+    assert(covered_state);
     ui_lockscreen_stop_anim(); /* screen off retains visibility and objects */
     unsigned wake_generation=atomic_load(&s_anim_generation);
     ui_lockscreen_show();
     assert(atomic_load(&s_anim_requested)>wake_generation);
+    assert(covered_state);
     assert(lv_anim_get(s_lock_page,anim_y_cb)==NULL);
     lv_obj_update_layout(s_lock_page); assert(lv_obj_get_y(s_lock_page)==0);
     assert(scans==1 && task_creations==1);

@@ -48,6 +48,19 @@ static atomic_uint s_anim_requested;
 static atomic_uint s_anim_generation;
 static TaskHandle_t s_anim_task;
 static portMUX_TYPE s_anim_request_lock = portMUX_INITIALIZER_UNLOCKED;
+/* 锁屏遮挡状态监听者（ui_manager）：锁屏页完全覆盖后隐藏模式页，
+ * 开始滑出前恢复。回调只在LVGL任务/持锁路径中执行。 */
+static ui_lockscreen_visibility_cb_t s_visibility_cb;
+
+static void notify_lock_visibility(bool covered)
+{
+    if (s_visibility_cb) s_visibility_cb(covered);
+}
+
+void ui_lockscreen_set_visibility_cb(ui_lockscreen_visibility_cb_t cb)
+{
+    s_visibility_cb = cb;
+}
 
 
 static uint8_t *s_rgb_buf = NULL;
@@ -310,6 +323,9 @@ static void show_anim_ready(lv_anim_t *a)
     (void)a;
     s_visible = true;
     ui_statusbar_show_time(false);
+    /* 滑入动画结束后锁屏页才真正覆盖全屏；此时再隐藏下层模式页，
+     * 既保留原滑入过渡，又避免MJPEG稳态重复绘制被遮挡页面。 */
+    notify_lock_visibility(true);
 }
 
 static void hide_anim_ready(lv_anim_t *a)
@@ -367,11 +383,17 @@ void ui_lockscreen_show(void)
     ui_lockscreen_update();
     ui_statusbar_show_time(false);
     ui_lockscreen_start_boot_anim();
+    /* 无滑入（熄屏唤醒/锁屏重播）时锁屏页已经覆盖全屏，立即隐藏
+     * 下层模式页；有滑入时保留过渡画面，由 show_anim_ready 回调。 */
+    if (!slide_in) notify_lock_visibility(true);
 }
 
 void ui_lockscreen_hide(void)
 {
     if (!s_lock_page || !s_visible) return;
+    /* 滑出开始前先恢复下层模式页，保持原有“锁屏页滑走后露出原页面”
+     * 的过渡；之后约350ms动画期间的额外重绘只发生一次。 */
+    notify_lock_visibility(false);
     ui_lockscreen_stop_anim();
     lv_anim_delete(s_lock_page, anim_y_cb);
     lv_anim_t a;

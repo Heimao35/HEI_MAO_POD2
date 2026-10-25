@@ -56,6 +56,7 @@ lv_obj_t *ui_image_viewer_get_page(void) { return NULL; }
 lv_obj_t *ui_ebook_get_page(void) { return NULL; }
 void ui_lockscreen_create(lv_obj_t *p) { (void)p; }
 void ui_lockscreen_show(void) {}
+void ui_lockscreen_set_visibility_cb(ui_lockscreen_visibility_cb_t cb) { (void)cb; }
 void ui_mode_panel_create(lv_obj_t *p) { (void)p; }
 void ui_mode_panel_set_callback(ui_mode_switch_cb_t cb) { (void)cb; }
 void ui_adj_panel_create(lv_obj_t *p) { (void)p; }
