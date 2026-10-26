@@ -26,6 +26,8 @@ static const char *TAG = "lockscr";
 #define PADDED_H   PAD16(FRAME_H)
 #define DECODE_BUF_SZ (PADDED_W * PADDED_H * FRAME_BPP)
 #define ANIM_FPS   LOCK_ANIMATION_FPS
+/* 时间/日期/星期三行之间的固定行距，集中定义供创建和居中计算共用。 */
+#define CLOCK_LINE_GAP 10
 
 static lv_obj_t *s_lock_page  = NULL;
 static lv_obj_t *s_bg_canvas  = NULL;
@@ -213,15 +215,15 @@ void ui_lockscreen_create(lv_obj_t *parent)
     /* 三行统一使用整屏宽度的文本框，并在框内居中。仅把内容自适应的
      * label 对象放到中间，不能保证文本居中；尤其 align_to 是一次性
      * 计算，RTC 占位文本切到真实时间/星期后宽度改变会让日期或星期偏移。
-     * 固定宽度避免依赖兄弟文本的旧宽度，不改变原纵向位置、字号和间距。
-     * 这里只设标签文本对齐，不改锁屏容器/触摸范围及 MJPEG 动画逻辑。 */
+     * 固定宽度避免依赖兄弟文本的旧宽度；字号和10px行距保持不变，三行
+     * 随后作为一个整体垂直居中。这里只设标签文本对齐，不改锁屏容器/
+     * 触摸范围及 MJPEG 动画逻辑。 */
     s_time_label = lv_label_create(s_lock_page);
     lv_obj_set_width(s_time_label,UI_HOR_RES);
     lv_obj_set_style_text_align(s_time_label,LV_TEXT_ALIGN_CENTER,0);
     lv_label_set_text(s_time_label, "--:--");
     lv_obj_set_style_text_color(s_time_label, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(s_time_label, &lv_font_montserrat_48, 0);
-    lv_obj_align(s_time_label, LV_ALIGN_TOP_MID, 0, UI_VER_RES * 30 / 100);
 
     s_date_label = lv_label_create(s_lock_page);
     lv_obj_set_width(s_date_label,UI_HOR_RES);
@@ -229,18 +231,30 @@ void ui_lockscreen_create(lv_obj_t *parent)
     lv_label_set_text(s_date_label, "---- -- --");
     lv_obj_set_style_text_color(s_date_label, UI_COLOR_TEXT_SECONDARY, 0);
     lv_obj_set_style_text_font(s_date_label, &lv_font_montserrat_26, 0);
-    lv_obj_align_to(s_date_label, s_time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
 
-    /* 新增第三行星期：只占用日期下方空间，保留原大时间、日期、背景
-     * canvas 和解锁触摸区域的位置。中文采用 22 号，与数字字体分开。
-     * 依次更新后重新相对对齐，避免日期/占位文本宽度变化造成星期偏移。 */
+    /* 第三行星期位于日期下方。中文采用 22 号，与数字字体分开；
+     * 最终与时间、日期一起垂直居中。 */
     s_weekday_label=lv_label_create(s_lock_page);
     lv_obj_set_width(s_weekday_label,UI_HOR_RES);
     lv_obj_set_style_text_align(s_weekday_label,LV_TEXT_ALIGN_CENTER,0);
     lv_label_set_text(s_weekday_label,"时间未设置");
     lv_obj_set_style_text_font(s_weekday_label,ui_font_22(),0);
     lv_obj_set_style_text_color(s_weekday_label,UI_COLOR_TEXT_SECONDARY,0);
-    lv_obj_align_to(s_weekday_label,s_date_label,LV_ALIGN_OUT_BOTTOM_MID,0,10);
+
+    /* 时间/日期/星期作为一个整体垂直居中。先让 LVGL 完成三行布局取得
+     * 实际字高（时间48px、日期26px、星期22px），再以整块高度计算顶部
+     * 起点；日期和星期相对上一行重新对齐，保留原有10px行距。文本每秒
+     * 变化只改内容，单行高度不变，因此无需在刷新时重复计算。 */
+    lv_obj_update_layout(s_lock_page);
+    int32_t clock_height = lv_obj_get_height(s_time_label) + CLOCK_LINE_GAP +
+                           lv_obj_get_height(s_date_label) + CLOCK_LINE_GAP +
+                           lv_obj_get_height(s_weekday_label);
+    int32_t clock_top = (UI_VER_RES - clock_height) / 2;
+    if (clock_top < 0) clock_top = 0;
+    lv_obj_align(s_time_label, LV_ALIGN_TOP_MID, 0, clock_top);
+    lv_obj_update_layout(s_lock_page);
+    lv_obj_align_to(s_date_label, s_time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, CLOCK_LINE_GAP);
+    lv_obj_align_to(s_weekday_label, s_date_label, LV_ALIGN_OUT_BOTTOM_MID, 0, CLOCK_LINE_GAP);
 
     /* 右下角传感器读数：温度在步数上方，两者右边缘对齐。
      * 使用固定宽度 + TEXT_ALIGN_RIGHT，而不是 align_to 依赖兄弟标签宽度：

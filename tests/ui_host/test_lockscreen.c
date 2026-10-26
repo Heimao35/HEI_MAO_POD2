@@ -98,7 +98,7 @@ static void run_requested(void)
 /* Time strings and the custom weekday font have different glyph widths.
  * Every line needs a fixed page-width text box with centered text, not merely
  * a once-computed position relative to a content-sized sibling label. */
-static void assert_clock_centered(void)
+static void assert_clock_horizontally_centered(void)
 {
     lv_obj_update_layout(s_lock_page);
     lv_area_t page;lv_obj_get_coords(s_lock_page,&page);
@@ -109,9 +109,27 @@ static void assert_clock_centered(void)
         assert(area.x1+area.x2==page.x1+page.x2);
         assert(lv_obj_get_style_text_align(labels[i],LV_PART_MAIN)==LV_TEXT_ALIGN_CENTER);
     }
-    assert(lv_obj_get_y(s_time_label)==UI_VER_RES*30/100);
-    assert(lv_obj_get_y(s_date_label)==lv_obj_get_y(s_time_label)+lv_obj_get_height(s_time_label)+10);
-    assert(lv_obj_get_y(s_weekday_label)==lv_obj_get_y(s_date_label)+lv_obj_get_height(s_date_label)+10);
+}
+
+/* 三行之间的固定10px行距。 */
+static void assert_clock_line_gaps(void)
+{
+    assert(lv_obj_get_y(s_date_label)==lv_obj_get_y(s_time_label)+lv_obj_get_height(s_time_label)+CLOCK_LINE_GAP);
+    assert(lv_obj_get_y(s_weekday_label)==lv_obj_get_y(s_date_label)+lv_obj_get_height(s_date_label)+CLOCK_LINE_GAP);
+}
+
+/* 三行作为整体垂直居中；整数取整允许1px误差。 */
+static void assert_clock_centered(void)
+{
+    assert_clock_horizontally_centered();
+    lv_area_t page;lv_obj_get_coords(s_lock_page,&page);
+    lv_area_t first,last;
+    lv_obj_get_coords(s_time_label,&first);
+    lv_obj_get_coords(s_weekday_label,&last);
+    int32_t block_center=(first.y1+last.y2)/2;
+    int32_t page_center=(page.y1+page.y2)/2;
+    assert(block_center>=page_center-1 && block_center<=page_center+1);
+    assert_clock_line_gaps();
 }
 int main(void)
 {
@@ -138,10 +156,14 @@ int main(void)
     ui_lockscreen_update();assert_clock_centered();
     state.hour=23;state.minute=58;state.month=12;state.day=31;state.weekday=6;
     ui_lockscreen_update();assert_clock_centered();
-    /* Changing weekday line metrics must not affect horizontal centering or
-     * the original 10px vertical gap beneath the existing date line. */
+    /* Changing weekday line metrics is a test-only check: the production
+     * layout is centered once for the fixed 22px weekday font. Verify that
+     * horizontal centering and the original 10px gap do not depend on glyph
+     * widths, then restore the font and verify the whole block centering. */
     lv_obj_set_style_text_font(s_weekday_label,&lv_font_montserrat_16,0);
-    ui_lockscreen_update();assert_clock_centered();
+    ui_lockscreen_update();
+    assert_clock_horizontally_centered();
+    assert_clock_line_gaps();
     lv_obj_set_style_text_font(s_weekday_label,ui_font_22(),0);
     ui_lockscreen_update();assert_clock_centered();
 
