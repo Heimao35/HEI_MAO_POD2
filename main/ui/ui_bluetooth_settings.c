@@ -197,7 +197,7 @@ static void refresh_status(void)
             text = "蓝牙已关闭";
         } else if (!bt_audio_link_ready()) {
             /* 用户已打开，但 P4 与 U4 的 SDIO 链路尚未握手。 */
-            text = "蓝牙协处理器未就绪";
+            text = "蓝牙启动中…";
         } else {
             switch (state) {
             case BT_AUDIO_STATE_CONNECTED: {
