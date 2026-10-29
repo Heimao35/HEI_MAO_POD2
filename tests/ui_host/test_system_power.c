@@ -126,6 +126,26 @@ int main(void)
         p=(lv_point_t){(area.x1+area.x2)/2,(area.y1+area.y2)/2};
         assert(lv_indev_search_obj(lv_layer_top(),&p)==s_buttons[i]);
     }
+    /* 关机弹窗三个按键与其它可点击控件共用按下反馈：按住时提亮为
+     * 不透明中性灰并出现 2px 白色描边。这里读取 PRESSED 选择器上的
+     * 本地样式（而不是立即计算值），避免主题 80ms 颜色过渡影响断言；
+     * 低电自动关机弹窗复用同一组按钮对象，因此同样生效。 */
+    for(unsigned i=0;i<3;++i) {
+        lv_style_value_t v;
+        assert(lv_obj_get_local_style_prop(s_buttons[i],LV_STYLE_BG_COLOR,&v,
+                                           LV_STATE_PRESSED)==LV_STYLE_RES_FOUND);
+        assert(lv_color_eq(v.color,UI_COLOR_PRESSED_BG));
+        assert(lv_obj_get_local_style_prop(s_buttons[i],LV_STYLE_BG_OPA,&v,
+                                           LV_STATE_PRESSED)==LV_STYLE_RES_FOUND);
+        assert(v.num==LV_OPA_COVER);
+        assert(lv_obj_get_local_style_prop(s_buttons[i],LV_STYLE_BORDER_WIDTH,&v,
+                                           LV_STATE_PRESSED)==LV_STYLE_RES_FOUND);
+        assert(v.num==2);
+        assert(lv_obj_get_local_style_prop(s_buttons[i],LV_STYLE_BORDER_COLOR,&v,
+                                           LV_STATE_PRESSED)==LV_STYLE_RES_FOUND);
+        assert(lv_color_eq(v.color,UI_COLOR_TEXT));
+    }
+    puts("PASS power dialog buttons use the shared pressed feedback");
     lv_obj_send_event(s_buttons[2],LV_EVENT_CLICKED,NULL); system_power_step();
     assert(!ui_power_dialog_is_visible() && atomic_load(&s_held));
     ticks=9000; system_power_step(); assert(!ui_power_dialog_is_visible());

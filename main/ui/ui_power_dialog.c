@@ -59,6 +59,10 @@ static void create_dialog(void)
         lv_obj_set_style_bg_color(s_buttons[i],lv_color_white(),0);
         lv_obj_set_style_bg_opa(s_buttons[i],LV_OPA_20,0);
         lv_obj_set_style_shadow_width(s_buttons[i],0,0);
+        /* 关机弹窗与低电自动关机弹窗共用这三个按键对象：按住时提亮并
+         * 出现 2px 白色描边，松开或滑动取消后自动恢复；按钮尺寸、位置
+         * 和正常态的半透明样式都不变。禁用保存期间不会出现按住反馈。 */
+        ui_apply_pressed_style(s_buttons[i]);
         lv_obj_remove_flag(s_buttons[i],LV_OBJ_FLAG_EVENT_BUBBLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
         lv_obj_add_event_cb(s_buttons[i],action_cb,LV_EVENT_CLICKED,(void *)(uintptr_t)actions[i]);
         lv_obj_t *label=lv_label_create(s_buttons[i]);

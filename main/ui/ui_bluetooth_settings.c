@@ -288,6 +288,9 @@ static void create_row_objects(unsigned index)
     lv_obj_set_style_pad_all(item->row, 0, 0);
     lv_obj_remove_flag(item->row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(item->row, LV_OBJ_FLAG_CLICKABLE);
+    /* 与设置页其它按键一致的按下提亮+白色描边；滚动拖动时 PRESS_LOST
+     * 会自动清除，不影响列表滚动。 */
+    ui_apply_pressed_style(item->row);
     /* 用户数据保存行号而不是 BDA 指针：行池是静态数组，回调发生时
      * 仍有效；重新扫描只更新同一行的 bda 内容，不重新注册事件。 */
     lv_obj_add_event_cb(item->row, device_clicked_cb, LV_EVENT_CLICKED,
@@ -484,6 +487,9 @@ static void create_unpair_dialog(void)
     lv_obj_set_style_bg_color(s_unpair_confirm, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(s_unpair_confirm, LV_OPA_20, 0);
     lv_obj_set_style_shadow_width(s_unpair_confirm, 0, 0);
+    /* 与关机弹窗按键共用同一套按下反馈：按住提亮并显示白色描边，
+     * 松开或滑出按钮后自动恢复，正常态的半透明样式和布局不变。 */
+    ui_apply_pressed_style(s_unpair_confirm);
     lv_obj_remove_flag(s_unpair_confirm, LV_OBJ_FLAG_EVENT_BUBBLE |
                                         LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_event_cb(s_unpair_confirm, unpair_confirm_cb, LV_EVENT_CLICKED, NULL);
@@ -497,6 +503,8 @@ static void create_unpair_dialog(void)
     lv_obj_set_style_bg_color(s_unpair_cancel, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(s_unpair_cancel, LV_OPA_20, 0);
     lv_obj_set_style_shadow_width(s_unpair_cancel, 0, 0);
+    /* 取消键与确认键保持完全相同的按住反馈。 */
+    ui_apply_pressed_style(s_unpair_cancel);
     lv_obj_remove_flag(s_unpair_cancel, LV_OBJ_FLAG_EVENT_BUBBLE |
                                        LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_event_cb(s_unpair_cancel, unpair_cancel_cb, LV_EVENT_CLICKED, NULL);
@@ -718,6 +726,8 @@ static void create_paired_row(lv_obj_t *parent)
     lv_obj_set_style_pad_all(s_paired_row, 0, 0);
     lv_obj_remove_flag(s_paired_row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_paired_row, LV_OBJ_FLAG_CLICKABLE);
+    /* 已配对卡片同样使用统一按下反馈；长按弹取消配对时保持按住高亮。 */
+    ui_apply_pressed_style(s_paired_row);
     lv_obj_add_event_cb(s_paired_row, paired_clicked_cb, LV_EVENT_CLICKED, NULL);
     /* 短按重连，长按弹取消配对；PRESSED 先复位点击消费标志。 */
     lv_obj_add_event_cb(s_paired_row, paired_pressed_cb, LV_EVENT_PRESSED, NULL);

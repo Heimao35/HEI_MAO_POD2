@@ -211,6 +211,8 @@ void ui_settings_create(lv_obj_t *parent)
         lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(btn, LV_OBJ_FLAG_EVENT_BUBBLE);
+        /* 按下反馈只覆盖 PRESSED 状态；蓝牙ON的白色正常态不受影响。 */
+        ui_apply_pressed_style(btn);
         lv_obj_add_event_cb(btn, item_click_cb, LV_EVENT_CLICKED,
                             (void *)(uintptr_t)i);
 

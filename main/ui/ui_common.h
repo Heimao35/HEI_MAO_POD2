@@ -53,6 +53,28 @@ extern "C" {
 #define UI_PANEL_BG_COLOR       lv_color_hex(0x1A1A1A)
 #define UI_COLOR_SLIDER_ACTIVE  UI_COLOR_ACCENT
 #define UI_COLOR_SLIDER_BG      lv_color_hex(0x484848)
+/** 按键/卡片按下时的中性提亮色；与白色描边配合，不改变布局。 */
+#define UI_COLOR_PRESSED_BG     lv_color_hex(0x3A3A3A)
+
+/**
+ * @brief 为可点击对象添加统一按下反馈：中性提亮 + 2px 白色描边。
+ *
+ * 只写 PRESSED 状态样式，不修改尺寸、位置、圆角或正常状态颜色；
+ * 释放或 LV_EVENT_PRESS_LOST 后 LVGL 自动恢复。用于模式按钮、设置
+ * 按钮、声光按钮、视频预览 tile 以及关机/配对确认弹窗按键。
+ */
+static inline void ui_apply_pressed_style(lv_obj_t *obj)
+{
+    if (!obj) return;
+    lv_obj_set_style_bg_color(obj, UI_COLOR_PRESSED_BG, LV_STATE_PRESSED);
+    /* 弹窗按键常态是 20% 白色半透明，若按住时继续半透明，提亮色几乎
+     * 不可见；按下瞬间改为不透明填充。其它控件常态本就不透明，此行
+     * 不改变它们的外观。 */
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(obj, 2, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(obj, UI_COLOR_TEXT, LV_STATE_PRESSED);
+    lv_obj_set_style_border_opa(obj, LV_OPA_80, LV_STATE_PRESSED);
+}
 
 /* ======================== 状态栏参数 ======================== */
 /** 状态栏高度 (像素)，同时也是下拉手势的检测区域高度，增大使状态栏更高 */

@@ -95,6 +95,7 @@ static lv_obj_t *s_player_view;
 static lv_obj_t *s_canvas;
 static lv_obj_t *s_player_status;
 static lv_obj_t *s_controls;
+static lv_obj_t *s_press_overlay; /**< 全屏视频按下时的白色边缘反馈 */
 static lv_obj_t *s_back_btn;
 static lv_obj_t *s_play_btn;
 static lv_obj_t *s_play_icon;
@@ -115,6 +116,7 @@ static bool s_canvas_has_buffer;
 static int32_t s_controls_opa;
 
 static void controls_show(void);
+static void video_press_feedback(bool on);
 static void controls_hide(void);
 static void controls_activity(void);
 static void ui_timer_cb(lv_timer_t *timer);
@@ -184,6 +186,7 @@ static void gesture_press_lost_cb(lv_event_t *event)
     (void)event;
     s_list_press_valid = false;
     s_player_press_valid = false;
+    video_press_feedback(false);
 }
 
 /* ============================ 预览缩略图 ============================ */
@@ -249,6 +252,12 @@ static void controls_fade_done(lv_anim_t *anim)
  * 只改 s_controls 的透明度，不改变播放器布局、canvas 或视频帧缓冲。
  * 透明度作用于整个控制层，返回键、底部栏和进度条一起淡入。
  */
+static void video_press_feedback(bool on)
+{
+    if (!s_press_overlay) return;
+    lv_obj_set_style_opa(s_press_overlay, on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+}
+
 static void controls_show(void)
 {
     if (!s_player_active || s_player_transitioning || !s_controls) return;
@@ -677,11 +686,14 @@ static void player_pressed_cb(lv_event_t *event)
     }
     s_player_press = p;
     s_player_press_valid = true;
+    /* 视频画面按下时显示白色边缘反馈；松开/PRESS_LOST时清除。 */
+    video_press_feedback(true);
 }
 
 static void player_released_cb(lv_event_t *event)
 {
     (void)event;
+    video_press_feedback(false);
     if (!s_player_active || s_player_transitioning || !s_player_press_valid ||
         s_slider_dragging) return;
     s_player_press_valid = false;
@@ -964,6 +976,8 @@ static lv_obj_t *create_tile(lv_obj_t *parent, unsigned slot)
     lv_obj_set_style_pad_all(tile, 0, 0);
     lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+    /* 预览 tile 按下时与其它可点击控件一致的提亮+白色描边。 */
+    ui_apply_pressed_style(tile);
     /* 让边缘手势能从 tile 冒泡到屏幕；tile 自己的 press/release 先处理，
      * list 的重复事件由 s_list_press_valid 拦截。 */
     lv_obj_add_flag(tile, LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -1245,6 +1259,20 @@ void ui_video_player_create(lv_obj_t *parent)
                         LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(s_slider_touch, slider_touch_press_lost_cb,
                         LV_EVENT_PRESS_LOST, NULL);
+
+    /* 全屏视频的按下反馈：覆盖在画面/控制台之上的透明边框层。
+     * 只改整层opa，不拦截触摸、不改变视频/控制台布局。 */
+    s_press_overlay = lv_obj_create(s_player_view);
+    lv_obj_set_size(s_press_overlay, UI_HOR_RES, UI_VER_RES);
+    lv_obj_set_pos(s_press_overlay, 0, 0);
+    lv_obj_set_style_bg_opa(s_press_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_press_overlay, 2, 0);
+    lv_obj_set_style_border_color(s_press_overlay, UI_COLOR_TEXT, 0);
+    lv_obj_set_style_border_opa(s_press_overlay, LV_OPA_80, 0);
+    lv_obj_set_style_radius(s_press_overlay, 0, 0);
+    lv_obj_set_style_pad_all(s_press_overlay, 0, 0);
+    lv_obj_remove_flag(s_press_overlay, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_opa(s_press_overlay, LV_OPA_TRANSP, 0);
 
     /* 100ms 定时器只做轻量 RAM 读取和滑块同步；不访问 SD/JPEG。 */
     s_ui_timer = lv_timer_create(ui_timer_cb, 100, NULL);

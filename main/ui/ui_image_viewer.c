@@ -1127,6 +1127,10 @@ static void create_home_card(lv_obj_t *parent, image_folder_t folder)
     lv_obj_set_style_pad_all(card, 0, 0);
     lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    /* 点击反馈：按下时底色轻微提亮并出现白色描边；释放或
+     * LV_EVENT_PRESS_LOST 后 LVGL 自动清除 PRESSED，不改布局/名称/
+     * 手势判定，也不影响滑动防误触。 */
+    ui_apply_pressed_style(card);
     /* 让卡片上的边缘滑动仍能冒泡到 ui_manager 打开模式/声光栏。 */
     lv_obj_add_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(card, home_pressed_cb, LV_EVENT_PRESSED, NULL);

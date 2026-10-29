@@ -255,6 +255,21 @@ int main(void)
     assert(lv_obj_has_flag(s_empty, LV_OBJ_FLAG_HIDDEN));
     puts("PASS scan results render in the scroll list with 18px names");
 
+    /* 设备行和已配对卡片按下时使用统一的提亮+2px白色描边。 */
+    lv_obj_add_state(s_rows[0].row, LV_STATE_PRESSED);
+    assert(lv_color_eq(lv_obj_get_style_bg_color(s_rows[0].row, 0),
+                       UI_COLOR_PRESSED_BG));
+    assert(lv_obj_get_style_border_width(s_rows[0].row, 0) == 2);
+    lv_obj_remove_state(s_rows[0].row, LV_STATE_PRESSED);
+    assert(lv_obj_get_style_border_width(s_rows[0].row, 0) == 0);
+    lv_obj_add_state(s_paired_row, LV_STATE_PRESSED);
+    assert(lv_color_eq(lv_obj_get_style_bg_color(s_paired_row, 0),
+                       UI_COLOR_PRESSED_BG));
+    assert(lv_obj_get_style_border_width(s_paired_row, 0) == 2);
+    lv_obj_remove_state(s_paired_row, LV_STATE_PRESSED);
+    assert(lv_obj_get_style_border_width(s_paired_row, 0) == 0);
+    puts("PASS device rows and paired card use the shared pressed feedback");
+
     /* Tapping a row sends that row's BDA to the facade; the page itself does
      * not mark anything connected before the backend confirms. */
     connect_result = ESP_OK;
@@ -315,6 +330,25 @@ int main(void)
     long_press_obj(pointer, s_paired_row);
     assert(!lv_obj_has_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN));
     assert(forget_calls == 0 && mock_paired_valid);
+    /* 取消配对弹窗的“确认/取消”与关机弹窗按键使用同一按下反馈：
+     * 按住提亮 + 2px 白色描边，松开后恢复原半透明正常态。这里直接
+     * 切换 PRESSED 状态并让主题的 80ms 颜色过渡跑完，再读取用户实际
+     * 看到的样式；不改用真实点击，避免提前触发配对/取消动作。 */
+    lv_obj_t *unpair_buttons[2] = {s_unpair_confirm, s_unpair_cancel};
+    for (unsigned i = 0; i < 2; ++i) {
+        lv_obj_add_state(unpair_buttons[i], LV_STATE_PRESSED);
+        advance(200);
+        assert(lv_color_eq(lv_obj_get_style_bg_color(unpair_buttons[i], 0),
+                           UI_COLOR_PRESSED_BG));
+        assert(lv_obj_get_style_bg_opa(unpair_buttons[i], 0) == LV_OPA_COVER);
+        assert(lv_obj_get_style_border_width(unpair_buttons[i], 0) == 2);
+        lv_obj_remove_state(unpair_buttons[i], LV_STATE_PRESSED);
+        advance(200);
+        assert(lv_obj_get_style_border_width(unpair_buttons[i], 0) == 0);
+        assert(lv_obj_get_style_bg_opa(unpair_buttons[i], 0) == LV_OPA_20);
+    }
+    assert(!lv_obj_has_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN));
+    puts("PASS unpair dialog buttons use the shared pressed feedback");
     click_obj(pointer, s_unpair_cancel);
     assert(lv_obj_has_flag(s_unpair_overlay, LV_OBJ_FLAG_HIDDEN));
     assert(forget_calls == 0 && mock_paired_valid);

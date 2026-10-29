@@ -186,6 +186,28 @@ int main(void)
     assert(!lv_obj_has_flag(s_home_phs[IMAGE_FOLDER_PICTURES], LV_OBJ_FLAG_HIDDEN));
     puts("PASS scan result fills cam preview and leaves pictures placeholder");
 
+    /* 按下卡片应有提亮+白色描边；拖动释放后自动恢复，不误进文件夹。 */
+    lv_area_t card_area;
+    lv_obj_get_coords(card_cam, &card_area);
+    lv_point_t card_center = {(card_area.x1 + card_area.x2) / 2,
+                              (card_area.y1 + card_area.y2) / 2};
+    pointer_point = card_center;
+    pointer_state = LV_INDEV_STATE_PRESSED;
+    lv_indev_read(pointer);
+    advance(20);
+    assert(lv_obj_has_state(card_cam, LV_STATE_PRESSED));
+    assert(lv_color_eq(lv_obj_get_style_bg_color(card_cam, 0),
+                       UI_COLOR_PRESSED_BG));
+    assert(lv_obj_get_style_border_width(card_cam, 0) == 2);
+    pointer_point = (lv_point_t){card_center.x + 160, card_center.y};
+    pointer_state = LV_INDEV_STATE_RELEASED;
+    lv_indev_read(pointer);
+    advance(60);
+    assert(!lv_obj_has_state(card_cam, LV_STATE_PRESSED));
+    assert(lv_obj_get_style_border_width(card_cam, 0) == 0);
+    assert(!s_overview_visible);
+    puts("PASS home card pressed feedback appears and clears without a stray click");
+
     /* 在卡片左边缘右滑是打开模式栏的手势，不能同时触发卡片 CLICKED。 */
     swipe(pointer, (lv_point_t){20, 150}, (lv_point_t){140, 150});
     advance(400);

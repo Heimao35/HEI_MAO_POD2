@@ -217,6 +217,9 @@ static lv_obj_t *create_round_btn(lv_obj_t *parent, const char *text,
     lv_obj_set_style_border_width(btn, 0, 0);
     lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    /* 自动亮度/静音按钮共用按下提亮+白色描边；激活的白色正常态
+     * 会在按住时短暂变为中性灰，松手恢复。 */
+    ui_apply_pressed_style(btn);
     lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *lbl = lv_label_create(btn);

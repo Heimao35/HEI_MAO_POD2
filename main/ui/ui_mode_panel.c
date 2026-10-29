@@ -106,6 +106,8 @@ void ui_mode_panel_create(lv_obj_t *parent)
         lv_obj_set_style_border_width(btn, 0, 0);
         lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+        /* 按下时统一提亮并显示白色描边，松开自动恢复。 */
+        ui_apply_pressed_style(btn);
 
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, s_modes[i].symbol);
