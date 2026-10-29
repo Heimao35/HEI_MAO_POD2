@@ -264,6 +264,10 @@ int main(void)
     assert(lv_obj_has_flag(s_full, LV_OBJ_FLAG_HIDDEN));
     puts("PASS tap controls and back button return to overview with status bar");
 
+    /* 对角/带纵向分量的滑动不能误触发返回；只有干净右滑才返回。 */
+    swipe(pointer, (lv_point_t){150, 300}, (lv_point_t){230, 240});
+    advance(400);
+    assert(s_overview_visible);
     /* 总览非边缘右滑返回首页。 */
     swipe(pointer, (lv_point_t){200, 230}, (lv_point_t){330, 230});
     advance(400);

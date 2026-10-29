@@ -124,6 +124,7 @@ static bool s_overview_visible;
 static bool s_overview_transition;
 static bool s_press_valid;
 static lv_point_t s_press;
+static int32_t s_overview_press_scroll_y;
 static bool s_swiped;
 
 static bool s_full_active;
@@ -475,6 +476,7 @@ static void overview_pressed_cb(lv_event_t *event)
     lv_indev_t *indev = lv_indev_active();
     if (!indev) return;
     lv_indev_get_point(indev, &s_press);
+    s_overview_press_scroll_y = lv_obj_get_scroll_y(s_overview_scroll);
     s_press_valid = true;
     s_swiped = false;
 }
@@ -494,8 +496,15 @@ static void overview_released_cb(lv_event_t *event)
     int32_t adx = dx < 0 ? -dx : dx;
     int32_t ady = dy < 0 ? -dy : dy;
     if (adx > 12 || ady > 12) s_swiped = true;
-    /* 非边缘右滑返回首页；边缘滑动留给 ui_manager 打开模式/声光栏。 */
-    if (dx > 50 && dx > dy && !is_edge_start(&s_press))
+    /* 非边缘、干净的右滑才返回首页：
+     * - 内容实际滚动超过4px（含惯性）说明用户在浏览，不返回；
+     * - 横向位移必须明显大于纵向（2倍），避免对角滚动误判；
+     * - 边缘滑动留给 ui_manager 打开模式/声光栏。 */
+    int32_t scroll_delta = lv_obj_get_scroll_y(s_overview_scroll) -
+                           s_overview_press_scroll_y;
+    if (scroll_delta < 0) scroll_delta = -scroll_delta;
+    if (scroll_delta <= 4 && dx > 60 && dx > ady * 2 &&
+        !is_edge_start(&s_press))
         close_overview();
 }
 
