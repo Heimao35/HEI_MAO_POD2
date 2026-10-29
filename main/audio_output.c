@@ -36,6 +36,9 @@
 #define WORKER_BUSY 4U
 #define SLEEP_REQUEST 8U
 #define REQUEST_MASK (QUIESCE_REQUEST|SLEEP_REQUEST)
+/* 音频 PCM 供给是实时路径；图片/视频/蓝牙 worker 都是优先级5。
+ * 先只把音频任务提高到6，观察短时SD读锁竞争是否改善。 */
+#define AUDIO_TASK_PRIO 6U
 static const char *TAG="audio_output";
 static TaskHandle_t s_task;
 static portMUX_TYPE s_cmd_mux=portMUX_INITIALIZER_UNLOCKED;
@@ -1061,7 +1064,7 @@ esp_err_t audio_output_init(void)
     ret=gpio_config(&irq);if(ret!=ESP_OK)goto fail;
     ret=gpio_isr_handler_add(IRQ_GPIO,dac_irq,NULL);if(ret!=ESP_OK)goto fail;
     irq_added=true;
-    if(xTaskCreatePinnedToCore(output_task,"audio_out",24576,NULL,5,&s_task,0)!=pdPASS) {
+    if(xTaskCreatePinnedToCore(output_task,"audio_out",24576,NULL,AUDIO_TASK_PRIO,&s_task,0)!=pdPASS) {
         ret=ESP_ERR_NO_MEM;goto fail;
     }
     return ESP_OK;

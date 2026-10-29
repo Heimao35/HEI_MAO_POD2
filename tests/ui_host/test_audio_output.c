@@ -87,7 +87,7 @@ void xTaskNotifyGive(TaskHandle_t task) {assert(task);++notify_count;}
 void vTaskNotifyGiveFromISR(TaskHandle_t task,BaseType_t *wake)
 {assert(task);++notify_count;++dma_wakes;*wake=pdTRUE;}
 BaseType_t xTaskCreatePinnedToCore(void(*fn)(void*),const char*n,uint32_t stack,void*arg,UBaseType_t p,TaskHandle_t*t,int core)
-{(void)fn;(void)n;(void)arg;assert(stack>=20480 && p==5 && core==0);*t=(void*)3;return pdPASS;}
+{(void)fn;(void)n;(void)arg;assert(stack>=20480 && p==AUDIO_TASK_PRIO && core==0);*t=(void*)3;return pdPASS;}
 static ssize_t checked_audio_read(int fd,void *buf,size_t bytes)
 {
     assert(sd_locked && !ui_locked && buf==s_io);
@@ -452,8 +452,11 @@ int main(void)
     assert(audio_output_video_play_requested() && !audio_output_video_started());
     static uint8_t vpcm[4096*4];
     memset(vpcm,0x5a,sizeof(vpcm));
-    assert(audio_output_video_write(vpcm,4096,20)==4096);
-    assert(audio_output_video_write(vpcm,4096,20)==4096);
+    /* 以实际高水位填满 ring；128KiB ring 下高水位高于旧 64KiB 的高水位。 */
+    while (audio_pcm_queued(&s_pcm) < AUDIO_PCM_HIGH_BYTES) {
+        size_t wrote = audio_output_video_write(vpcm,2048,20);
+        assert(wrote > 0);
+    }
     pump_wait=false;
     for(unsigned i=0;i<8 && !tx_enabled;++i){output_iteration();advance_ms(1);}
     assert(tx_enabled && audio_output_video_started());
@@ -468,8 +471,10 @@ int main(void)
     audio_output_video_flush();
     assert(!tx_enabled && audio_output_video_time_us()==0);
     audio_output_video_play(false);
-    assert(audio_output_video_write(vpcm,4096,20)==4096);
-    assert(audio_output_video_write(vpcm,4096,20)==4096);
+    while (audio_pcm_queued(&s_pcm) < AUDIO_PCM_HIGH_BYTES) {
+        size_t wrote = audio_output_video_write(vpcm,2048,20);
+        assert(wrote > 0);
+    }
     audio_output_video_play(true);
     pump_wait=false;
     for(unsigned i=0;i<8 && !tx_enabled;++i){output_iteration();advance_ms(1);}

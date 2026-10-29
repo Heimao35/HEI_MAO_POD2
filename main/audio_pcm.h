@@ -3,6 +3,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+/* 保持 64KiB：128KiB 实测会挤占 I2S DMA 所需的内部 DMA 内存，
+ * i2s_alloc_dma_desc() 返回 ESP_ERR_NO_MEM，整条音频无法启动。
+ * push/DMA ISR 使用 & (AUDIO_RING_BYTES-1) 回绕，因此必须保持2的幂；
+ * ring 和本结构必须在内部 SRAM（DMA ISR 直接读取）。 */
 #define AUDIO_RING_BYTES (64U*1024U)
 #define AUDIO_DMA_COUNT 8U
 #define AUDIO_DMA_FRAMES 256U
