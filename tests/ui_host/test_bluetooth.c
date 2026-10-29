@@ -235,7 +235,8 @@ int main(void)
     assert(mock_enabled);
     assert(lv_obj_has_state(s_power_switch, LV_STATE_CHECKED));
     assert(scan_start_calls == 2);
-    assert(strstr(lv_label_get_text(s_status), "未就绪") != NULL);
+    /* 用户改版后的状态文案为“蓝牙启动中…”，空列表提示仍为“未就绪”。 */
+    assert(strstr(lv_label_get_text(s_status), "启动中") != NULL);
     assert(strstr(lv_label_get_text(s_empty), "未就绪") != NULL);
     puts("PASS switch posts power intent and reports an unready link honestly");
 

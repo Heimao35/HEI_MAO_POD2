@@ -35,6 +35,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME video_ui COMMAND video_ui_tests)
 
+# Image viewer home/overview/fullscreen layout and gestures with a stub
+# backend; verifies the fixed 32-slot virtualization and status-bar handoff.
+add_executable(image_viewer_tests test_image_viewer.c)
+target_include_directories(image_viewer_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(image_viewer_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(image_viewer_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable -ffunction-sections -fdata-sections)
+  target_link_options(image_viewer_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+endif()
+add_test(NAME image_viewer COMMAND image_viewer_tests)
+
 # Real 460x460 MJPEG fixture: streaming parser, seek and thumbnail window.
 add_executable(video_mjpeg_tests test_video_mjpeg.c)
 # stubs/ff.h keeps the real parser test on stdio while production uses FatFs.

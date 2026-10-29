@@ -35,6 +35,7 @@
 #include "pmic_axp2101.h"
 #include "music_player_adapter.h"
 #include "video_player.h"
+#include "image_viewer.h"
 #include "jpeg_codec.h"
 #include "audio_output.h"
 #include "ui_fonts.h"
@@ -435,6 +436,12 @@ void app_main(void)
     esp_err_t video_ret = video_player_init();
     if (video_ret != ESP_OK)
         ESP_LOGE(TAG, "Video player init failed: %s", esp_err_to_name(video_ret));
+
+    /* 图片 worker 只创建命令队列/任务；扫描、缩略图和全屏缓冲在首次
+     * 进入图片模式时才分配，未使用图片功能时不占用额外 PSRAM。 */
+    esp_err_t image_ret = image_viewer_init();
+    if (image_ret != ESP_OK)
+        ESP_LOGE(TAG, "Image viewer init failed: %s", esp_err_to_name(image_ret));
 
     app_boot_progress(95,"Starting display controls...");
     /* 字体和 SD 初始挂载结束后才启动十秒计时；触摸 IRQ 包装器保留
