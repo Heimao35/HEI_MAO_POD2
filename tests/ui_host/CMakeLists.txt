@@ -46,6 +46,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME image_viewer COMMAND image_viewer_tests)
 
+# Disposable thumbnail cache: direct-mapped slot files, source size/mtime
+# binding, dimension checks and pixel CRC over a RAM SD-lock double.
+add_executable(thumb_cache_tests test_thumb_cache.c)
+target_include_directories(thumb_cache_tests PRIVATE stubs ../media_host/stubs ../animation_host/stubs "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(thumb_cache_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+  target_link_options(thumb_cache_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME thumb_cache COMMAND thumb_cache_tests)
+
 # Real 460x460 MJPEG fixture: streaming parser, seek and thumbnail window.
 add_executable(video_mjpeg_tests test_video_mjpeg.c)
 # stubs/ff.h keeps the real parser test on stdio while production uses FatFs.

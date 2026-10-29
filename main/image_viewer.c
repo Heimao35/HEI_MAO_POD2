@@ -14,6 +14,7 @@
 
 #include "jpeg_codec.h"
 #include "sd_card.h"
+#include "thumb_cache.h"
 
 #include "driver/jpeg_decode.h"
 #include "esp_heap_caps.h"
@@ -84,6 +85,17 @@ static uint8_t *s_full_pixels[2];
 static uint8_t *s_thumb_pixels[IMAGE_MAX_THUMB_SLOTS];
 static uint8_t *s_home_pixels[IMAGE_FOLDER_COUNT];
 static bool s_buffers_ok;
+
+/* 每个缩略图槽位最近一次成功解码的身份。总览关闭时 UI 会失效槽位，
+ * 但后台缓冲仍然保留；重新打开同一窗口时直接重发这张已解码的小图，
+ * 不访问 SD、不再解码。扫描/换卡才清空。 */
+typedef struct {
+    bool valid;
+    image_folder_t folder;
+    uint32_t index;
+    uint32_t generation;
+} thumb_mem_t;
+static thumb_mem_t s_thumb_mem[IMAGE_MAX_THUMB_SLOTS];
 static uint8_t s_full_next;
 /* worker-only：最近一次读/解码失败的具体原因，供全屏回调显示。 */
 static image_error_t s_last_error;
@@ -103,6 +115,9 @@ static uint32_t s_full_token;
 static uint32_t s_full_epoch;
 static thumb_request_t s_thumb_req[IMAGE_MAX_THUMB_SLOTS];
 static uint32_t s_thumb_clear_epoch;
+/* 连续处理满一屏后打印一次命中率，便于确认缓存生效；只做计数。 */
+static unsigned s_thumb_total;
+static unsigned s_thumb_hits;
 
 static void notify_worker(void)
 {
@@ -137,6 +152,7 @@ static void free_buffers(void)
     for (unsigned i = 0; i < IMAGE_MAX_THUMB_SLOTS; ++i) {
         heap_caps_free(s_thumb_pixels[i]);
         s_thumb_pixels[i] = NULL;
+        s_thumb_mem[i].valid = false;
     }
     s_buffers_ok = false;
 }
@@ -682,6 +698,9 @@ static void do_scan(void)
     atomic_store(&s_scan_requested, false);
     uint32_t gen = sd_card_get_generation();
     bool home_ok[IMAGE_FOLDER_COUNT] = {false, false};
+    /* 目录可能变化：上一轮的缩略图身份全部作废，避免重扫后误用旧小图。 */
+    for (unsigned i = 0; i < IMAGE_MAX_THUMB_SLOTS; ++i)
+        s_thumb_mem[i].valid = false;
 
     if (!ensure_buffers()) {
         for (unsigned f = 0; f < IMAGE_FOLDER_COUNT; ++f) {
@@ -709,11 +728,24 @@ static void do_scan(void)
     if (result == IMAGE_SCAN_OK) {
         for (unsigned f = 0; f < IMAGE_FOLDER_COUNT; ++f) {
             if (!s_ready[f] || !s_count[f]) continue;
+            char path[sizeof(IMAGE_DIR_PICTURES) + IMAGE_NAME_MAX + 4];
+            bool path_ok = build_path((image_folder_t)f, 0, path, sizeof(path));
+            /* 首页预览也走缩略图缓存：避免每次扫描都解码两张 460x460
+             * 原图。源文件没变时直接复用上次缩小后的 148x148 小图。 */
+            if (path_ok &&
+                thumb_cache_load(THUMB_CACHE_HOME, path, IMAGE_HOME_W,
+                                 IMAGE_HOME_H, s_home_pixels[f])) {
+                home_ok[f] = true;
+                continue;
+            }
             size_t bytes = read_jpeg((image_folder_t)f, 0);
             if (bytes && decode_to_scratch(bytes)) {
                 downscale_460(s_scratch, s_home_pixels[f],
                               IMAGE_HOME_W, IMAGE_HOME_H);
                 home_ok[f] = true;
+                if (path_ok)
+                    thumb_cache_store(THUMB_CACHE_HOME, path, IMAGE_HOME_W,
+                                      IMAGE_HOME_H, s_home_pixels[f]);
             }
         }
     }
@@ -808,22 +840,62 @@ static bool process_one_thumbnail(void)
         xSemaphoreGive(s_req_mux);
 
         bool ok = false;
+        bool from_cache = false;
+        bool path_ok = false;
+        char path[sizeof(IMAGE_DIR_PICTURES) + IMAGE_NAME_MAX + 4];
         if (ensure_buffers() && req.folder < IMAGE_FOLDER_COUNT &&
-            s_ready[req.folder] && req.index < s_count[req.folder]) {
-            size_t bytes = read_jpeg(req.folder, req.index);
-            if (bytes && decode_to_scratch(bytes)) {
-                downscale_460(s_scratch, s_thumb_pixels[slot],
-                              IMAGE_THUMB_W, IMAGE_THUMB_H);
+            s_ready[req.folder] && req.index < s_count[req.folder] &&
+            sd_card_get_generation() == s_generation[req.folder]) {
+            path_ok = build_path(req.folder, req.index, path, sizeof(path));
+            thumb_mem_t *mem = &s_thumb_mem[slot];
+            if (mem->valid && mem->folder == req.folder &&
+                mem->index == req.index &&
+                mem->generation == s_generation[req.folder]) {
+                /* 同一槽位仍是这张图：缓冲未释放，直接重发。 */
                 ok = true;
+                from_cache = true;
+            } else if (path_ok &&
+                       thumb_cache_load(THUMB_CACHE_IMG, path, IMAGE_THUMB_W,
+                                        IMAGE_THUMB_H, s_thumb_pixels[slot])) {
+                /* SD 上的小图命中：只需一次 20KB 读，不再解码原图。 */
+                ok = true;
+                from_cache = true;
+            } else {
+                size_t bytes = read_jpeg(req.folder, req.index);
+                if (bytes && decode_to_scratch(bytes)) {
+                    downscale_460(s_scratch, s_thumb_pixels[slot],
+                                  IMAGE_THUMB_W, IMAGE_THUMB_H);
+                    ok = true;
+                }
             }
         }
+
+        ++s_thumb_total;
+        if (from_cache) ++s_thumb_hits;
 
         /* 同一个槽位可能已经被 UI 换成新图片；只发布最新 token。 */
         xSemaphoreTake(s_req_mux, portMAX_DELAY);
         bool valid = epoch == s_thumb_clear_epoch &&
                      s_thumb_req[slot].token == req.token;
         xSemaphoreGive(s_req_mux);
+        /* 无论发布是否已被新请求取代，都要按本次实际写入的内容更新身份，
+         * 否则旧身份会让下一次同图请求误用别的像素。 */
+        s_thumb_mem[slot] = (thumb_mem_t){
+            .valid = ok,
+            .folder = req.folder,
+            .index = req.index,
+            .generation = ok ? s_generation[req.folder] : 0,
+        };
         if (valid) publish_thumbnail(slot, req.token, ok);
+        /* 只有真正重新解码的结果才写回缓存；命中的小图不必重复写。 */
+        if (ok && !from_cache && path_ok)
+            thumb_cache_store(THUMB_CACHE_IMG, path, IMAGE_THUMB_W,
+                              IMAGE_THUMB_H, s_thumb_pixels[slot]);
+        if (s_thumb_total >= IMAGE_MAX_THUMB_SLOTS) {
+            ESP_LOGI(TAG, "Thumb cache: %u/%u hits", s_thumb_hits, s_thumb_total);
+            s_thumb_hits = 0;
+            s_thumb_total = 0;
+        }
         return true;
     }
     return false;

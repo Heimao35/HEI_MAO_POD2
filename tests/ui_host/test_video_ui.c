@@ -183,7 +183,27 @@ int main(void)
     assert(lv_obj_has_flag(s_player_view, LV_OBJ_FLAG_HIDDEN));
     assert(statusbar_visible);
 
-    /* Lock/mode leave must clear image descriptors before backend release. */
+    /* 普通模式切换只停止播放，不释放缩略图/列表页；重新进入时如果整页
+     * 预览齐全就直接复用，不应再请求页面或重新发布缩略图。 */
+    for (unsigned i = 1; i < 4; ++i) {
+        test_ops.thumbnail(i, i, thumbs[i], VIDEO_PLAYER_THUMB_SIZE,
+                           VIDEO_PLAYER_THUMB_SIZE, 7, NULL);
+        assert(s_thumb_dsc[i].data == thumbs[i]);
+    }
+    unsigned loads_before_leave = loads;
+    ui_video_player_on_mode_leave();
+    assert(releases == 0);
+    /* 页面被隐藏，但缩略图描述符仍指向 worker 缓冲，重新进入可直接复用。 */
+    assert(s_thumb_dsc[2].data == thumbs[2]);
+    ui_video_player_on_mode_enter();
+    assert(loads == loads_before_leave);
+    assert(s_thumb_dsc[0].data == thumbs[0]);
+    assert(s_thumb_dsc[2].data == thumbs[2]);
+    assert(!lv_obj_has_flag(s_grid, LV_OBJ_FLAG_HIDDEN));
+    assert(statusbar_visible);
+    puts("PASS mode leave keeps the loaded page and reuses previews");
+
+    /* Lock must clear image descriptors before backend release. */
     ui_video_player_close_for_lock();
     assert(releases == 1);
     assert(!s_thumb_dsc[0].data);

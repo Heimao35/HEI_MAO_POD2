@@ -73,6 +73,9 @@ static lv_obj_t *s_tile_placeholders[VIDEO_PAGE_SIZE];
 static lv_obj_t *s_tile_names[VIDEO_PAGE_SIZE];
 static lv_image_dsc_t s_thumb_dsc[VIDEO_PAGE_SIZE];
 static uint32_t s_tile_index[VIDEO_PAGE_SIZE];
+/* 当前页每个槽位是否已有可显示的缩略图。离开视频模式后保留列表页，
+ * 重新进入时只有整页齐全才直接复用；缺图仍重新请求该页补全。 */
+static bool s_tile_preview_ok[VIDEO_PAGE_SIZE];
 
 static uint32_t s_page_first;
 static uint32_t s_page_count;
@@ -196,6 +199,7 @@ static void clear_tile_preview(unsigned slot)
     if (slot >= VIDEO_PAGE_SIZE) return;
     s_thumb_dsc[slot].data = NULL;
     s_thumb_dsc[slot].data_size = 0;
+    s_tile_preview_ok[slot] = false;
     /* 复用同一个描述符指针时，必须丢弃 LVGL 按 src 指针建立的图像缓存，
      * 否则换页后可能继续显示上一页的缩略图。 */
     lv_image_cache_drop(&s_thumb_dsc[slot]);
@@ -228,6 +232,7 @@ static void set_tile_preview(unsigned slot, const uint8_t *pixels,
     lv_image_set_src(s_tile_images[slot], &s_thumb_dsc[slot]);
     set_hidden(s_tile_images[slot], false);
     set_hidden(s_tile_placeholders[slot], true);
+    s_tile_preview_ok[slot] = true;
     lv_obj_invalidate(s_tile_images[slot]);
 }
 
@@ -1394,11 +1399,20 @@ void ui_video_player_on_mode_enter(void)
         return;
     }
     if (s_page_loaded) {
-        set_hidden(s_grid, false);
-        set_list_status(NULL, false);
-    } else {
-        request_list_page(s_page_first);
+        /* 离开视频模式时保留了列表页和缩略图；只有当前页所有槽位都已有
+         * 预览才直接复用，避免上次被停止打断时留下永久占位图。 */
+        bool previews_ready = s_page_count > 0;
+        for (uint32_t i = 0; i < s_page_count && previews_ready; ++i)
+            previews_ready = s_tile_preview_ok[i];
+        if (previews_ready) {
+            set_hidden(s_grid, false);
+            set_list_status(NULL, false);
+            return;
+        }
+        /* 缺图时重新请求本页：命中缓存的小图会快速补全。 */
+        s_page_loaded = false;
     }
+    request_list_page(s_page_first);
 }
 
 void ui_video_player_on_mode_leave(void)
@@ -1429,12 +1443,10 @@ void ui_video_player_on_mode_leave(void)
     lv_anim_delete(s_grid, grid_anim_x_cb);
     lv_obj_set_x(s_grid, 0);
 
-    /* 先让 UI 不再引用缩略图，再让 worker 释放 PSRAM/JPEG 引擎。 */
-    clear_all_previews();
-    s_page_loaded = false;
-    s_page_count = 0;
+    /* 只停止播放并关闭视频/音轨文件；保留已加载的列表页和缩略图缓冲，
+     * 再次进入视频模式时直接显示原页，不重新读索引/缩略图。锁屏和关机
+     * 路径仍调用 video_player_release() 完整释放 PSRAM。 */
     video_player_stop();
-    video_player_release();
     ui_statusbar_set_visible(true);
 }
 

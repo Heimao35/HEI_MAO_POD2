@@ -20,6 +20,7 @@
 #include "video_wav.h"
 #include "jpeg_codec.h"
 #include "sd_card.h"
+#include "thumb_cache.h"
 #include "music_player_adapter.h"
 #include "audio_output.h"
 #include "system_power.h"
@@ -39,6 +40,10 @@ static const char *TAG = "video_player";
 
 #define VIDEO_FRAME_BYTES (VIDEO_PLAYER_PAD_WIDTH * VIDEO_PLAYER_PAD_HEIGHT * 2U)
 #define VIDEO_THUMB_BYTES (VIDEO_PLAYER_THUMB_SIZE * VIDEO_PLAYER_THUMB_SIZE * 2U)
+/* 列表每页 4 张，但 RAM 中保留最近 32 张（8 页）缩略图。翻页时命中内存
+ * 就不再访问 SD；页面显示的 4 块缓冲与这 32 块缓存分开，缓存淘汰永远
+ * 不会覆盖 UI 正在引用的像素。 */
+#define VIDEO_THUMB_MEM_SLOTS 32U
 /* 460x460 baseline JPEG 通常远小于 512 KiB；缩小取帧窗口可减少缩略图
  * 持 SD 锁的时间。超过窗口的异常帧只会没有预览图，不影响播放。 */
 #define VIDEO_THUMB_JPEG_MAX (512U * 1024U)
@@ -116,7 +121,25 @@ static uint32_t s_library_generation;
 static bool s_library_valid;
 static uint8_t *s_thumb_jpeg;
 static uint8_t *s_thumb_decode;
+/* UI 当前页 4 个槽位实际引用的像素；翻页缓存只复制到这里。 */
 static uint8_t *s_thumb_pixels[VIDEO_PAGE_SIZE];
+/* 最近看过视频的缩略图 RAM 缓存（worker-only）。 */
+typedef struct {
+    bool valid;
+    uint32_t generation;
+    uint32_t index;
+    uint32_t stamp;      /* LRU 计数 */
+    uint8_t *pixels;
+} video_thumb_mem_t;
+static video_thumb_mem_t s_thumb_mem[VIDEO_THUMB_MEM_SLOTS];
+static uint32_t s_thumb_stamp;
+/* 当前列表页的索引范围，用于避免淘汰仍在本页显示的缩略图（命中率
+ * 优化；页面缓冲区与缓存分离，正确性不依赖这个范围）。 */
+static uint32_t s_visible_first;
+static uint32_t s_visible_count;
+/* 最近一次 make_thumbnail 的命中来源；load_page 用它打印每页命中数。 */
+static bool s_thumb_cache_hit;
+static bool s_thumb_ram_hit;
 
 /* 同名 WAV 音轨。s_audio_active 表示 WAV 已打开且 audio_output 已切到
  * 视频 PCM 模式；此后视频帧节拍改由音频 DMA 时间驱动。 */
@@ -269,6 +292,8 @@ static esp_err_t ensure_thumb_buffers(void)
     bool complete = s_thumb_jpeg && s_thumb_decode;
     for (unsigned i = 0; complete && i < VIDEO_PAGE_SIZE; ++i)
         complete = s_thumb_pixels[i] != NULL;
+    for (unsigned i = 0; complete && i < VIDEO_THUMB_MEM_SLOTS; ++i)
+        complete = s_thumb_mem[i].pixels != NULL;
     if (complete) return ESP_OK;
 
     /* 如果上一次只分配了一部分，先统一释放，避免重复分配泄漏。 */
@@ -288,28 +313,31 @@ static esp_err_t ensure_thumb_buffers(void)
         s_thumb_pixels[i] = heap_caps_malloc(VIDEO_THUMB_BYTES,
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
+    for (unsigned i = 0; i < VIDEO_THUMB_MEM_SLOTS; ++i) {
+        s_thumb_mem[i].pixels = heap_caps_malloc(VIDEO_THUMB_BYTES,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_thumb_mem[i].valid = false;
+    }
     if (!s_thumb_jpeg || !s_thumb_decode || actual < VIDEO_FRAME_BYTES) {
         goto fail;
     }
     for (unsigned i = 0; i < VIDEO_PAGE_SIZE; ++i) {
         if (!s_thumb_pixels[i]) goto fail;
     }
+    for (unsigned i = 0; i < VIDEO_THUMB_MEM_SLOTS; ++i) {
+        if (!s_thumb_mem[i].pixels) goto fail;
+    }
+    ESP_LOGI(TAG, "Video thumbnails: %u display + %u RAM cache slots",
+             (unsigned)VIDEO_PAGE_SIZE, (unsigned)VIDEO_THUMB_MEM_SLOTS);
     return ESP_OK;
 fail:
-    heap_caps_free(s_thumb_jpeg);
-    heap_caps_free(s_thumb_decode);
-    for (unsigned i = 0; i < VIDEO_PAGE_SIZE; ++i) {
-        heap_caps_free(s_thumb_pixels[i]);
-        s_thumb_pixels[i] = NULL;
-    }
-    s_thumb_jpeg = NULL;
-    s_thumb_decode = NULL;
+    free_thumb_buffers();
     return ESP_ERR_NO_MEM;
 }
 
 static void free_thumb_buffers(void)
 {
-    /* 先让 UI 解除对四个缩略图缓冲的引用，再释放 PSRAM。 */
+    /* 先让 UI 解除对四个显示缓冲的引用，再释放 PSRAM。 */
     for (unsigned i = 0; i < VIDEO_PAGE_SIZE; ++i)
         publish_thumbnail(i, UINT32_MAX, NULL, 0, 0, 0);
     heap_caps_free(s_thumb_jpeg);
@@ -320,6 +348,16 @@ static void free_thumb_buffers(void)
         heap_caps_free(s_thumb_pixels[i]);
         s_thumb_pixels[i] = NULL;
     }
+    for (unsigned i = 0; i < VIDEO_THUMB_MEM_SLOTS; ++i) {
+        heap_caps_free(s_thumb_mem[i].pixels);
+        s_thumb_mem[i].pixels = NULL;
+        s_thumb_mem[i].valid = false;
+    }
+    s_visible_first = 0;
+    s_visible_count = 0;
+    s_thumb_stamp = 0;
+    s_thumb_cache_hit = false;
+    s_thumb_ram_hit = false;
 }
 
 static bool decode_frame(const uint8_t *jpeg, size_t bytes, uint8_t *out)
@@ -666,36 +704,140 @@ static void downscale_thumbnail(const uint8_t *src, uint8_t *dst)
     }
 }
 
+static uint32_t thumb_stamp_next(void)
+{
+    /* LRU 计数只需区分先后；回绕时统一清零，不做 64 位扩展。 */
+    if (++s_thumb_stamp == 0) {
+        for (unsigned i = 0; i < VIDEO_THUMB_MEM_SLOTS; ++i)
+            s_thumb_mem[i].stamp = 0;
+        s_thumb_stamp = 1;
+    }
+    return s_thumb_stamp;
+}
+
+static int thumb_mem_find(uint32_t generation, uint32_t index)
+{
+    for (unsigned i = 0; i < VIDEO_THUMB_MEM_SLOTS; ++i) {
+        const video_thumb_mem_t *m = &s_thumb_mem[i];
+        if (m->valid && m->generation == generation && m->index == index)
+            return (int)i;
+    }
+    return -1;
+}
+
+static int thumb_mem_victim(uint32_t generation)
+{
+    int victim = -1;
+    for (unsigned i = 0; i < VIDEO_THUMB_MEM_SLOTS; ++i) {
+        video_thumb_mem_t *m = &s_thumb_mem[i];
+        if (!m->pixels) continue;
+        /* 当前页的缩略图不淘汰：翻回本页时还能命中内存。 */
+        if (m->valid && m->generation == generation &&
+            m->index >= s_visible_first &&
+            m->index - s_visible_first < s_visible_count)
+            continue;
+        if (!m->valid) return (int)i;
+        if (victim < 0 || m->stamp < s_thumb_mem[victim].stamp)
+            victim = (int)i;
+    }
+    return victim;
+}
+
 static bool make_thumbnail(uint32_t slot, uint32_t index, const video_item_t *item,
                            uint32_t file_size, uint32_t generation, uint32_t token)
 {
-    if (slot >= VIDEO_PAGE_SIZE || !s_thumb_jpeg || !s_thumb_decode ||
-        !s_thumb_pixels[slot] || !item) return false;
+    s_thumb_cache_hit = false;
+    s_thumb_ram_hit = false;
+    if (slot >= VIDEO_PAGE_SIZE || !s_thumb_pixels[slot] || !item) return false;
     char path[VIDEO_NAME_MAX + 80];
     if (video_library_make_video_path(item, path, sizeof(path)) != ESP_OK) return false;
 
-    size_t jpeg_bytes = 0;
-    uint64_t jpeg_offset = 0;
-    /* 索引不保存文件大小；UINT64_MAX 让取帧函数先 stat，再选中间位置。 */
-    uint64_t target = file_size ? (uint64_t)file_size / 2 : UINT64_MAX;
-    if (!sd_card_io_lock(VIDEO_SD_LOCK_MS)) return false;
-    esp_err_t ret = video_mjpeg_read_frame_near(path, target, s_thumb_jpeg,
-                                                 VIDEO_THUMB_JPEG_MAX,
-                                                 &jpeg_bytes, &jpeg_offset);
-    sd_card_io_unlock();
-    if (ret != ESP_OK || atomic_load(&s_cancel) ||
-        atomic_load(&s_page_token) != token) return false;
+    /* RAM 命中：把缓存像素复制到本页显示缓冲再交给 UI。缓存块与 UI
+     * 引用完全分离，后续翻页淘汰不会覆盖正在显示的图像。 */
+    int mem = thumb_mem_find(generation, index);
+    if (mem >= 0) {
+        memcpy(s_thumb_pixels[slot], s_thumb_mem[mem].pixels, VIDEO_THUMB_BYTES);
+        s_thumb_mem[mem].stamp = thumb_stamp_next();
+        s_thumb_cache_hit = true;
+        s_thumb_ram_hit = true;
+        if (atomic_load(&s_cancel) || atomic_load(&s_page_token) != token)
+            return false;
+        publish_thumbnail(slot, index, s_thumb_pixels[slot],
+                          VIDEO_PLAYER_THUMB_SIZE, VIDEO_PLAYER_THUMB_SIZE,
+                          generation);
+        return true;
+    }
 
-    jpeg_decode_picture_info_t info;
-    if (jpeg_decoder_get_info(s_thumb_jpeg, (uint32_t)jpeg_bytes, &info) != ESP_OK ||
-        info.width != VIDEO_PLAYER_WIDTH || info.height != VIDEO_PLAYER_HEIGHT)
+    /* 选一个缓存槽作为本次加载目标；没有可淘汰槽时退回本页显示缓冲，
+     * 只让这张图不进 RAM 缓存。 */
+    int victim = thumb_mem_victim(generation);
+    uint8_t *dst = victim >= 0 ? s_thumb_mem[victim].pixels : s_thumb_pixels[slot];
+    if (victim >= 0) s_thumb_mem[victim].valid = false;
+
+    /* 缓存键 = 源文件路径 + 大小 + 修改时间；当前索引不保存文件大小，
+     * 缩略图固定取文件中间附近的帧，选择方式确定，所以同一个文件可以
+     * 直接复用上次的小图。命中时不读 MJPEG、不占解码器。 */
+    bool decoded = false;
+    if (thumb_cache_load(THUMB_CACHE_VIDEO, path, VIDEO_PLAYER_THUMB_SIZE,
+                         VIDEO_PLAYER_THUMB_SIZE, dst)) {
+        s_thumb_cache_hit = true;
+    } else {
+        if (!s_thumb_jpeg || !s_thumb_decode) {
+            if (victim >= 0) s_thumb_mem[victim].valid = false;
+            return false;
+        }
+        size_t jpeg_bytes = 0;
+        uint64_t jpeg_offset = 0;
+        /* 索引不保存文件大小；UINT64_MAX 让取帧函数先 stat，再选中间位置。 */
+        uint64_t target = file_size ? (uint64_t)file_size / 2 : UINT64_MAX;
+        if (!sd_card_io_lock(VIDEO_SD_LOCK_MS)) {
+            if (victim >= 0) s_thumb_mem[victim].valid = false;
+            return false;
+        }
+        esp_err_t ret = video_mjpeg_read_frame_near(path, target, s_thumb_jpeg,
+                                                     VIDEO_THUMB_JPEG_MAX,
+                                                     &jpeg_bytes, &jpeg_offset);
+        sd_card_io_unlock();
+        if (ret != ESP_OK || atomic_load(&s_cancel) ||
+            atomic_load(&s_page_token) != token) {
+            if (victim >= 0) s_thumb_mem[victim].valid = false;
+            return false;
+        }
+
+        jpeg_decode_picture_info_t info;
+        if (jpeg_decoder_get_info(s_thumb_jpeg, (uint32_t)jpeg_bytes, &info) != ESP_OK ||
+            info.width != VIDEO_PLAYER_WIDTH || info.height != VIDEO_PLAYER_HEIGHT) {
+            if (victim >= 0) s_thumb_mem[victim].valid = false;
+            return false;
+        }
+        if (!decode_frame(s_thumb_jpeg, jpeg_bytes, s_thumb_decode) ||
+            atomic_load(&s_cancel) || atomic_load(&s_page_token) != token) {
+            if (victim >= 0) s_thumb_mem[victim].valid = false;
+            return false;
+        }
+        downscale_thumbnail(s_thumb_decode, dst);
+        decoded = true;
+    }
+
+    if (atomic_load(&s_cancel) || atomic_load(&s_page_token) != token) {
+        if (victim >= 0) s_thumb_mem[victim].valid = false;
         return false;
-    if (!decode_frame(s_thumb_jpeg, jpeg_bytes, s_thumb_decode)) return false;
-    if (atomic_load(&s_cancel) || atomic_load(&s_page_token) != token) return false;
-
-    downscale_thumbnail(s_thumb_decode, s_thumb_pixels[slot]);
+    }
+    if (victim >= 0) {
+        memcpy(s_thumb_pixels[slot], dst, VIDEO_THUMB_BYTES);
+        s_thumb_mem[victim].valid = true;
+        s_thumb_mem[victim].generation = generation;
+        s_thumb_mem[victim].index = index;
+        s_thumb_mem[victim].stamp = thumb_stamp_next();
+    }
     publish_thumbnail(slot, index, s_thumb_pixels[slot],
                       VIDEO_PLAYER_THUMB_SIZE, VIDEO_PLAYER_THUMB_SIZE, generation);
+    /* 写入磁盘缓存是尽力而为；停止/释放请求已经排队时跳过，避免锁屏/
+     * 关机等待这次可选的 SD 写。命中缓存的不必重写。 */
+    if (decoded && !atomic_load(&s_cancel) &&
+        !atomic_load(&s_stop_request) && !atomic_load(&s_release_request))
+        thumb_cache_store(THUMB_CACHE_VIDEO, path, VIDEO_PLAYER_THUMB_SIZE,
+                          VIDEO_PLAYER_THUMB_SIZE, dst);
     return true;
 }
 
@@ -756,14 +898,24 @@ static void load_page(uint32_t first)
 
     uint32_t token = atomic_load(&s_page_token);
     publish_page(&page, generation);
+    s_visible_first = page.first;
+    s_visible_count = page.count;
     if (!s_thumb_jpeg || !s_thumb_decode) return;
 
+    unsigned attempted = 0, cache_hits = 0, ram_hits = 0;
     for (uint32_t slot = 0; slot < page.count; ++slot) {
         if (atomic_load(&s_cancel) || atomic_load(&s_page_token) != token ||
             priority_command_pending()) break;
-        make_thumbnail(slot, first + slot, &page.items[slot], page.sizes[slot],
-                       generation, token);
+        ++attempted;
+        if (make_thumbnail(slot, first + slot, &page.items[slot], page.sizes[slot],
+                           generation, token)) {
+            if (s_thumb_cache_hit) ++cache_hits;
+            if (s_thumb_ram_hit) ++ram_hits;
+        }
     }
+    if (attempted)
+        ESP_LOGI(TAG, "Page %lu thumbnails: %u/%u cached (%u RAM)",
+                 (unsigned long)first, cache_hits, attempted, ram_hits);
 }
 
 static void scan_library(void)
@@ -796,6 +948,10 @@ static void scan_library(void)
     }
     s_library_generation = generation;
     s_library_valid = true;
+    /* 重新扫描后同一个索引可能对应另一个视频（目录顺序变化），RAM
+     * 缓存按索引保存，必须整体作废；磁盘缓存仍按源文件键校验。 */
+    for (unsigned i = 0; i < VIDEO_THUMB_MEM_SLOTS; ++i)
+        s_thumb_mem[i].valid = false;
     publish_library(video_library_get_count(), video_library_is_truncated(), generation);
 }
 
