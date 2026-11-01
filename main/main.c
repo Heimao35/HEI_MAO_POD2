@@ -36,6 +36,7 @@
 #include "music_player_adapter.h"
 #include "video_player.h"
 #include "image_viewer.h"
+#include "ebook.h"
 #include "jpeg_codec.h"
 #include "audio_output.h"
 #include "ui_fonts.h"
@@ -442,6 +443,12 @@ void app_main(void)
     esp_err_t image_ret = image_viewer_init();
     if (image_ret != ESP_OK)
         ESP_LOGE(TAG, "Image viewer init failed: %s", esp_err_to_name(image_ret));
+
+    /* 电子书 worker 只创建请求锁/任务；书本表、封面和正文缓冲在进入
+     * 电子书模式后才分配，未使用电子书时不占用额外 PSRAM。 */
+    esp_err_t ebook_ret = ebook_init();
+    if (ebook_ret != ESP_OK)
+        ESP_LOGE(TAG, "Ebook init failed: %s", esp_err_to_name(ebook_ret));
 
     app_boot_progress(95,"Starting display controls...");
     /* 字体和 SD 初始挂载结束后才启动十秒计时；触摸 IRQ 包装器保留

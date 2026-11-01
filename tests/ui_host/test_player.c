@@ -55,6 +55,10 @@ void ui_image_viewer_on_mode_leave(void) {}
 void ui_image_viewer_close_for_lock(void) {}
 bool ui_image_viewer_is_fullscreen_active(void) { return false; }
 void ui_ebook_create(lv_obj_t *p) { (void)p; }
+void ui_ebook_on_mode_enter(void) {}
+void ui_ebook_on_mode_leave(void) {}
+void ui_ebook_close_for_lock(void) {}
+bool ui_ebook_is_reader_active(void) { return false; }
 lv_obj_t *ui_video_player_get_page(void) { return NULL; }
 lv_obj_t *ui_image_viewer_get_page(void) { return NULL; }
 lv_obj_t *ui_ebook_get_page(void) { return NULL; }

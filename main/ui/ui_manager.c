@@ -202,6 +202,7 @@ static void gesture_released_cb(lv_event_t *e)
      * 内容上；左右边缘的模式栏/声光栏不受影响，仍是全屏时可用的浮层。 */
     if (!(s_current_mode == UI_MODE_VIDEO && ui_video_player_is_player_active()) &&
         !(s_current_mode == UI_MODE_IMAGE && ui_image_viewer_is_fullscreen_active()) &&
+        !(s_current_mode == UI_MODE_EBOOK && ui_ebook_is_reader_active()) &&
         !is_horizontal && dy > GESTURE_MIN_DIST &&
         s_press_point.y < (int32_t)UI_STATUSBAR_HEIGHT) {
         ui_settings_show();
@@ -387,6 +388,7 @@ void ui_manager_switch_mode(ui_mode_t mode)
      * 同样先收起全屏/总览，避免它的 JPEG worker 与新页面同时解码。 */
     if (s_current_mode == UI_MODE_VIDEO) ui_video_player_on_mode_leave();
     if (s_current_mode == UI_MODE_IMAGE) ui_image_viewer_on_mode_leave();
+    if (s_current_mode == UI_MODE_EBOOK) ui_ebook_on_mode_leave();
 
     lv_obj_t *old_page = s_mode_pages[s_current_mode];
     lv_obj_t *new_page = s_mode_pages[mode];
@@ -426,6 +428,8 @@ void ui_manager_switch_mode(ui_mode_t mode)
     if (mode == UI_MODE_VIDEO) ui_video_player_on_mode_enter();
     /* 图片模式回到两个文件夹入口；未扫描或卡代次变化时投递一次后台扫描。 */
     if (mode == UI_MODE_IMAGE) ui_image_viewer_on_mode_enter();
+    /* 电子书模式回到书库入口；阅读页在离开时已关闭并释放正文。 */
+    if (mode == UI_MODE_EBOOK) ui_ebook_on_mode_enter();
     ESP_LOGI(TAG, "Switched to mode %d", (int)mode);
 }
 
@@ -454,6 +458,8 @@ void ui_manager_lock(void)
      * worker 空闲后再解码。图片查看器同样收起全屏并取消在途请求。 */
     ui_video_player_close_for_lock();
     ui_image_viewer_close_for_lock();
+    /* 阅读页会占用较大正文缓冲，锁屏时关闭并释放；书库/首页状态保留。 */
+    ui_ebook_close_for_lock();
     ui_settings_hide();
     ui_mode_panel_hide();
     ui_adj_panel_hide();

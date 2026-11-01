@@ -56,6 +56,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME thumb_cache COMMAND thumb_cache_tests)
 
+# Ebook home card, horizontal library, reader controls and page-turn
+# animation with a RAM backend double; no SD/JPEG/TXT.
+add_executable(ebook_tests test_ebook.c)
+target_include_directories(ebook_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(ebook_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(ebook_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable)
+  target_link_options(ebook_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+endif()
+add_test(NAME ebook COMMAND ebook_tests)
+
 # Real 460x460 MJPEG fixture: streaming parser, seek and thumbnail window.
 add_executable(video_mjpeg_tests test_video_mjpeg.c)
 # stubs/ff.h keeps the real parser test on stdio while production uses FatFs.

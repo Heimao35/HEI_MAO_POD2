@@ -165,5 +165,34 @@ int main(void)
     player_settings_get_bluetooth(&pair_valid,pair_read,pair_name,sizeof(pair_name));
     assert(pair_valid && !memcmp(pair_read,pair_bda,6) && !strcmp(pair_name,"客厅音箱"));
     puts("PASS Bluetooth pairing record round-trips through the settings TLV/NVS snapshot");
+
+    /* 阅读进度：key+页码+总页数写入同一快照，重启后按 key 读回；
+     * 超出 16 本按 LRU 淘汰，损坏的页码/重复 key 必须拒绝。 */
+    player_settings_t progress;
+    player_settings_set_ebook_progress(0x1111222233334444ULL, 3, 10);
+    player_settings_set_ebook_progress(0x5555666677778888ULL, 1, 5);
+    player_settings_capture(&progress);
+    assert(player_settings_save(&progress)==ESP_OK);
+    reboot_ram(); assert(player_settings_init()==ESP_OK);
+    uint32_t page=0,pages=0;
+    assert(player_settings_get_ebook_progress(0x1111222233334444ULL,&page,&pages) &&
+           page==3 && pages==10);
+    assert(player_settings_get_ebook_progress(0x5555666677778888ULL,&page,&pages) &&
+           page==1 && pages==5);
+    assert(!player_settings_get_ebook_progress(0x9999ULL,&page,&pages));
+    for (unsigned i=0;i<20;++i)
+        player_settings_set_ebook_progress(0x1000ULL+i, i, 30);
+    assert(s_ram.ebook_count==PLAYER_SETTINGS_EBOOK_MAX);
+    assert(player_settings_get_ebook_progress(0x1000ULL+19,&page,&pages));
+    puts("PASS ebook progress round-trips and uses a bounded 16-entry LRU table");
+    len=encode(&s_ram,encoded);
+    size_t f10=SETTINGS_HEADER;
+    while (f10+3<=len && encoded[f10]!=10) f10+=3U+get16(encoded+f10+1);
+    assert(f10+3<len && encoded[f10]==10);
+    size_t e10=f10+3;
+    put32(encoded+e10+1+8+4,0); /* pages=0 -> invalid */
+    put32(encoded+8,crc32(encoded+12,len-12));
+    assert(decode(encoded,len,&after)==ESP_ERR_INVALID_ARG);
+    puts("PASS invalid/zero-page ebook progress is rejected by the codec");
     return 0;
 }

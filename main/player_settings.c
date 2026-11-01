@@ -32,6 +32,14 @@ static void put32(uint8_t *p, uint32_t v)
 { for (unsigned i=0; i<4; ++i) p[i] = v >> (i*8); }
 static uint32_t get32(const uint8_t *p)
 { return p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24; }
+static void put64(uint8_t *p, uint64_t v)
+{ for (unsigned i=0; i<8; ++i) p[i] = (uint8_t)(v >> (i*8)); }
+static uint64_t get64(const uint8_t *p)
+{
+    uint64_t v=0;
+    for (unsigned i=0; i<8; ++i) v |= (uint64_t)p[i] << (i*8);
+    return v;
+}
 static size_t add_field(uint8_t *b, size_t n, uint8_t id, const void *v, uint16_t len)
 {
     b[n++] = id; put16(b+n, len); n += 2; memcpy(b+n, v, len); return n+len;
@@ -60,6 +68,22 @@ static size_t encode(const player_settings_t *v, uint8_t *b)
         memcpy(pair+pair_len,v->bt_paired_name,name_len); pair_len+=name_len;
         n=add_field(b,n,9,pair,(uint16_t)pair_len);
     }
+    /* 10 为可选阅读进度表：[count 1][key 8][page 4][pages 4][stamp 4]...。
+     * 只保存最近 16 本；旧固件按未知 ID 跳过，版本号不变。 */
+    uint8_t ebook_count = v->ebook_count > PLAYER_SETTINGS_EBOOK_MAX
+                              ? PLAYER_SETTINGS_EBOOK_MAX : v->ebook_count;
+    if (ebook_count) {
+        uint8_t table[1 + PLAYER_SETTINGS_EBOOK_MAX * 20];
+        size_t tn = 0;
+        table[tn++] = ebook_count;
+        for (unsigned i = 0; i < ebook_count; ++i) {
+            put64(table+tn, v->ebook[i].key); tn += 8;
+            put32(table+tn, v->ebook[i].page); tn += 4;
+            put32(table+tn, v->ebook[i].pages); tn += 4;
+            put32(table+tn, v->ebook[i].stamp); tn += 4;
+        }
+        n=add_field(b,n,10,table,(uint16_t)tn);
+    }
     put16(b+6,n); put32(b+8,crc32(b+SETTINGS_HEADER,n-SETTINGS_HEADER));
     return n;
 }
@@ -75,7 +99,7 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
         if (n-off<3) return ESP_ERR_INVALID_SIZE;
         uint8_t id=b[off++]; uint16_t len=get16(b+off); off+=2;
         if (len>n-off) return ESP_ERR_INVALID_SIZE;
-        if (id>=1 && id<=9) {
+        if (id>=1 && id<=10) {
             if (seen & (1U<<id)) return ESP_ERR_INVALID_RESPONSE;
             seen |= 1U<<id;
         }
@@ -115,6 +139,28 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
                 memcpy(tmp.bt_paired_bda,b+off+1,6);
                 memcpy(tmp.bt_paired_name,b+off+7,name_len);
                 tmp.bt_paired_name[name_len]=0;
+            }
+        } else if (id==10) {
+            /* 阅读进度：count + count×20B。拒绝越界页码、零 key、重复 key
+             * 和超过上限的总页数，损坏数据不能让 UI 跳到错误页面。 */
+            if (len < 1) return ESP_ERR_INVALID_SIZE;
+            uint8_t count=b[off];
+            if (count > PLAYER_SETTINGS_EBOOK_MAX ||
+                len != 1U + (size_t)count * 20U)
+                return ESP_ERR_INVALID_SIZE;
+            tmp.ebook_count=count;
+            for (unsigned i=0;i<count;++i) {
+                const uint8_t *p=b+off+1+i*20U;
+                player_settings_ebook_t e;
+                e.key=get64(p); e.page=get32(p+8);
+                e.pages=get32(p+12); e.stamp=get32(p+16);
+                if (!e.key || !e.pages ||
+                    e.pages>PLAYER_SETTINGS_EBOOK_MAX_PAGES ||
+                    e.page>=e.pages)
+                    return ESP_ERR_INVALID_ARG;
+                for (unsigned j=0;j<i;++j)
+                    if (tmp.ebook[j].key==e.key) return ESP_ERR_INVALID_ARG;
+                tmp.ebook[i]=e;
             }
         }
         off+=len;
@@ -196,23 +242,93 @@ void player_settings_set_song(const music_item_t *item)
     memcpy(s_ram.song_folder,item->name,MUSIC_NAME_MAX);
     memcpy(s_ram.song_audio,item->audio,MUSIC_NAME_MAX);
 }
+bool player_settings_get_ebook_progress(uint64_t key, uint32_t *page,
+                                        uint32_t *pages)
+{
+    if (!key || !page || !pages) return false;
+    unsigned count = s_ram.ebook_count;
+    if (count > PLAYER_SETTINGS_EBOOK_MAX) count = PLAYER_SETTINGS_EBOOK_MAX;
+    for (unsigned i=0;i<count;++i) {
+        const player_settings_ebook_t *e=&s_ram.ebook[i];
+        if (e->key==key && e->pages && e->page<e->pages) {
+            *page=e->page; *pages=e->pages;
+            return true;
+        }
+    }
+    return false;
+}
+void player_settings_set_ebook_progress(uint64_t key, uint32_t page,
+                                        uint32_t pages)
+{
+    if (!key || !pages || pages>PLAYER_SETTINGS_EBOOK_MAX_PAGES ||
+        page>=pages)
+        return;
+    unsigned count = s_ram.ebook_count;
+    if (count > PLAYER_SETTINGS_EBOOK_MAX) count = PLAYER_SETTINGS_EBOOK_MAX;
+    uint32_t max_stamp=0;
+    int found=-1;
+    for (unsigned i=0;i<count;++i) {
+        if (s_ram.ebook[i].stamp > max_stamp) max_stamp=s_ram.ebook[i].stamp;
+        if (s_ram.ebook[i].key==key) found=(int)i;
+    }
+    /* 计数回绕时清零后重来；LRU 只用于淘汰，不影响正确性。 */
+    if (max_stamp==UINT32_MAX) {
+        for (unsigned i=0;i<count;++i) s_ram.ebook[i].stamp=0;
+        max_stamp=0;
+    }
+    if (found<0) {
+        if (count < PLAYER_SETTINGS_EBOOK_MAX) {
+            found=(int)count;
+            s_ram.ebook_count=(uint8_t)(count+1);
+        } else {
+            found=0;
+            for (unsigned i=1;i<count;++i)
+                if (s_ram.ebook[i].stamp < s_ram.ebook[found].stamp)
+                    found=(int)i;
+        }
+    }
+    s_ram.ebook[found].key=key;
+    s_ram.ebook[found].page=page;
+    s_ram.ebook[found].pages=pages;
+    s_ram.ebook[found].stamp=max_stamp+1;
+}
 bool player_settings_equal(const player_settings_t *a, const player_settings_t *b)
 {
-    return a->brightness==b->brightness && a->volume==b->volume &&
-        a->muted==b->muted && a->auto_brightness==b->auto_brightness &&
-        a->motion_steps==b->motion_steps && a->motion_wake==b->motion_wake &&
-        a->bt_paired==b->bt_paired &&
-        !memcmp(a->bt_paired_bda,b->bt_paired_bda,6) &&
-        !strcmp(a->bt_paired_name,b->bt_paired_name) &&
-        !strcmp(a->song_folder,b->song_folder) && !strcmp(a->song_audio,b->song_audio);
+    if (!(a->brightness==b->brightness && a->volume==b->volume &&
+          a->muted==b->muted && a->auto_brightness==b->auto_brightness &&
+          a->motion_steps==b->motion_steps && a->motion_wake==b->motion_wake &&
+          a->bt_paired==b->bt_paired &&
+          !memcmp(a->bt_paired_bda,b->bt_paired_bda,6) &&
+          !strcmp(a->bt_paired_name,b->bt_paired_name) &&
+          !strcmp(a->song_folder,b->song_folder) &&
+          !strcmp(a->song_audio,b->song_audio) &&
+          a->ebook_count==b->ebook_count))
+        return false;
+    unsigned count=a->ebook_count;
+    if (count > PLAYER_SETTINGS_EBOOK_MAX) count=PLAYER_SETTINGS_EBOOK_MAX;
+    for (unsigned i=0;i<count;++i) {
+        if (a->ebook[i].key!=b->ebook[i].key ||
+            a->ebook[i].page!=b->ebook[i].page ||
+            a->ebook[i].pages!=b->ebook[i].pages ||
+            a->ebook[i].stamp!=b->ebook[i].stamp)
+            return false;
+    }
+    return true;
 }
 esp_err_t player_settings_save(const player_settings_t *v)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (v->brightness<5 || v->brightness>100 || v->volume>100 ||
         !memchr(v->song_folder,0,MUSIC_NAME_MAX) || !memchr(v->song_audio,0,MUSIC_NAME_MAX) ||
-        !memchr(v->bt_paired_name,0,sizeof(v->bt_paired_name)))
+        !memchr(v->bt_paired_name,0,sizeof(v->bt_paired_name)) ||
+        v->ebook_count > PLAYER_SETTINGS_EBOOK_MAX)
         return ESP_ERR_INVALID_ARG;
+    for (unsigned i=0;i<v->ebook_count;++i) {
+        const player_settings_ebook_t *e=&v->ebook[i];
+        if (!e->key || !e->pages ||
+            e->pages>PLAYER_SETTINGS_EBOOK_MAX_PAGES || e->page>=e->pages)
+            return ESP_ERR_INVALID_ARG;
+    }
     if (s_have_saved && player_settings_equal(v,&s_saved))
         return ESP_OK;
     nvs_handle_t handle;
