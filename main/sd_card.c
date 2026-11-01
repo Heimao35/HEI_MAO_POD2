@@ -27,6 +27,7 @@ static SemaphoreHandle_t s_io_mutex;
 static SemaphoreHandle_t s_evt_sem = NULL;
 static void (*s_audio_detach)(void);
 static void (*s_video_detach)(void);
+static void (*s_bulk_detach)(void);
 static atomic_bool s_safe_remount_requested;
 
 esp_err_t sd_card_set_audio_detach_callback(void (*callback)(void))
@@ -41,6 +42,14 @@ esp_err_t sd_card_set_video_detach_callback(void (*callback)(void))
 {
     if (!sd_card_io_lock(pdMS_TO_TICKS(1000))) return ESP_ERR_TIMEOUT;
     s_video_detach=callback;
+    sd_card_io_unlock();
+    return ESP_OK;
+}
+
+esp_err_t sd_card_set_bulk_detach_callback(void (*callback)(void))
+{
+    if (!sd_card_io_lock(pdMS_TO_TICKS(1000))) return ESP_ERR_TIMEOUT;
+    s_bulk_detach=callback;
     sd_card_io_unlock();
     return ESP_OK;
 }
@@ -176,6 +185,7 @@ static void do_unmount(void)
      * 失效FILE指针。回调只能关闭文件/发布原子标志，不等待UI或DAC。 */
     if (s_audio_detach) s_audio_detach();
     if (s_video_detach) s_video_detach();
+    if (s_bulk_detach) s_bulk_detach();
     esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
     s_card = NULL;
     s_mounted = false;

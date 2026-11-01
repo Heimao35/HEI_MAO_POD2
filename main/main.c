@@ -30,6 +30,7 @@
 #include "ui_adj_panel.h"
 #include "ui_lockscreen.h"
 #include "ui_motion_settings.h"
+#include "sd_bulk_read.h"
 #include "sd_card.h"
 #include "lock_animation.h"
 #include "pmic_axp2101.h"
@@ -411,6 +412,12 @@ void app_main(void)
     /* 放在 UI 初始化之后，确保 lockscreen 等 UI 对象已创建 */
     esp_err_t sd_ret = sd_card_init();
     if (sd_ret != ESP_OK) ESP_LOGE(TAG, "SD init failed: %s", esp_err_to_name(sd_ret));
+
+    /* 大文件分块读取：注册 SD 卸载回调，并创建串行化互斥量。必须在
+     * image_viewer/ebook 之前完成；未初始化时它们的读取会明确失败。 */
+    esp_err_t bulk_ret = sd_bulk_read_init();
+    if (bulk_ret != ESP_OK)
+        ESP_LOGE(TAG, "Bulk read init failed: %s", esp_err_to_name(bulk_ret));
 
     app_boot_progress(82,"Preparing lock animation...");
     /* 动画资源只在本次启动导入一次，此时音频/屏幕电源任务尚未启动。

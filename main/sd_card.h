@@ -31,6 +31,9 @@ void      sd_card_request_safe_remount(void);
 esp_err_t sd_card_set_audio_detach_callback(void (*callback)(void));
 /* 视频文件同样必须在 VFS 卸载前关闭；回调在 SD 锁内执行，只可关闭 FILE。 */
 esp_err_t sd_card_set_video_detach_callback(void (*callback)(void));
+/* 分块读取（sd_bulk_read）的 FILE 会跨放锁存活，卸载前同样要关闭；
+ * 回调在 SD 锁内执行，只可关闭 FILE 和发布原子失效标志。 */
+esp_err_t sd_card_set_bulk_detach_callback(void (*callback)(void));
 
 #ifdef __cplusplus
 }

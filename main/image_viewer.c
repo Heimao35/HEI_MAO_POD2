@@ -13,6 +13,7 @@
 #include "image_viewer.h"
 
 #include "jpeg_codec.h"
+#include "sd_bulk_read.h"
 #include "sd_card.h"
 #include "thumb_cache.h"
 
@@ -344,6 +345,12 @@ static bool build_path(image_folder_t folder, uint32_t index, char *out, size_t 
 
 /**
  * @brief 读取一张 JPEG 到固定输入缓冲；不进行任何按文件大小分配。
+ *
+ * 这里分两步：短锁只做状态检查/stat 取得文件大小，真正的整文件读取交给
+ * sd_bulk_read_all() 分块完成。以前在一个 SD 锁临界区里一次 fread 读完
+ * 整张图（上限 2 MiB），持锁可达数百毫秒，会让音频 worker 拿不到锁补
+ * PCM、内部 64 KiB 环被唱空；分块后单次持锁只有十几毫秒。
+ *
  * @return 读取到的字节数，失败返回 0；s_last_error 记录原因。
  */
 static size_t read_jpeg(image_folder_t folder, uint32_t index)
@@ -359,7 +366,7 @@ static size_t read_jpeg(image_folder_t folder, uint32_t index)
         ESP_LOGW(TAG, "Read %s: SD I/O lock timeout", path);
         return 0;
     }
-    size_t bytes = 0;
+    bool ok = false;
     struct stat st;
     if (!sd_card_is_mounted() || !sd_card_is_present() ||
         sd_card_get_generation() != s_generation[folder]) {
@@ -382,23 +389,22 @@ static size_t read_jpeg(image_folder_t folder, uint32_t index)
         ESP_LOGW(TAG, "Read %s: file too large (%lld > %u)",
                  path, (long long)st.st_size, (unsigned)IMAGE_JPEG_MAX_BYTES);
     } else {
-        FILE *fp = fopen(path, "rb");
-        if (!fp) {
-            s_last_error = IMAGE_ERROR_READ;
-            ESP_LOGW(TAG, "Read %s: fopen failed errno=%d", path, errno);
-        } else {
-            bytes = fread(s_jpeg_buf, 1, (size_t)st.st_size, fp);
-            fclose(fp);
-            if (bytes != (size_t)st.st_size) {
-                ESP_LOGW(TAG, "Read %s: short read %u/%lld", path,
-                         (unsigned)bytes, (long long)st.st_size);
-                s_last_error = IMAGE_ERROR_READ;
-                bytes = 0;
-            }
-        }
+        ok = true;
     }
     sd_card_io_unlock();
-    return bytes;
+    if (!ok) return 0;
+
+    esp_err_t ret = sd_bulk_read_all(path, s_jpeg_buf, (size_t)st.st_size);
+    if (ret != ESP_OK) {
+        /* 卡被拔掉/换卡按 BUSY 处理，让 UI 走原有的等待路径；
+         * 其余按普通读取失败。 */
+        s_last_error = (ret == ESP_ERR_INVALID_STATE || ret == ESP_ERR_TIMEOUT)
+                           ? IMAGE_ERROR_BUSY
+                           : IMAGE_ERROR_READ;
+        ESP_LOGW(TAG, "Read %s failed: %s", path, esp_err_to_name(ret));
+        return 0;
+    }
+    return (size_t)st.st_size;
 }
 
 /* ============================ 解码/缩放 ============================ */

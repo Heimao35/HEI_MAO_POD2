@@ -67,6 +67,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME ebook COMMAND ebook_tests)
 
+# Chunked bulk reads: take/release the SD lock between 64 KiB blocks so the
+# audio worker can refill PCM, detach during a read, and pending-handle close.
+add_executable(sd_bulk_read_tests test_sd_bulk_read.c)
+target_include_directories(sd_bulk_read_tests PRIVATE stubs ../media_host/stubs "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(sd_bulk_read_tests PRIVATE -O1 -Wall -Wextra)
+  target_link_options(sd_bulk_read_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME sd_bulk_read COMMAND sd_bulk_read_tests)
+
 # Real 460x460 MJPEG fixture: streaming parser, seek and thumbnail window.
 add_executable(video_mjpeg_tests test_video_mjpeg.c)
 # stubs/ff.h keeps the real parser test on stdio while production uses FatFs.

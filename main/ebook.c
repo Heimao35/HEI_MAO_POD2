@@ -8,6 +8,7 @@
 #include "ebook.h"
 
 #include "jpeg_codec.h"
+#include "sd_bulk_read.h"
 #include "sd_card.h"
 #include "ui_fonts.h"
 
@@ -738,44 +739,44 @@ static ebook_open_result_t load_book(uint32_t book, uint32_t epoch)
     char path[sizeof(EBOOK_DIR) + 2 * EBOOK_TITLE_MAX + 4];
     if (!book_path(&item, item.txt, path, sizeof(path))) return EBOOK_OPEN_READ;
 
+    /* 先用短锁只取大小/修改时间：进度 key、正文缓冲大小和上限判断都
+     * 不需要文件内容，没必要为了 stat 占住 SD 锁。 */
     if (!sd_card_io_lock(pdMS_TO_TICKS(EBOOK_SD_LOCK_MS))) return EBOOK_OPEN_BUSY;
     struct stat st;
     bool ok = stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
     uint64_t size = ok ? (uint64_t)st.st_size : 0;
     uint32_t mtime = ok ? (uint32_t)st.st_mtime : 0;
-    const lv_font_t *font = ui_font_18();
-    uint64_t pkey = ok ? progress_key(item.title, size, mtime,
-                                      font ? font->line_height : 0) : 0;
-    if (ok && size > EBOOK_MAX_BYTES) {
-        sd_card_io_unlock();
-        return EBOOK_OPEN_TOO_LARGE;
-    }
-    if (ok && heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < size + 1024U * 1024U) {
-        sd_card_io_unlock();
-        return EBOOK_OPEN_TOO_LARGE;
-    }
-
-    uint8_t *text = NULL;
-    size_t bytes = 0;
-    if (ok) {
-        text = heap_caps_malloc((size_t)size + 1U,
-                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!text) ok = false;
-    }
-    if (ok) {
-        FILE *fp = fopen(path, "rb");
-        if (!fp) ok = false;
-        else {
-            bytes = fread(text, 1, (size_t)size, fp);
-            if (fclose(fp) != 0 || bytes != (size_t)size) ok = false;
-        }
-    }
     sd_card_io_unlock();
     if (!ok) {
-        heap_caps_free(text);
-        ESP_LOGW(TAG, "TXT read failed: %s", path);
+        ESP_LOGW(TAG, "TXT stat failed: %s", path);
         return EBOOK_OPEN_READ;
     }
+
+    const lv_font_t *font = ui_font_18();
+    uint64_t pkey = progress_key(item.title, size, mtime,
+                                  font ? font->line_height : 0);
+    if (size > EBOOK_MAX_BYTES) return EBOOK_OPEN_TOO_LARGE;
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < size + 1024U * 1024U)
+        return EBOOK_OPEN_TOO_LARGE;
+
+    uint8_t *text = heap_caps_malloc((size_t)size + 1U,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!text) return EBOOK_OPEN_TOO_LARGE;
+
+    /* 分块读取（每块 SD_BULK_READ_CHUNK_BYTES，块间放锁）。以前整本
+     * TXT 在一个 SD 锁临界区里读完，几 MB 的书会持锁数百毫秒，音频
+     * worker 拿不到锁补 PCM，内部 64 KiB 环被 DMA 唱空，听感就是音乐
+     * 短暂停顿。分块后单次持锁只有十几毫秒，音频可以在块间插队。 */
+    esp_err_t read_ret = sd_bulk_read_all(path, text, (size_t)size);
+    if (read_ret != ESP_OK) {
+        heap_caps_free(text);
+        ESP_LOGW(TAG, "TXT read failed: %s (%s)", path,
+                 esp_err_to_name(read_ret));
+        if (read_ret == ESP_ERR_INVALID_STATE) return EBOOK_OPEN_NO_CARD;
+        if (read_ret == ESP_ERR_TIMEOUT) return EBOOK_OPEN_BUSY;
+        return EBOOK_OPEN_READ;
+    }
+    size_t bytes = (size_t)size;
     text[bytes] = '\0';
 
     size_t start = 0;
