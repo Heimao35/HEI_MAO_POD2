@@ -236,6 +236,15 @@ static void set_tile_preview(unsigned slot, const uint8_t *pixels,
     lv_obj_invalidate(s_tile_images[slot]);
 }
 
+/** @brief 当前页所有槽位是否都已有可显示的缩略图。 */
+static bool page_previews_ready(void)
+{
+    if (s_page_count == 0 || s_page_count > VIDEO_PAGE_SIZE) return false;
+    for (uint32_t i = 0; i < s_page_count; ++i)
+        if (!s_tile_preview_ok[i]) return false;
+    return true;
+}
+
 /* ============================ 播放器控制台 ============================ */
 
 static void controls_fade_exec(void *obj, int32_t value)
@@ -1339,9 +1348,9 @@ static void ui_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    /* 锁屏期间资源被释放，解锁后当前模式仍是视频，但不会再次触发
-     * on_mode_enter。这里在锁屏结束后补一次当前预览页请求；1 秒节流
-     * 避免读取失败时每 100ms 重试。 */
+    /* 解锁后当前模式仍是视频，但不会再次触发 on_mode_enter。如果锁屏
+     * 前页面尚未加载（或预览不齐被标记为未加载），这里补一次当前预览
+     * 页请求；1 秒节流避免读取失败时每 100ms 重试。 */
     if (s_library_ready && s_total_count > 0 && !s_page_loaded &&
         !s_page_request_pending && !s_page_transitioning &&
         ui_manager_get_current_mode() == UI_MODE_VIDEO &&
@@ -1399,12 +1408,9 @@ void ui_video_player_on_mode_enter(void)
         return;
     }
     if (s_page_loaded) {
-        /* 离开视频模式时保留了列表页和缩略图；只有当前页所有槽位都已有
-         * 预览才直接复用，避免上次被停止打断时留下永久占位图。 */
-        bool previews_ready = s_page_count > 0;
-        for (uint32_t i = 0; i < s_page_count && previews_ready; ++i)
-            previews_ready = s_tile_preview_ok[i];
-        if (previews_ready) {
+        /* 离开视频模式/锁屏时保留了列表页和缩略图；只有当前页所有槽位
+         * 都已有预览才直接复用，避免上次被停止打断时留下永久占位图。 */
+        if (page_previews_ready()) {
             set_hidden(s_grid, false);
             set_list_status(NULL, false);
             return;
@@ -1444,8 +1450,8 @@ void ui_video_player_on_mode_leave(void)
     lv_obj_set_x(s_grid, 0);
 
     /* 只停止播放并关闭视频/音轨文件；保留已加载的列表页和缩略图缓冲，
-     * 再次进入视频模式时直接显示原页，不重新读索引/缩略图。锁屏和关机
-     * 路径仍调用 video_player_release() 完整释放 PSRAM。 */
+     * 再次进入视频模式时直接显示原页，不重新读索引/缩略图。只有关机、
+     * 换卡扫描路径仍调用 video_player_release() 完整释放 PSRAM。 */
     video_player_stop();
     ui_statusbar_set_visible(true);
 }
@@ -1474,17 +1480,19 @@ void ui_video_player_close_for_lock(void)
     controls_hide_immediate();
     set_hidden(s_player_view, true);
     lv_obj_set_x(s_player_view, 0);
-    /* 锁屏会盖住本页；先恢复列表视图，解锁后定时器才能补加载预览页。 */
+    /* 锁屏会盖住本页；先恢复列表视图。与图片查看器一致，保留已加载的
+     * 列表页和缩略图：只停止播放并关闭视频/音轨文件，解锁后直接显示
+     * 原页，不再重新读索引/缩略图。整页预览不齐时标记为未加载，交给
+     * 解锁后的定时器补一次，避免占位图永久残留。 */
     set_hidden(s_list_view, false);
     lv_anim_delete(s_grid, grid_anim_x_cb);
     lv_obj_set_x(s_grid, 0);
-    set_hidden(s_grid, true);
+    if (s_page_loaded && !page_previews_ready())
+        s_page_loaded = false;
+    set_hidden(s_grid, !s_page_loaded);
+    if (s_page_loaded) set_list_status(NULL, false);
 
-    clear_all_previews();
-    s_page_loaded = false;
-    s_page_count = 0;
     video_player_stop();
-    video_player_release();
     ui_statusbar_set_visible(true);
 }
 

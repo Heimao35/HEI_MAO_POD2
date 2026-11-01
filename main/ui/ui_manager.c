@@ -450,8 +450,8 @@ void ui_manager_lock(void)
     /* 蓝牙子页同样收起并停止扫描；蓝牙连接和音频输出不在锁屏时断开。 */
     ui_bluetooth_settings_close_for_lock();
     /* 锁屏 MJPEG 和视频播放器不能同时占用硬件 JPEG。这里先隐藏播放器并
-     * 投递停止/释放请求，锁屏动画会等待视频 worker 空闲后再解码。图片
-     * 查看器同样收起全屏并取消在途全屏/缩略图请求。 */
+     * 投递停止请求（保留已加载的列表页/缩略图），锁屏动画会等待视频
+     * worker 空闲后再解码。图片查看器同样收起全屏并取消在途请求。 */
     ui_video_player_close_for_lock();
     ui_image_viewer_close_for_lock();
     ui_settings_hide();

@@ -203,12 +203,29 @@ int main(void)
     assert(statusbar_visible);
     puts("PASS mode leave keeps the loaded page and reuses previews");
 
-    /* Lock must clear image descriptors before backend release. */
+    /* 锁屏与图片查看器一致：保留已加载的列表页和缩略图，只停止播放；
+     * 解锁后直接显示原页，不重新请求。 */
     ui_video_player_close_for_lock();
-    assert(releases == 1);
-    assert(!s_thumb_dsc[0].data);
-    assert(lv_obj_has_flag(s_grid, LV_OBJ_FLAG_HIDDEN));
+    assert(releases == 0);
+    assert(s_page_loaded);
+    assert(s_thumb_dsc[0].data == thumbs[0]);
+    assert(s_thumb_dsc[2].data == thumbs[2]);
+    assert(!lv_obj_has_flag(s_grid, LV_OBJ_FLAG_HIDDEN));
     assert(statusbar_visible);
+    puts("PASS lock keeps the loaded page and clears no thumbnails");
+
+    /* 页内预览不齐时锁屏：保留已有缩略图，但标记为未加载；解锁后定时器
+     * 补一次当前页请求，避免占位图永久残留。 */
+    clear_tile_preview(1);
+    ui_video_player_close_for_lock();
+    assert(releases == 0);
+    assert(!s_page_loaded);
+    assert(lv_obj_has_flag(s_grid, LV_OBJ_FLAG_HIDDEN));
+    unsigned loads_before_unlock = loads;
+    advance(1100);
+    ui_timer_cb(NULL);
+    assert(loads == loads_before_unlock + 1);
+    puts("PASS lock with missing previews schedules one reload after unlock");
 
     puts("PASS video UI smoke/lifecycle");
     return 0;
