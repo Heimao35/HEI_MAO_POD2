@@ -172,8 +172,14 @@ static bool ensure_buffers(void)
     for (unsigned f = 0; f < IMAGE_FOLDER_COUNT; ++f)
         s_names[f] = heap_caps_calloc(1, names_bytes,
                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_jpeg_buf = heap_caps_malloc(IMAGE_JPEG_MAX_BYTES,
-                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* 128B 对齐：JPEG 输入经 sd_bulk_read_all 读取，目标指针按 cache line
+     * 对齐时 sdmmc 才走多块 DMA；否则逐扇区单块读会慢约 10 倍，并把音频
+     * 的 PCM 环唱空。失败时退回普通分配，只影响读取速度。 */
+    s_jpeg_buf = heap_caps_aligned_alloc(SD_BULK_READ_ALIGN, IMAGE_JPEG_MAX_BYTES,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_jpeg_buf)
+        s_jpeg_buf = heap_caps_malloc(IMAGE_JPEG_MAX_BYTES,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
     jpeg_decode_memory_alloc_cfg_t out_mem = {
         .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,

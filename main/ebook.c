@@ -382,8 +382,14 @@ static void do_scan(void)
 static bool ensure_cover_buffers(void)
 {
     if (s_cover_buffers_ok) return true;
-    s_cover_jpeg = heap_caps_malloc(EBOOK_COVER_JPEG_MAX,
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* 128B 对齐：封面同样经 sd_bulk_read_all 读取，只有目标指针按 cache
+     * line 对齐时 sdmmc 才走多块 DMA；失败时退回普通分配，只是读得慢。 */
+    s_cover_jpeg = heap_caps_aligned_alloc(SD_BULK_READ_ALIGN,
+                                           EBOOK_COVER_JPEG_MAX,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_cover_jpeg)
+        s_cover_jpeg = heap_caps_malloc(EBOOK_COVER_JPEG_MAX,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     /* JPEG 硬件解码的输出缓冲必须满足 DMA/cache 对齐；必须使用
      * jpeg_alloc_decoder_mem，普通 heap_caps_malloc 会被驱动拒绝
      * （ESP_ERR_INVALID_ARG），封面就会全部显示占位图。 */
@@ -469,23 +475,27 @@ static bool read_cover(const ebook_book_t *book, uint32_t *bytes)
     if (!ensure_cover_buffers()) return false;
     char path[sizeof(EBOOK_DIR) + 2 * EBOOK_TITLE_MAX + 4];
     if (!book_path(book, book->cover, path, sizeof(path))) return false;
+    /* 短锁只做 stat；整张封面同样交给分块读取器。封面最大 512KiB，
+     * 一次持锁读完在较慢的 FATFS 路径下也要数百毫秒，和 TXT 读取是同一
+     * 类问题，会让音频拿不到 SD 锁补 PCM。 */
     if (!sd_card_io_lock(pdMS_TO_TICKS(EBOOK_SD_LOCK_MS))) return false;
-
     struct stat st;
     bool ok = stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
               (uint64_t)st.st_size <= EBOOK_COVER_JPEG_MAX;
-    if (ok) {
-        FILE *fp = fopen(path, "rb");
-        if (!fp) ok = false;
-        else {
-            size_t n = fread(s_cover_jpeg, 1, (size_t)st.st_size, fp);
-            if (fclose(fp) != 0 || n != (size_t)st.st_size) ok = false;
-            else *bytes = (uint32_t)n;
-        }
-    }
+    uint64_t size = ok ? (uint64_t)st.st_size : 0;
     sd_card_io_unlock();
-    if (!ok) ESP_LOGW(TAG, "Cover read failed: %s", path);
-    return ok;
+    if (!ok) {
+        ESP_LOGW(TAG, "Cover read failed: %s", path);
+        return false;
+    }
+    esp_err_t read_ret = sd_bulk_read_all(path, s_cover_jpeg, (size_t)size);
+    if (read_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Cover read failed: %s (%s)", path,
+                 esp_err_to_name(read_ret));
+        return false;
+    }
+    *bytes = (uint32_t)size;
+    return true;
 }
 
 /**
@@ -759,8 +769,16 @@ static ebook_open_result_t load_book(uint32_t book, uint32_t epoch)
     if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < size + 1024U * 1024U)
         return EBOOK_OPEN_TOO_LARGE;
 
-    uint8_t *text = heap_caps_malloc((size_t)size + 1U,
-                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* 128B 对齐（SD_BULK_READ_ALIGN）：sdmmc_read_sectors() 只在目标指针和
+     * 长度都对齐 cache line 时对 PSRAM 走多块 DMA，否则逐扇区单块读，
+     * 实测约 0.8 MB/s（940KB 的书要读 1.2 秒），音频 PCM 环会被唱空。
+     * 对齐失败时退回普通分配，功能不受影响，只是读取变慢。 */
+    uint8_t *text = heap_caps_aligned_alloc(SD_BULK_READ_ALIGN,
+                                            (size_t)size + 1U,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!text)
+        text = heap_caps_malloc((size_t)size + 1U,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!text) return EBOOK_OPEN_TOO_LARGE;
 
     /* 分块读取（每块 SD_BULK_READ_CHUNK_BYTES，块间放锁）。以前整本

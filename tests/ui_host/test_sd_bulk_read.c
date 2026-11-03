@@ -56,6 +56,14 @@ esp_err_t sd_card_set_bulk_detach_callback(void (*callback)(void))
     return ESP_OK;
 }
 
+/* ---------------- esp_timer double（只用于诊断日志计时） ---------------- */
+static int64_t fake_us;
+int64_t esp_timer_get_time(void)
+{
+    fake_us += 1000;
+    return fake_us;
+}
+
 /* ---------------- FreeRTOS mutex double ---------------- */
 static bool mux_taken;
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (void *)1; }

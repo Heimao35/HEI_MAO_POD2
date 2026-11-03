@@ -30,10 +30,20 @@
 extern "C" {
 #endif
 
-/* 单块字节数。本板 20 MHz 4-bit SD 顺序读约 8.7 MB/s，64 KiB 约 8-15 ms
- * 持锁（含 FATFS 目录/簇处理），远小于 64 KiB PCM 环在 48 kHz 下的约
- * 165 ms 余量；再小只会增加取锁次数，收益有限。 */
-#define SD_BULK_READ_CHUNK_BYTES (64U * 1024U)
+/* 单块字节数。对齐目标缓冲后实测约 4 MB/s，32 KiB 一块约 8-16ms；即使
+ * 退回未对齐的逐扇区慢路径（约 0.8 MB/s）也只要约 40ms。音频等 SD 锁的
+ * 上限（AUDIO_SD_LOCK_MS=150ms）必须能盖住一整块，块间放锁时 FreeRTOS
+ * 才能把锁直接交给正在等待的音频任务；多出来的取锁开销可以忽略。 */
+#define SD_BULK_READ_CHUNK_BYTES (32U * 1024U)
+
+/* 目标缓冲的对齐要求（本板 L2 cache line = 128B，见 sdkconfig 的
+ * CONFIG_CACHE_L2_CACHE_LINE_128B）。sdmmc_read_sectors() 只在“指针和长度
+ * 都是 cache line 对齐”时对 PSRAM 目标使用多块 DMA；否则退化为逐扇区
+ * 单块读，每 512B 还要一次 CMD13 状态查询，实测只有约 0.8 MB/s（对齐后
+ * 约 4 MB/s）。本模块用 read(fileno()) 直接读进调用者的缓冲（不走 stdio
+ * 的 fread），所以调用者必须用 heap_caps_aligned_alloc(SD_BULK_READ_ALIGN,…)
+ * 分配目标缓冲，否则读本身仍然正确，只是会慢很多。 */
+#define SD_BULK_READ_ALIGN 128U
 
 /** @brief 创建串行化互斥量并注册 SD 卸载回调；main 在 sd_card_init 之后调用一次。 */
 esp_err_t sd_bulk_read_init(void);

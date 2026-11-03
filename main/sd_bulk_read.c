@@ -1,6 +1,6 @@
 /**
  * @file sd_bulk_read.c
- * @brief 大文件分块读取实现：每 64 KiB 取放一次 SD 锁，块间让音频插队。
+ * @brief 大文件分块读取实现：每 32 KiB 取放一次 SD 锁，块间让音频插队。
  *
  * 读取顺序（全部在 worker 任务里执行，不持有 LVGL 锁）：
  *   取 SD 锁 -> 打开文件 -> 读一块 -> 放锁 -> 取回锁 -> 读下一块 ...
@@ -12,19 +12,22 @@
  * - 文件句柄只在持有 SD 锁时访问；
  * - SD 卸载路径（sd_card.c do_unmount）在同一个锁内调用 detach 回调，
  *   关闭句柄并置 s_detached；
- * - 每块取回锁后先检查 s_detached，已失效就中止，绝不继续 fread。
+ * - 每块取回锁后先检查 s_detached，已失效就中止，绝不再碰失效句柄。
  */
 #include "sd_bulk_read.h"
 
 #include "sd_card.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <unistd.h>
 
 static const char *TAG = "sd_bulk";
 
@@ -80,6 +83,11 @@ esp_err_t sd_bulk_read_all(const char *path, uint8_t *dst, size_t size)
     if (!xSemaphoreTake(s_mux, portMAX_DELAY)) return ESP_ERR_TIMEOUT;
 
     esp_err_t result = ESP_OK;
+    /* 诊断：块数、总耗时和最长单块耗时。打开一本大书时用这些数字就能
+     * 判断是“每块都在几十毫秒内”还是“某一次块内读取卡住了”。 */
+    const int64_t started_us = esp_timer_get_time();
+    unsigned chunks = 0;
+    int64_t chunk_max_us = 0;
 
     /* 上一次块间取锁超时可能留下未关闭的句柄；先补关再打开新文件。 */
     if (s_file) {
@@ -109,13 +117,34 @@ esp_err_t sd_bulk_read_all(const char *path, uint8_t *dst, size_t size)
     } else {
         s_file = fopen(path, "rb");
         if (!s_file) result = ESP_ERR_NOT_FOUND;
+        else {
+            /* 本模块只用 read(fileno()) 读取，不用 stdio 的 fread：
+             * newlib 对无缓冲流用的是 1 字节内部缓冲，fread 会退化成每
+             * 字节一次 VFS read（实测 940KB 的书要 21 秒）。直接 read()
+             * 才能把数据读进调用者的 128B 对齐缓冲，让 sdmmc 走多块 DMA。
+             * setvbuf 只为让 stdio 不分配多余缓冲、文件位置只由 read()
+             * 推进；与 audio_output 读取压缩数据的做法一致。 */
+            setvbuf(s_file, NULL, _IONBF, 0);
+        }
     }
 
     size_t done = 0;
     while (result == ESP_OK && done < size) {
         size_t want = size - done;
         if (want > SD_BULK_READ_CHUNK_BYTES) want = SD_BULK_READ_CHUNK_BYTES;
-        size_t got = fread(dst + done, 1, want, s_file);
+        const int64_t chunk_started_us = esp_timer_get_time();
+        /* 一次 read() 可能返回短读（VFS/FatFs 在簇边界或 EINTR），补读到
+         * 整块为止；返回 0 表示提前 EOF，按失败处理（与整文件读取一致）。 */
+        size_t got = 0;
+        while (got < want) {
+            ssize_t n = read(fileno(s_file), dst + done + got, want - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+        const int64_t chunk_us = esp_timer_get_time() - chunk_started_us;
+        if (chunk_us > chunk_max_us) chunk_max_us = chunk_us;
+        ++chunks;
         if (got != want) {
             result = ESP_FAIL;
             break;
@@ -147,9 +176,16 @@ esp_err_t sd_bulk_read_all(const char *path, uint8_t *dst, size_t size)
     }
     xSemaphoreGive(s_mux);
 
+    int64_t total_us = esp_timer_get_time() - started_us;
     if (result != ESP_OK) {
         ESP_LOGW(TAG, "Read %s failed: %s (%u/%u bytes)", path,
                  esp_err_to_name(result), (unsigned)done, (unsigned)size);
+    } else if (size >= 128U * 1024U || total_us >= 50000) {
+        /* 大文件每次都记一行：块数和最长单块耗时能直接说明块间是否真的
+         * 放了锁，以及是否出现了某块长时间卡住（最长块接近总时长）。 */
+        ESP_LOGI(TAG, "%s: %u bytes in %u chunks, %lld ms (max chunk %lld ms)",
+                 path, (unsigned)size, chunks, (long long)(total_us / 1000),
+                 (long long)(chunk_max_us / 1000));
     }
     return result;
 }

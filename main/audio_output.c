@@ -39,6 +39,14 @@
 /* 音频 PCM 供给是实时路径；图片/视频/蓝牙 worker 都是优先级5。
  * 先只把音频任务提高到6，观察短时SD读锁竞争是否改善。 */
 #define AUDIO_TASK_PRIO 6U
+/* 读取压缩数据时等 SD 锁的上限。原来只有5ms：大文件分块读取时单块耗
+ * 时就有几十毫秒，音频在块中途超时、睡2ms后重试，很容易正好错过放锁
+ * 的那一瞬间；实测打开一本940KB的书时，音频连续约1.2s一次都没拿到锁，
+ * 64KiB PCM环被唱空。现在等待上限覆盖一整个数据块（32KiB；对齐缓冲后
+ * 实测约8-16ms，退回逐扇区慢路径约40ms），留足余量覆盖更慢的卡。块间
+ * 放锁时FreeRTOS会把锁直接交给正在等待的音频任务（优先级6 > 读取方5），
+ * 不再靠重试去碰运气。此上限只约束取锁，不约束已经开始的实际读取耗时。 */
+#define AUDIO_SD_LOCK_MS 150U
 static const char *TAG="audio_output";
 static TaskHandle_t s_task;
 static portMUX_TYPE s_cmd_mux=portMUX_INITIALIZER_UNLOCKED;
@@ -90,6 +98,10 @@ static atomic_uint s_video_rate_pub,s_video_frame_bytes_pub,s_video_bits_pub,s_v
 static TickType_t s_diag_at,s_read_max,s_decode_max,s_push_max,s_step_max,s_poll_max;
 static uint64_t s_read_ticks,s_decode_ticks,s_push_ticks,s_decoded_frames;
 static uint32_t s_diag_underrun,s_decode_peak_frames;
+/* SD 锁等待单独统计：read_ticks 把成功读取和等锁超时混在一起，无法区分
+ * “读得慢”和“根本拿不到锁”。timeouts 窗口内非零说明有别的任务长持锁。 */
+static TickType_t s_lock_max;
+static uint32_t s_lock_timeouts;
 /* A2DP 已连接时本机 DAC 静音，但 I2S/DMA 继续运行以维持视频主时钟和
  * 音乐进度；蓝牙断开后恢复用户音量。 */
 static unsigned dac_volume(void)
@@ -110,6 +122,7 @@ static void reset_diagnostics(void)
     s_read_max=s_decode_max=s_push_max=s_step_max=s_poll_max=0;
     s_read_ticks=s_decode_ticks=s_push_ticks=s_decoded_frames=0;
     s_decode_peak_frames=0;
+    s_lock_max=0;s_lock_timeouts=0;
     audio_mp3_take_stats();
 }
 static void report_diagnostics(void)
@@ -133,6 +146,11 @@ static void report_diagnostics(void)
         (unsigned long)(s_push_ticks*portTICK_PERIOD_MS),
         (unsigned long)(s_decoded_frames*1000/s_format.sample_rate),
         (unsigned long)s_decode_peak_frames,(unsigned long)(s_decode_max*portTICK_PERIOD_MS));
+    /* 只在明显等锁或发生超时时打印，避免每个窗口多一行日志。 */
+    if(s_lock_max*portTICK_PERIOD_MS>=10 || s_lock_timeouts)
+        ESP_LOGI(TAG,"SD lock: max wait=%lu ms, timeouts=%lu",
+            (unsigned long)(s_lock_max*portTICK_PERIOD_MS),
+            (unsigned long)s_lock_timeouts);
     audio_mp3_stats_t mp3=audio_mp3_take_stats();
     if(s_mp3_session)ESP_LOGI(TAG,"MP3 core: calls=%lu, work=%lu ms, max=%lu ms",
         (unsigned long)mp3.calls,(unsigned long)(mp3.core_ticks*portTICK_PERIOD_MS),
@@ -141,6 +159,7 @@ static void report_diagnostics(void)
     s_read_max=s_decode_max=s_push_max=s_step_max=s_poll_max=0;
     s_read_ticks=s_decode_ticks=s_push_ticks=s_decoded_frames=0;
     s_decode_peak_frames=0;
+    s_lock_max=0;s_lock_timeouts=0;
 }
 
 static command_t command(void)
@@ -375,7 +394,11 @@ static esp_err_t open_session(command_t c)
 static esp_err_t read_input(void)
 {
     if(s_input_eof)return ESP_OK;
-    if(!sd_card_io_lock(pdMS_TO_TICKS(5)))return ESP_ERR_TIMEOUT;
+    /* 等锁时间单独记账：区分“卡上读得慢”和“拿不到锁”。 */
+    TickType_t lock_start=xTaskGetTickCount();
+    bool locked=sd_card_io_lock(pdMS_TO_TICKS(AUDIO_SD_LOCK_MS));
+    record_max(&s_lock_max,lock_start);
+    if(!locked) {++s_lock_timeouts;return ESP_ERR_TIMEOUT;}
     esp_err_t ret=ESP_OK;
     if(!card_current())ret=ESP_ERR_INVALID_STATE;
     if(ret==ESP_OK && !s_file) {
