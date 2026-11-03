@@ -65,7 +65,9 @@ esp_err_t jpeg_decoder_process(jpeg_decoder_handle_t decoder, const jpeg_decode_
 {
     assert(!ui_locked && !sd_locked && decoder==(void *)2);
     assert(cfg->output_format==JPEG_DECODE_OUT_FORMAT_RGB565 && bytes==4 && input[0]==0xFF);
-    assert(output==s_decode_buf && output!=s_rgb_buf && capacity==DECODE_BUF_SZ);
+    /* 解码目标必须是"当前不在显示"的那一块；canvas 指向另一块。 */
+    assert(output==s_frame_bufs[s_frame_index] && capacity==DECODE_BUF_SZ);
+    assert(output!=lv_canvas_get_buf(s_bg_canvas));
     ++decodes; memset(output,0x5A,capacity); *size=capacity;
     if (cancel_during_decode) ui_lockscreen_stop_anim();
     return ESP_OK;
@@ -138,6 +140,15 @@ int main(void)
     lv_display_set_buffers(display,pixels,NULL,sizeof(pixels),LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(display,flush);
     ui_lockscreen_create(lv_screen_active());
+    /* 画布直接用 464x464 解码缓冲，靠 460x460 的页面裁掉右/下各 4 像素，
+     * 不再每帧把 464 宽逐行拷成 460 宽。 */
+    lv_obj_update_layout(s_lock_page);
+    assert(s_frame_bufs[0] && s_frame_bufs[1] && s_frame_bufs[0]!=s_frame_bufs[1]);
+    assert(lv_obj_get_width(s_bg_canvas)==(int32_t)PADDED_W);
+    assert(lv_obj_get_height(s_bg_canvas)==(int32_t)PADDED_H);
+    assert(lv_obj_get_x(s_bg_canvas)==0 && lv_obj_get_y(s_bg_canvas)==0);
+    assert(PADDED_W>FRAME_W && PADDED_H>FRAME_H);
+    assert(lv_canvas_get_buf(s_bg_canvas)==s_frame_bufs[0]);
     bar=lv_obj_create(lv_screen_active());
     assert(task_creations==1 && ui_lockscreen_is_visible());
     ui_lockscreen_set_visibility_cb(visibility_cb);
@@ -227,11 +238,15 @@ int main(void)
     fail_engine=false;
     puts("PASS decoder allocation failure exits safely and allows the next lock replay");
     ui_lockscreen_show(); run_requested();
-    assert(decodes==1 && s_rgb_buf[0]==0x5A && s_rgb_buf[FRAME_BUF_SZ-1]==0x5A);
+    /* 解码输出被直接发布为 canvas 缓冲：内容来自刚解码的那一块，不是拷贝。 */
+    uint8_t *shown = s_frame_bufs[s_frame_index ^ 1U];
+    assert(decodes==1 && shown[0]==0x5A && shown[DECODE_BUF_SZ-1]==0x5A);
+    assert(lv_canvas_get_buf(s_bg_canvas)==shown);
     assert(engines==deletes && ui_lockscreen_anim_is_idle());
-    ui_lockscreen_show(); assert(s_rgb_buf[0]==0);
+    ui_lockscreen_show(); assert(s_frame_bufs[s_frame_index ^ 1U][0]==0);
     cancel_during_decode=true; run_requested();
-    assert(decodes==2 && s_rgb_buf[0]==0 && engines==deletes);
+    /* 取消的解码不能发布，也不能切换缓冲：显示中的一块仍是清空后的状态。 */
+    assert(decodes==2 && s_frame_bufs[s_frame_index ^ 1U][0]==0 && engines==deletes);
     notify_before=notifications; ui_lockscreen_start_boot_anim(); assert(notifications==notify_before);
     puts("PASS each entry resets old tail frame; canceled decoder cannot publish; dark state rejects late SD replay");
 
@@ -242,6 +257,6 @@ int main(void)
     asset_available=false; ui_lockscreen_show(); run_requested();
     assert(decodes==4 && ui_lockscreen_anim_is_idle() && engines==deletes && task_creations==1);
     puts("PASS Flash cache replays without mounted/present SD, no SD lock, no worker or engine accumulation");
-    lv_deinit(); free(s_rgb_buf); free(s_decode_buf);
+    lv_deinit(); free(s_frame_bufs[0]); free(s_frame_bufs[1]);
     puts("ALL LOCKSCREEN TESTS PASSED"); return 0;
 }

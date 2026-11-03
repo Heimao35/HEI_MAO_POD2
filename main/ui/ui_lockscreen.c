@@ -20,7 +20,9 @@ static const char *TAG = "lockscr";
 #define FRAME_W    LOCK_ANIMATION_WIDTH
 #define FRAME_H    LOCK_ANIMATION_HEIGHT
 #define FRAME_BPP  2
-#define FRAME_BUF_SZ (FRAME_W * FRAME_H * FRAME_BPP)
+/* JPEG 硬件解码的输出宽高都要补齐到 16 的倍数（460 -> 464）。canvas 直接
+ * 使用这个补齐后的缓冲，由 460x460 的锁屏页裁掉右侧/下侧各 4 像素；
+ * 这样每帧不需要再把 464 宽逐行拷成 460 宽（和视频播放器同一做法）。 */
 #define PAD16(x)   (((x) + 15) & ~15)
 #define PADDED_W   PAD16(FRAME_W)
 #define PADDED_H   PAD16(FRAME_H)
@@ -65,8 +67,12 @@ void ui_lockscreen_set_visibility_cb(ui_lockscreen_visibility_cb_t cb)
 }
 
 
-static uint8_t *s_rgb_buf = NULL;
-static uint8_t *s_decode_buf = NULL;
+/* 双缓冲：s_frame_bufs[s_frame_index] 是当前解码目标，另一块正在被 LVGL
+ * 绘制（或不显示）。解码完成后在 LVGL 锁内把 canvas 指向新缓冲并切换索引，
+ * 因此 JPEG 的 2DDMA 永远不会覆盖正在显示的那一帧。s_frame_index 的读写
+ * 都在 LVGL 锁内（worker 发布帧、UI 清空尾帧），不会跨任务竞争。 */
+static uint8_t *s_frame_bufs[2] = {NULL, NULL};
+static unsigned s_frame_index = 1;
 
 static void play_mjpeg(unsigned generation)
 {
@@ -76,6 +82,7 @@ static void play_mjpeg(unsigned generation)
      * 每次调用的position从0开始；缓存直到关机都不变，无需新分配文件缓冲。 */
     size_t position=0, frame_len=0;
     const uint8_t *frame=NULL;
+    if (!s_frame_bufs[0] || !s_frame_bufs[1]) return;
     if (!lock_animation_next_frame(&position,&frame,&frame_len)) return;
 
     /* 视频播放器可能正在停止；先等它空闲再开始动画，避免 UI 帧缓冲交接
@@ -93,24 +100,27 @@ static void play_mjpeg(unsigned generation)
     const int64_t frame_us = 1000000LL / ANIM_FPS;
     int64_t next_us = esp_timer_get_time();
     while (atomic_load(&s_visible) && generation == atomic_load(&s_anim_generation)) {
+        /* 解码到"不在显示"的那一块。LVGL 可能还在绘制上一帧，JPEG 的
+         * 2DDMA 不能写它正在读的缓冲。解码失败或没抢到 LVGL 锁时不切换
+         * 索引，下一帧继续覆盖同一块，canvas 保持上一帧。 */
+        uint8_t *target = s_frame_bufs[s_frame_index];
         uint32_t out_size = 0;
         esp_err_t ret = jpeg_codec_process(&dec_cfg,
                                             frame, (uint32_t)frame_len,
-                                            s_decode_buf, DECODE_BUF_SZ,
+                                            target, DECODE_BUF_SZ,
                                             &out_size, 1000);
         if (ret == ESP_OK) {
             if (lvgl_port_lock(50)) {
-                /* 先确认本轮仍有效，再在 LVGL 锁内更新可见 canvas。
-                 * 解码始终使用独立的 staging buffer，绘制不会读到半帧。 */
+                /* 先确认本轮仍有效，再把解码输出直接设为 canvas 缓冲。
+                 * 464x464 的 canvas 放在 460x460 的锁屏页里，右/下各 4
+                 * 像素由父对象裁掉，可见画面与原来的逐行拷贝一致，但不再
+                 * 需要每帧 423KB 的 PSRAM 搬运。 */
                 if (atomic_load(&s_visible) && generation == atomic_load(&s_anim_generation)) {
-                    for (int row = 0; row < FRAME_H; row++) {
-                        memcpy(s_rgb_buf + row * FRAME_W * FRAME_BPP,
-                               s_decode_buf + row * PADDED_W * FRAME_BPP,
-                               FRAME_W * FRAME_BPP);
-                    }
-                    lv_canvas_set_buffer(s_bg_canvas, s_rgb_buf, FRAME_W, FRAME_H,
+                    lv_canvas_set_buffer(s_bg_canvas, target,
+                                         PADDED_W, PADDED_H,
                                          LV_COLOR_FORMAT_RGB565);
                     lv_obj_invalidate(s_bg_canvas);
+                    s_frame_index ^= 1U;
                 }
                 lvgl_port_unlock();
             }
@@ -194,21 +204,31 @@ void ui_lockscreen_create(lv_obj_t *parent)
     lv_obj_remove_flag(s_lock_page, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_lock_page, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    /* MJPEG 动画背景 canvas（全屏，最底层） */
-    s_rgb_buf = heap_caps_aligned_calloc(128, 1, FRAME_BUF_SZ,
-                                          MALLOC_CAP_SPIRAM);
+    /* MJPEG 动画背景 canvas（铺满整页，最底层）。
+     * 缓冲直接使用 JPEG 解码输出：464x464（宽高补齐到 16 的倍数），
+     * jpeg_alloc_decoder_mem 按 cache line 对齐并清零。两块交替使用，
+     * 一块给 LVGL 绘制、一块给 2DDMA 解码，互不覆盖。锁屏页 460x460，
+     * 右/下各 4 像素由父对象裁掉，因此每帧不再需要拷成 460 宽。 */
     jpeg_decode_memory_alloc_cfg_t dec_mem_cfg = {
         .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
     };
     size_t dec_buf_actual = 0;
-    s_decode_buf = jpeg_alloc_decoder_mem(DECODE_BUF_SZ, &dec_mem_cfg,
-                                          &dec_buf_actual);
+    s_frame_bufs[0] = jpeg_alloc_decoder_mem(DECODE_BUF_SZ, &dec_mem_cfg,
+                                             &dec_buf_actual);
+    s_frame_bufs[1] = jpeg_alloc_decoder_mem(DECODE_BUF_SZ, &dec_mem_cfg,
+                                             &dec_buf_actual);
+    if (!s_frame_bufs[1] && s_frame_bufs[0]) {
+        heap_caps_free(s_frame_bufs[0]);
+        s_frame_bufs[0] = NULL;
+    }
+    s_frame_index = 1; /* 初始 canvas 显示 0 号缓冲，下一帧解码进 1 号 */
     s_bg_canvas = lv_canvas_create(s_lock_page);
-    lv_obj_set_size(s_bg_canvas, FRAME_W, FRAME_H);
-    lv_obj_align(s_bg_canvas, LV_ALIGN_CENTER, 0, 0);
-    if (s_rgb_buf) {
-        lv_canvas_set_buffer(s_bg_canvas, s_rgb_buf,
-                             FRAME_W, FRAME_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_size(s_bg_canvas, PADDED_W, PADDED_H);
+    lv_obj_set_pos(s_bg_canvas, 0, 0);
+    lv_obj_remove_flag(s_bg_canvas, LV_OBJ_FLAG_SCROLLABLE);
+    if (s_frame_bufs[0]) {
+        lv_canvas_set_buffer(s_bg_canvas, s_frame_bufs[0],
+                             PADDED_W, PADDED_H, LV_COLOR_FORMAT_RGB565);
     }
     lv_obj_add_flag(s_bg_canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
 
@@ -286,7 +306,7 @@ void ui_lockscreen_create(lv_obj_t *parent)
     s_temp_x10 = 0;
 
     s_visible = true;
-    if (s_rgb_buf && s_decode_buf &&
+    if (s_frame_bufs[0] && s_frame_bufs[1] &&
         xTaskCreate(mjpeg_anim_task, "lock_anim", 8192, NULL, 5, &s_anim_task) != pdPASS)
         ESP_LOGE(TAG, "Cannot create lock animation worker");
 }
@@ -392,7 +412,10 @@ void ui_lockscreen_show(void)
     atomic_store(&s_anim_allowed, true);
     /* 清空上一轮尾帧并立即更新时间；新请求从 MJPEG 的首帧重新解码。
      * 常驻worker只读取启动时发布的动画缓存，不在触摸/显示路径访问SD或Flash。 */
-    if (s_rgb_buf) memset(s_rgb_buf, 0, FRAME_BUF_SZ);
+    /* 只清当前正在显示的那一块（s_frame_index 指向解码缓冲，另一块才是
+     * 正在显示的）；解码线程可能正在写另一块，不能碰。 */
+    if (s_frame_bufs[s_frame_index ^ 1U])
+        memset(s_frame_bufs[s_frame_index ^ 1U], 0, DECODE_BUF_SZ);
     lv_obj_invalidate(s_bg_canvas);
     ui_lockscreen_update();
     ui_statusbar_show_time(false);
