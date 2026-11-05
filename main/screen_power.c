@@ -44,6 +44,10 @@ static esp_lcd_touch_interrupt_callback_t s_original_touch_irq;
 static TaskHandle_t s_task;
 static atomic_uint s_events;
 static atomic_bool s_dark;
+/* “防误触”设置：true 表示熄屏后触摸允许唤醒（原行为）。
+ * 关闭时 ISR 不登记触摸候选、步骤不做I2C确认，并在进入Light-sleep前
+ * 把GPIO6从EXT1唤醒源移除；电源键/抬手亮屏不受影响。 */
+static atomic_bool s_touch_wake = true;
 static atomic_uchar s_brightness = 80;
 static atomic_bool s_brightness_pending;
 /* UI只在极短临界区投递模式/手动命令；ADC和DCS不持有此锁或LVGL锁。
@@ -101,6 +105,9 @@ static void IRAM_ATTR touch_irq(esp_lcd_touch_handle_t touch)
      * esp_lvgl_port回调；熄屏时立即唤醒检查任务，避免100ms固定轮询
      * 把快速点按拖到松手后才读，造成“需要长按触摸才能唤醒”。 */
     if (atomic_load(&s_dark)) {
+        /* 防误触打开时不登记触摸候选，也不唤醒屏幕电源任务；即使
+         * 控制器仍产生边沿，熄屏状态保持黑屏。 */
+        if (!atomic_load(&s_touch_wake)) return;
         atomic_fetch_or(&s_events, EVENT_TOUCH);
         BaseType_t woken = pdFALSE;
         if (s_task) vTaskNotifyGiveFromISR(s_task, &woken);
@@ -121,6 +128,14 @@ void screen_power_set_brightness(uint8_t brightness)
     atomic_store(&s_brightness_pending, true);
     portEXIT_CRITICAL(&s_brightness_mux);
     if (s_task) xTaskNotifyGive(s_task);
+}
+
+void screen_power_set_touch_wake(bool enabled)
+{
+    /* 只写原子标志：UI 回调、开机恢复都可以直接调用。唤醒源/触摸读取
+     * 的调整分别在下一次熄屏步骤和进入 Light-sleep 前完成，不在这里
+     * 等待 LVGL、I2C 或 RTC 操作。 */
+    atomic_store(&s_touch_wake, enabled);
 }
 
 void screen_power_set_auto_brightness(bool enabled)
@@ -148,6 +163,8 @@ static esp_err_t write_panel_brightness(uint8_t brightness)
  * 零触点或越界数据均保持黑屏。持续低电平/IRQ风暴最多每20ms读一次。 */
 static bool touch_confirms_wake(void)
 {
+    /* 防御性复核：防误触在本轮读取前被打开时，不再访问触摸控制器。 */
+    if (!atomic_load(&s_touch_wake)) return false;
     TickType_t now = xTaskGetTickCount();
     if (s_touch_probed && now - s_touch_probe_at < pdMS_TO_TICKS(TOUCH_PROBE_MIN_MS))
         return false;
@@ -272,8 +289,15 @@ static void dark_idle(void)
      * DAC耳机监测任务确认停稳，避免I2C事务跨越显式Light-sleep。 */
     /* 低电平候选已在screen_power_step中读触摸数据。仍为低时不进入
      * ANY_LOW睡眠，避免立刻被同一电平唤醒；也不再给自己排无条件亮屏
-     * 事件/通知，防止持续低电平导致I2C忙循环。 */
-    if (gpio_get_level(TOUCH_IRQ_GPIO) == 0) { audio_output_sleep(false); return; }
+     * 事件/通知，防止持续低电平导致I2C忙循环。
+     * 防误触打开时触摸本来就不允许唤醒：即使IRQ持续为低也不能因此
+     * 拒绝睡眠，否则一个按住/短路的触摸会被误当成"有用户操作"而让
+     * 系统永远不进入低功耗。 */
+    bool touch_wake = atomic_load(&s_touch_wake);
+    if (touch_wake && gpio_get_level(TOUCH_IRQ_GPIO) == 0) {
+        audio_output_sleep(false);
+        return;
+    }
     /* A pending PMIC notification first needs the monitor to drain it. VBUS,
      * charging and SOC events can wake the CPU without turning on the screen. */
     if (gpio_get_level(PMIC_IRQ_GPIO) == 0) { audio_output_sleep(false); return; }
@@ -297,9 +321,19 @@ static void dark_idle(void)
         audio_output_sleep(false);
         return;
     }
-    esp_err_t wake_ret = motion_wake ? esp_sleep_enable_ext1_wakeup_io(
-        1ULL << MOTION_IRQ_GPIO, ESP_EXT1_WAKEUP_ANY_LOW) :
-        esp_sleep_disable_ext1_wakeup_io(1ULL << MOTION_IRQ_GPIO);
+    /* 每次进入睡眠前按当前防误触设置更新触摸唤醒源。IDF 的
+     * esp_sleep_enable_ext1_wakeup_io() 只会把引脚加进掩码，不能移除；
+     * 关闭触摸唤醒必须调用 esp_sleep_disable_ext1_wakeup_io()。
+     * PMIC（电源键）始终保留在 EXT1 中，GPIO6 仅在允许触摸唤醒时加入。 */
+    esp_err_t wake_ret = touch_wake
+        ? esp_sleep_enable_ext1_wakeup_io(1ULL << TOUCH_IRQ_GPIO,
+                                          ESP_EXT1_WAKEUP_ANY_LOW)
+        : esp_sleep_disable_ext1_wakeup_io(1ULL << TOUCH_IRQ_GPIO);
+    if (wake_ret == ESP_OK) {
+        wake_ret = motion_wake ? esp_sleep_enable_ext1_wakeup_io(
+            1ULL << MOTION_IRQ_GPIO, ESP_EXT1_WAKEUP_ANY_LOW) :
+            esp_sleep_disable_ext1_wakeup_io(1ULL << MOTION_IRQ_GPIO);
+    }
     if (wake_ret != ESP_OK) {
         motion_sensor_sleep(false);
         pmic_axp2101_pause_monitor(false);
@@ -317,7 +351,8 @@ static void dark_idle(void)
      * Before SD init, the missing mutex also prevents an early sleep. */
     if (sd_card_io_lock(0)) {
         if (!system_power_is_active() && !atomic_load(&s_events) && gpio_get_level(PMIC_IRQ_GPIO) != 0 &&
-            gpio_get_level(TOUCH_IRQ_GPIO) != 0 && !music_player_adapter_is_playing() &&
+            (!touch_wake || gpio_get_level(TOUCH_IRQ_GPIO) != 0) &&
+            !music_player_adapter_is_playing() &&
             (!motion_wake || gpio_get_level(MOTION_IRQ_GPIO) != 0)) {
             esp_sleep_enable_timer_wakeup(1000000ULL);
             esp_err_t ret = esp_light_sleep_start();
@@ -344,7 +379,11 @@ static void dark_idle(void)
                 if ((wake_pins & (1ULL << MOTION_IRQ_GPIO)) || gpio_get_level(MOTION_IRQ_GPIO) == 0)
                     motion_sensor_notify_wake();
             }
-            if ((wake_pins & (1ULL << TOUCH_IRQ_GPIO)) || gpio_get_level(TOUCH_IRQ_GPIO) == 0)
+            /* 关闭触摸唤醒时 GPIO6 不在本轮 EXT1 掩码中；即使它碰巧为低
+             * 也不能把这次电源键/定时唤醒升级成触摸唤醒。 */
+            if (touch_wake &&
+                ((wake_pins & (1ULL << TOUCH_IRQ_GPIO)) ||
+                 gpio_get_level(TOUCH_IRQ_GPIO) == 0))
                 post_event(EVENT_TOUCH);
 
         }
@@ -427,9 +466,17 @@ static void screen_power_step(void)
     if (atomic_load(&s_dark)) {
         bool explicit_wake = (events & (EVENT_KEY | EVENT_WAKE_REQUEST)) != 0;
         bool touch_wake = false;
-        if ((events & EVENT_TOUCH) || gpio_get_level(TOUCH_IRQ_GPIO) == 0)
+        /* 防误触打开时丢弃尚未处理的触摸候选（包括设置在本轮之前刚
+         * 改变的情况），既不读 I2C，也不会因为延长低电平而阻止渐灭/
+         * 进入 Light-sleep。 */
+        bool touch_allowed = atomic_load(&s_touch_wake);
+        if (!touch_allowed) {
+            s_touch_probe_pending = false;
+        } else if ((events & EVENT_TOUCH) || gpio_get_level(TOUCH_IRQ_GPIO) == 0) {
             s_touch_probe_pending = true;
-        if (!explicit_wake && s_touch_probe_pending) touch_wake = touch_confirms_wake();
+        }
+        if (!explicit_wake && touch_allowed && s_touch_probe_pending)
+            touch_wake = touch_confirms_wake();
         /* CPU从EXT1醒来不等于用户要求亮屏；仅确认触点或独立电源键/
          * 软件请求才能恢复显示。渐灭途中也执行相同检查，不被空IRQ打断。 */
         if (explicit_wake || touch_wake) {
@@ -496,9 +543,13 @@ esp_err_t screen_power_init(lv_display_t *display, lv_indev_t *input,
     s_original_touch_irq = touch->config.interrupt_callback;
     /* GPIO6/GPIO10 are RTC GPIOs on P4. EXT1 does not replace their normal
      * negative-edge IRQ configuration with a level IRQ while the UI is awake.
-     * Keep peripheral retention enabled for the current DSI/I2C drivers. */
-    esp_err_t ret = esp_sleep_enable_ext1_wakeup_io(
-        (1ULL << TOUCH_IRQ_GPIO) | (1ULL << PMIC_IRQ_GPIO), ESP_EXT1_WAKEUP_ANY_LOW);
+     * Keep peripheral retention enabled for the current DSI/I2C drivers.
+     * 防误触可能在 screen_power_init 之前由 main 从 NVS 恢复，因此初始
+     * 掩码按当前设置决定是否包含触摸引脚；电源键始终保留。之后每次
+     * 进入 Light-sleep 前还会再次按最新设置更新。 */
+    uint64_t ext1_mask = 1ULL << PMIC_IRQ_GPIO;
+    if (atomic_load(&s_touch_wake)) ext1_mask |= 1ULL << TOUCH_IRQ_GPIO;
+    esp_err_t ret = esp_sleep_enable_ext1_wakeup_io(ext1_mask, ESP_EXT1_WAKEUP_ANY_LOW);
     if (ret != ESP_OK) return ret;
     ret = esp_lcd_touch_register_interrupt_callback(touch, touch_irq);
     if (ret != ESP_OK) return ret;
@@ -518,6 +569,7 @@ esp_err_t screen_power_init(lv_display_t *display, lv_indev_t *input,
         esp_lcd_touch_register_interrupt_callback(touch, s_original_touch_irq);
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Lock timeout=10s, touch wake=GPIO6, PMIC key wake=GPIO10");
+    ESP_LOGI(TAG, "Lock timeout=10s, touch wake=%s (GPIO6), PMIC key wake=GPIO10",
+             atomic_load(&s_touch_wake) ? "allowed" : "disabled");
     return ESP_OK;
 }

@@ -21,6 +21,8 @@ static bool statusbar_visible = true;
 static ui_mode_t test_mode = UI_MODE_VIDEO;
 
 const lv_font_t *ui_font_18(void) { return &lv_font_montserrat_18; }
+/* 壁纸模块由独立测试覆盖；这里只需要链接符号，列表布局/手势不应变化。 */
+lv_obj_t *wallpaper_create_canvas(lv_obj_t *parent) { (void)parent; return NULL; }
 void ui_statusbar_set_visible(bool visible) { statusbar_visible = visible; }
 bool ui_lockscreen_is_visible(void) { return false; }
 ui_mode_t ui_manager_get_current_mode(void) { return test_mode; }

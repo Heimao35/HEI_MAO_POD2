@@ -13,6 +13,9 @@ static bool ui_locked, sd_locked, mounted = true, present = true, asset_availabl
 static unsigned sd_accesses;
 static unsigned task_creations, notifications, scans, decodes, engines, deletes;
 static bool cancel_during_decode, fail_engine;
+/* 模拟“JPEG 引擎尚在创建”或“引擎被其他模块占用”的瞬态错误；锁屏必须
+ * 保留当前帧重试，而不是把帧读掉后从中间开始播放。 */
+static unsigned transient_failures;
 static bool show_status_time;
 static TickType_t ticks;
 static lv_obj_t *bar;
@@ -79,6 +82,10 @@ esp_err_t jpeg_codec_process(const jpeg_decode_cfg_t *cfg,
 {
     (void)timeout_ms;
     if (fail_engine) return ESP_FAIL;
+    if (transient_failures) {
+        --transient_failures;
+        return ESP_ERR_INVALID_STATE;
+    }
     return jpeg_decoder_process((jpeg_decoder_handle_t)(void *)2, cfg,
                                 input, input_len, output, output_cap, output_len);
 }
@@ -257,6 +264,17 @@ int main(void)
     asset_available=false; ui_lockscreen_show(); run_requested();
     assert(decodes==4 && ui_lockscreen_anim_is_idle() && engines==deletes && task_creations==1);
     puts("PASS Flash cache replays without mounted/present SD, no SD lock, no worker or engine accumulation");
+
+    /* 引擎尚未就绪/被占用：前两次返回 INVALID_STATE，第三次成功。锁屏
+     * 必须重试同一帧，等引擎可用后仍显示第一帧，而不是把帧消耗掉。 */
+    asset_available = true;
+    transient_failures = 2;
+    ui_lockscreen_show();
+    run_requested();
+    assert(decodes == 5 && s_frame_bufs[s_frame_index ^ 1U][0] == 0x5A);
+    assert(ui_lockscreen_anim_is_idle() && engines == deletes);
+    puts("PASS transient decoder unavailability preserves the frame and then decodes it");
+
     lv_deinit(); free(s_frame_bufs[0]); free(s_frame_bufs[1]);
     puts("ALL LOCKSCREEN TESTS PASSED"); return 0;
 }

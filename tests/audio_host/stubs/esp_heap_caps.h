@@ -27,3 +27,6 @@ static inline void *test_heap_realloc(void *p,size_t n)
 #define heap_caps_malloc(n,c) test_heap_alloc(64,n)
 #define heap_caps_realloc(p,n,c) test_heap_realloc(p,n)
 #define heap_caps_free test_heap_free
+/* 测试不模拟内部 DMA 堆容量；生产代码只在 I2S 重试日志中打印该值。 */
+static inline size_t heap_caps_get_free_size(unsigned caps)
+{(void)caps;return 0;}

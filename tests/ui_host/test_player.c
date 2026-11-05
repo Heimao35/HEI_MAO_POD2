@@ -29,6 +29,14 @@ void ui_motion_settings_close_for_lock(void) {}
 bool ui_bluetooth_settings_is_visible(void) { return false; }
 void ui_bluetooth_settings_create(lv_obj_t *parent) { (void)parent; }
 void ui_bluetooth_settings_close_for_lock(void) {}
+/* “锁屏和壁纸”子页与壁纸选择页由独立测试覆盖；ui_manager.c 只需要
+ * 它们的存在性和收起/可见性符号，手势/锁屏顺序由本测试继续验证。 */
+bool ui_lock_wallpaper_settings_is_visible(void) { return false; }
+void ui_lock_wallpaper_settings_create(lv_obj_t *parent) { (void)parent; }
+void ui_lock_wallpaper_settings_close_for_lock(void) {}
+bool ui_wallpaper_picker_is_visible(void) { return false; }
+void ui_wallpaper_picker_create(lv_obj_t *parent) { (void)parent; }
+void ui_wallpaper_picker_close_for_lock(void) {}
 bool bt_audio_is_connected(void) { return false; }
 /* ui_manager.c publishes the Bluetooth icon through the shared device state. */
 ui_device_state_t *ui_get_device_state(void) { static ui_device_state_t state; return &state; }
@@ -44,6 +52,9 @@ void ui_mode_panel_show(void) {} void ui_mode_panel_hide(void) {}
 void ui_adj_panel_show(void) {} void ui_adj_panel_hide(void) {}
 
 void ui_statusbar_update(void) {} void ui_lockscreen_update(void) {}
+/* 壁纸层由独立测试覆盖；ui_manager 只需要创建它的符号。返回 NULL 表示
+ * 没有壁纸，这一层保持原有的纯色背景，音乐页/手势布局不受影响。 */
+lv_obj_t *wallpaper_create_canvas(lv_obj_t *parent) { (void)parent; return NULL; }
 void ui_video_player_create(lv_obj_t *p) { (void)p; }
 void ui_video_player_on_mode_enter(void) {}
 void ui_video_player_on_mode_leave(void) {}

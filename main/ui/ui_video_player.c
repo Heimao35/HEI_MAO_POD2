@@ -1068,7 +1068,10 @@ void ui_video_player_create(lv_obj_t *parent)
     lv_obj_set_size(s_page, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_page, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(s_page, UI_COLOR_PAGE_BG, 0);
-    lv_obj_set_style_bg_opa(s_page, LV_OPA_COVER, 0);
+    /* 页面背景透明：壁纸层固定在模式页最底层（ui_manager 创建），
+     * 列表容器本来透明，预览格保持不透明；全屏播放器有独立黑色背景，
+     * 会完整盖住壁纸。没有壁纸时看到的是壁纸层的原页面底色。 */
+    lv_obj_set_style_bg_opa(s_page, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_page, 0, 0);
     lv_obj_set_style_radius(s_page, 0, 0);
     lv_obj_set_style_pad_all(s_page, 0, 0);

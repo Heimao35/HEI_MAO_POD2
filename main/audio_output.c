@@ -350,6 +350,11 @@ static esp_err_t skip_mp3_metadata(void)
     s_file_offset=offset;return ESP_OK;
 }
 
+/* open_session 需要在打开 FLAC/MP3 解码器之前预留 I2S 通道；这两个
+ * 辅助函数定义在文件后面，先声明。 */
+static bool supported_rate(uint32_t rate);
+static esp_err_t create_tx(uint32_t sample_rate);
+
 static esp_err_t open_session(command_t c)
 {
     if(!sd_card_io_lock(pdMS_TO_TICKS(100)))return ESP_ERR_TIMEOUT;
@@ -380,6 +385,19 @@ static esp_err_t open_session(command_t c)
     s_current=c;
     atomic_store(&s_detached,false);
     s_mp3_session=!info.is_flac;
+    /* 真正的播放请求：在打开音频解码器之前先预留 I2S 通道和 DMA 缓冲。
+     * FLAC/MP3 解码器（尤其 FLAC）打开的瞬间会占用内部内存，而 I2S 需要
+     * 8×2KiB 的 MALLOC_CAP_DMA|INTERNAL 缓冲；实测首次上电首次播放时
+     * 解码器先分配会把内部 DMA 堆压到不足 2KiB，i2s_alloc_dma_desc()
+     * 直接 NO_MEM，整首歌被判定失败。probe 已经得到采样率，先建通道，
+     * 后续 configure_tx() 只需按解码器实际格式重配时钟。
+     * 仅在 c.play 时执行：保持“开机曲库扫描阶段不分配 GDMA”的既有设计，
+     * 单纯选中/恢复歌曲不会提前占用 I2S。 */
+    if(c.play) {
+        uint32_t preroll=supported_rate(info.sample_rate)?info.sample_rate:48000U;
+        esp_err_t tx_ret=create_tx(preroll);
+        if(tx_ret!=ESP_OK)return tx_ret;
+    }
     esp_audio_simple_dec_cfg_t cfg={.dec_type=info.is_flac?ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:ESP_AUDIO_SIMPLE_DEC_TYPE_MP3};
     esp_audio_err_t err=esp_audio_simple_dec_open(&cfg,&s_decoder);
     if(err!=ESP_AUDIO_ERR_OK)return ESP_ERR_NOT_SUPPORTED;
@@ -657,6 +675,45 @@ static void fail_current(esp_err_t ret,command_t failed)
      * 错误的请求版本，不丢弃用户在阻塞期间新提交的播放/暂停意图。 */
     if(s_cmd.serial==s_current.serial && s_cmd.request==failed.request)s_cmd.play=false;
     portEXIT_CRITICAL(&s_cmd_mux);
+}
+
+/* I2S 首次创建需要 8×2KiB 的内部 DMA 缓冲；FLAC/MP3 解码器刚打开或
+ * 后台扫描/封面工作尚未结束时，内部 DMA 堆可能暂时不足。这种错误不应
+ * 当成“这首歌无法播放”：关闭本次会话（释放解码器缓冲），保留用户的
+ * 播放意图，250ms 后由 output_step 自动从头重新打开（open_session 会
+ * 在解码器之前先建 I2S）。最多重试 5 秒，之后仍失败才走 fail_current。
+ * 新的选歌/播放/暂停请求（serial/request 变化）立即取消旧的等待。 */
+#define PREPARE_RETRY_MAX 20U
+#define PREPARE_RETRY_MS  250U
+static TickType_t s_prepare_retry_at;
+static uint32_t s_prepare_retry_serial,s_prepare_retry_request;
+static unsigned s_prepare_retries;
+
+static bool prepare_retry_pending(command_t c)
+{
+    return s_prepare_retries && s_prepare_retry_serial==c.serial &&
+           s_prepare_retry_request==c.request &&
+           (int32_t)(xTaskGetTickCount()-s_prepare_retry_at)<0;
+}
+static bool prepare_retry_schedule(command_t c)
+{
+    /* 只在 I2S 尚未创建且用户仍想播放时重试；其它 NO_MEM（输出缓冲增长、
+     * 视频会话等）仍按原错误处理。s_tx 已存在说明 DMA 已经分配成功，
+     * 后续失败不是这类瞬态资源问题。 */
+    if(s_tx || !c.play || c.index==UINT32_MAX)return false;
+    if(s_prepare_retry_serial!=c.serial || s_prepare_retry_request!=c.request) {
+        s_prepare_retry_serial=c.serial;
+        s_prepare_retry_request=c.request;
+        s_prepare_retries=0;
+    }
+    if(s_prepare_retries>=PREPARE_RETRY_MAX)return false;
+    ++s_prepare_retries;
+    s_prepare_retry_at=xTaskGetTickCount()+pdMS_TO_TICKS(PREPARE_RETRY_MS);
+    close_session();
+    ESP_LOGW(TAG,"I2S DMA unavailable; retry %u/%u (DMA free %u B)",
+        s_prepare_retries,(unsigned)PREPARE_RETRY_MAX,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL));
+    return true;
 }
 static void poll_headphone(void)
 {
@@ -984,14 +1041,26 @@ static void output_step(void)
         if(c.index!=UINT32_MAX) {
             esp_err_t ret=open_session(c);
             if(ret==ESP_ERR_TIMEOUT) {s_current.serial=c.serial-1;return;}
-            if(ret!=ESP_OK) {fail_current(ret,c);return;}
+            if(ret!=ESP_OK) {
+                if(ret==ESP_ERR_NO_MEM && prepare_retry_schedule(c))return;
+                fail_current(ret,c);return;
+            }
         }
     }
     if(s_decoder && !card_current()) {fail_current(ESP_ERR_INVALID_STATE,c);close_session();return;}
     if(c.play && !s_decoder && c.index!=UINT32_MAX) {
+        /* I2S DMA 暂不可用时的 250ms 等待窗口；新请求会改变 identity，
+         * 不进入等待。 */
+        if(prepare_retry_pending(c)) {
+            ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(20));
+            return;
+        }
         esp_err_t ret=open_session(c);
         if(ret==ESP_ERR_TIMEOUT)return;
-        if(ret!=ESP_OK) {fail_current(ret,c);return;}
+        if(ret!=ESP_OK) {
+            if(ret==ESP_ERR_NO_MEM && prepare_retry_schedule(c))return;
+            fail_current(ret,c);return;
+        }
     }
     command_t latest=command();
     if(latest.serial!=c.serial || latest.play!=c.play)return;
@@ -1028,7 +1097,13 @@ static void output_step(void)
     TickType_t step_before=xTaskGetTickCount();
     bool progress;esp_err_t ret=decode_step(&progress);
     record_max(&s_step_max,step_before);
-    if(ret!=ESP_OK && ret!=ESP_ERR_TIMEOUT) {fail_current(ret,c);return;}
+    if(ret!=ESP_OK && ret!=ESP_ERR_TIMEOUT) {
+        /* 首次准备阶段 I2S 通道/DMA 暂时分配不到：保留播放意图，关闭
+         * 会话后自动重试；解码器已关闭，下一次 open_session 会先建 I2S
+         * 再打开解码器，等价于用户切歌重来，但不需要用户操作。 */
+        if(ret==ESP_ERR_NO_MEM && prepare_retry_schedule(c))return;
+        fail_current(ret,c);return;
+    }
     if(!progress || ret==ESP_ERR_TIMEOUT)
         ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(2));
 

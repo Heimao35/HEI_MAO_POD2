@@ -26,6 +26,9 @@
 #include "ui_clock_settings.h"
 #include "ui_motion_settings.h"
 #include "ui_bluetooth_settings.h"
+#include "ui_lock_wallpaper_settings.h"
+#include "ui_wallpaper_picker.h"
+#include "wallpaper.h"
 #include "bt_audio.h"
 #include "esp_log.h"
 
@@ -36,6 +39,13 @@ static ui_mode_t s_current_mode = UI_MODE_MUSIC;
 
 /* ---- 各模式页面指针数组，按 ui_mode_t 索引 ---- */
 static lv_obj_t *s_mode_pages[UI_MODE_MAX] = {NULL};
+
+/* ---- 固定壁纸层 ----
+ * 位置在所有模式页面之下，模式切换只滑动页面对象，壁纸层不参与动画。
+ * 图片/视频/电子书页面自身背景透明，首页直接透出该层；音乐页和锁屏
+ * 页保持不透明，所以壁纸只出现在这三个主界面（符合功能要求）。没有
+ * 设置壁纸时这一层就是原来的 UI_COLOR_PAGE_BG 纯色背景。 */
+static lv_obj_t *s_wallpaper_layer;
 
 /* ---- 锁屏遮挡时临时隐藏当前模式页 ----
  * 锁屏页是不透明的全屏对象，但 LVGL 不会因为上层完全遮挡而跳过下层
@@ -122,9 +132,13 @@ static void gesture_released_cb(lv_event_t *e)
     /* 子页滚轮/开关独占触摸，不让边缘/底部滑动穿透到原设置页或播放器。
      * 姿态感应子页没有滚轮，但同样必须独占，否则在返回动画途中从底部
      * 上滑会把下层的设置主页收起，留下一个悬空的子页。蓝牙子页含可
-     * 滚动设备列表，也必须独占，否则列表拖到端部会把设置主页收起。 */
+     * 滚动设备列表，也必须独占，否则列表拖到端部会把设置主页收起。
+     * “锁屏和壁纸”子页与壁纸选择页同理：壁纸页自己处理右滑返回和
+     * 缩略图滚动，外层管理器不再响应任何手势。 */
     if (ui_clock_settings_is_visible() || ui_motion_settings_is_visible() ||
-        ui_bluetooth_settings_is_visible()) return;
+        ui_bluetooth_settings_is_visible() ||
+        ui_lock_wallpaper_settings_is_visible() ||
+        ui_wallpaper_picker_is_visible()) return;
     lv_indev_t *indev = lv_indev_active();
     if (!indev) return;
 
@@ -306,6 +320,22 @@ void ui_manager_init(void)
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* ---- 0. 固定壁纸层 ----
+     * 必须是屏幕的第一个子对象：位于音乐/视频/图片/电子书页面和锁屏
+     * 之下。使用与模式页相同的底色，没有壁纸时视觉完全不变。
+     * 该层不接触摸、不滚动，作为背景不参与任何手势或模式切换动画。 */
+    s_wallpaper_layer = lv_obj_create(scr);
+    lv_obj_set_size(s_wallpaper_layer, UI_HOR_RES, UI_VER_RES);
+    lv_obj_set_pos(s_wallpaper_layer, 0, 0);
+    lv_obj_set_style_bg_color(s_wallpaper_layer, UI_COLOR_PAGE_BG, 0);
+    lv_obj_set_style_bg_opa(s_wallpaper_layer, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_wallpaper_layer, 0, 0);
+    lv_obj_set_style_radius(s_wallpaper_layer, 0, 0);
+    lv_obj_set_style_pad_all(s_wallpaper_layer, 0, 0);
+    lv_obj_remove_flag(s_wallpaper_layer,
+                       LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    wallpaper_create_canvas(s_wallpaper_layer);
+
     /* ---- 1. 创建各模式页面 ---- */
     ui_music_player_create(scr);
     s_mode_pages[UI_MODE_MUSIC] = ui_music_player_get_page();
@@ -350,6 +380,11 @@ void ui_manager_init(void)
      * z-order；显示时再 move_foreground。它上电默认关闭，不读 NVS、
      * 不启动扫描，因此这里只建对象，不影响开机时间。 */
     ui_bluetooth_settings_create(scr);
+    /* “锁屏和壁纸”子页（防误触/锁屏设置占位/壁纸入口）与上述子页同级，
+     * 创建在状态栏之前以保持原有 z-order；壁纸选择页也在此创建，
+     * 它只在被打开时 move_foreground，并把状态栏重新置顶。 */
+    ui_lock_wallpaper_settings_create(scr);
+    ui_wallpaper_picker_create(scr);
 
     /* ---- 5. 状态栏（最顶层） ---- */
     ui_statusbar_create(scr);
@@ -453,6 +488,10 @@ void ui_manager_lock(void)
     ui_motion_settings_close_for_lock();
     /* 蓝牙子页同样收起并停止扫描；蓝牙连接和音频输出不在锁屏时断开。 */
     ui_bluetooth_settings_close_for_lock();
+    /* 壁纸选择页先于它所属的“锁屏和壁纸”子页收起：取消缩略图/全屏
+     * 解码并恢复图片查看器回调，避免锁屏 MJPEG 与图片 JPEG 同时解码。 */
+    ui_wallpaper_picker_close_for_lock();
+    ui_lock_wallpaper_settings_close_for_lock();
     /* 锁屏 MJPEG 和视频播放器不能同时占用硬件 JPEG。这里先隐藏播放器并
      * 投递停止请求（保留已加载的列表页/缩略图），锁屏动画会等待视频
      * worker 空闲后再解码。图片查看器同样收起全屏并取消在途请求。 */

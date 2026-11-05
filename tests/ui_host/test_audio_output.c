@@ -441,6 +441,31 @@ int main(void)
     assert(clock_reconfigs==reconfigs_before && !init_nomem_attempts);
     assert(i2s_del_channel(s_tx)==ESP_OK);s_tx=NULL;s_tx_rate=0;
     puts("PASS repeated DMA init out-of-memory releases channels and permits clean retry");
+    /* 首次准备阶段 I2S DMA 暂时不足：自动关闭会话释放解码器内存、保留
+     * 播放意图，250ms 后从头重试；用户不需要再点一次播放。前两次
+     * init 返回 NO_MEM，第三次成功。 */
+    init_nomem_attempts=2;
+    /* 上一段短曲测试删除了 fixture；重新写一个小文件供真实 open_session
+     * 打开（解码器是替身，不解析内容）。 */
+    FILE *retry_file=fopen(fixture,"wb");assert(retry_file);
+    uint8_t retry_header[42]={0};memcpy(retry_header,"fLaC",4);
+    retry_header[4]=0x80;retry_header[7]=34;
+    assert(fwrite(retry_header,1,42,retry_file)==42);
+    for(unsigned i=0;i<64*1024;++i)assert(fputc(0x21,retry_file)!=EOF);
+    fclose(retry_file);fixture_size=42+64*1024;
+    audio_output_select(0,generation,true);
+    for(unsigned i=0;i<800 && !audio_output_is_playing();++i) {
+        output_iteration();advance_ms(1);
+    }
+    assert(audio_output_is_playing() && audio_output_is_play_requested() &&
+           s_tx && tx_enabled);
+    puts("PASS I2S DMA no-memory during preparation retries automatically without losing play intent");
+    audio_output_set_playing(false);
+    steps(3);
+    assert(!tx_enabled);
+    assert(close_session());remove(fixture);
+    assert(i2s_del_channel(s_tx)==ESP_OK);
+    s_tx=NULL;s_tx_rate=0;
     /* 视频 PCM 模式：复用同一I2S/DAC/ring；预缓冲到高水位后启动TX，
      * DMA消费的真实帧数就是视频主时钟；flush归零、暂停停TX、close归还。 */
     assert(!s_tx && s_tx_rate==0 && !tx_enabled);

@@ -93,6 +93,8 @@ bool sd_card_is_present(void) { return true; }
 const lv_font_t *ui_font_16(void) { return &lv_font_montserrat_16; }
 const lv_font_t *ui_font_18(void) { return &lv_font_montserrat_18; }
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
+/* 壁纸模块由独立测试覆盖；这里只需要链接符号，首页布局/手势不应变化。 */
+lv_obj_t *wallpaper_create_canvas(lv_obj_t *parent) { (void)parent; return NULL; }
 
 /* ---------------- LVGL harness ---------------- */
 static uint32_t ticks;

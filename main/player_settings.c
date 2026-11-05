@@ -1,5 +1,6 @@
 #include "player_settings.h"
 #include "ui/ui_motion_settings.h"
+#include "ui/ui_lock_wallpaper_settings.h"
 #include "bt_audio.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -50,6 +51,7 @@ static size_t encode(const player_settings_t *v, uint8_t *b)
     size_t n = SETTINGS_HEADER;
     uint8_t muted=v->muted, automatic=v->auto_brightness;
     uint8_t motion_steps=v->motion_steps, motion_wake=v->motion_wake;
+    uint8_t anti_touch=v->anti_touch;
     n=add_field(b,n,1,&v->brightness,1); n=add_field(b,n,2,&v->volume,1);
     n=add_field(b,n,3,&muted,1); n=add_field(b,n,4,&automatic,1);
     n=add_field(b,n,5,v->song_folder,(uint16_t)strlen(v->song_folder));
@@ -57,6 +59,10 @@ static size_t encode(const player_settings_t *v, uint8_t *b)
     /* 7/8 为新增的可选单字节开关字段。旧固件按未知 ID 跳过，因此不需要
      * 升级版本；旧数据缺少这两个字段时解码默认值保持关闭。 */
     n=add_field(b,n,7,&motion_steps,1); n=add_field(b,n,8,&motion_wake,1);
+    /* 11 为新增的可选防误触开关（单字节 0/1）。与 7/8 相同，旧固件按
+     * 未知 ID 跳过；旧数据缺少该字段时默认关闭（熄屏触摸仍可唤醒），
+     * 与升级前的行为一致，不需要升级版本号。 */
+    n=add_field(b,n,11,&anti_touch,1);
     /* 9 为可选配对记录：[valid][bda 6][name<=32]。未配对时不写该字段，
      * 旧固件按未知 ID 跳过，因此同样不需要升级版本。 */
     if (v->bt_paired) {
@@ -93,13 +99,13 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
         return ESP_ERR_INVALID_SIZE;
     if (get16(b+4)!=SETTINGS_VERSION) return ESP_ERR_NOT_SUPPORTED;
     if (get32(b+8)!=crc32(b+SETTINGS_HEADER,n-SETTINGS_HEADER)) return ESP_ERR_INVALID_RESPONSE;
-    player_settings_t tmp = {.brightness=80,.volume=50};
+    player_settings_t tmp = {.brightness=80,.volume=50,.anti_touch=false};
     unsigned seen=0;
     for (size_t off=SETTINGS_HEADER; off<n;) {
         if (n-off<3) return ESP_ERR_INVALID_SIZE;
         uint8_t id=b[off++]; uint16_t len=get16(b+off); off+=2;
         if (len>n-off) return ESP_ERR_INVALID_SIZE;
-        if (id>=1 && id<=10) {
+        if (id>=1 && id<=11) {
             if (seen & (1U<<id)) return ESP_ERR_INVALID_RESPONSE;
             seen |= 1U<<id;
         }
@@ -121,6 +127,11 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
             if (len!=1) return ESP_ERR_INVALID_SIZE;
             if (b[off]>1) return ESP_ERR_INVALID_ARG;
             if (id==7) tmp.motion_steps=b[off]; else tmp.motion_wake=b[off];
+        } else if (id==11) {
+            /* 防误触开关同样只接受单字节 0/1；缺少字段时保持默认关闭。 */
+            if (len!=1) return ESP_ERR_INVALID_SIZE;
+            if (b[off]>1) return ESP_ERR_INVALID_ARG;
+            tmp.anti_touch=b[off];
         } else if (id==9) {
             /* 配对记录：valid + 6 字节 BDA + 至多 32 字节名称。名称必须
              * 以 TLV 长度结束，不接受内嵌 NUL；全 0 BDA 视为损坏。 */
@@ -202,6 +213,12 @@ void player_settings_get_motion(bool *steps, bool *wake)
     if (steps) *steps=s_ram.motion_steps;
     if (wake) *wake=s_ram.motion_wake;
 }
+void player_settings_get_anti_touch(bool *anti_touch)
+{
+    /* 只读 RAM 快照；调用方随后把它套用到“锁屏和壁纸”开关和
+     * screen_power 的触摸唤醒允许标志。 */
+    if (anti_touch) *anti_touch=s_ram.anti_touch;
+}
 void player_settings_get_bluetooth(bool *valid, uint8_t bda[6],
                                    char *name, size_t name_size)
 {
@@ -228,6 +245,9 @@ void player_settings_capture(player_settings_t *out)
      * 但生产路径中 capture 只在 ui_manager_init() 之后才被调用。 */
     s_ram.motion_steps=ui_motion_settings_steps_enabled();
     s_ram.motion_wake=ui_motion_settings_wake_enabled();
+    /* 防误触开关由“锁屏和壁纸”子页维护；与姿态开关相同，在电源
+     * worker 的既有 LVGL 锁快照中读取，3 秒合并后写入 NVS。 */
+    s_ram.anti_touch=ui_lock_wallpaper_settings_anti_touch_enabled();
     /* 配对记录由链路 worker 在 A2DP 连接成功后发布；这里只取 RAM 快照。
      * 未配对时 get_paired 会清零输出，s_ram 中不会残留旧地址。 */
     s_ram.bt_paired=bt_audio_get_paired(s_ram.bt_paired_bda,
@@ -297,6 +317,7 @@ bool player_settings_equal(const player_settings_t *a, const player_settings_t *
     if (!(a->brightness==b->brightness && a->volume==b->volume &&
           a->muted==b->muted && a->auto_brightness==b->auto_brightness &&
           a->motion_steps==b->motion_steps && a->motion_wake==b->motion_wake &&
+          a->anti_touch==b->anti_touch &&
           a->bt_paired==b->bt_paired &&
           !memcmp(a->bt_paired_bda,b->bt_paired_bda,6) &&
           !strcmp(a->bt_paired_name,b->bt_paired_name) &&

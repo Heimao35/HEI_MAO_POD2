@@ -30,6 +30,22 @@ void ui_image_viewer_close_for_lock(void);
 /** @brief 是否正在全屏查看图片（ui_manager 用于抑制状态栏下拉设置）。 */
 bool ui_image_viewer_is_fullscreen_active(void);
 
+/**
+ * @brief 暂时把 image_viewer 后台回调交给其他页面（壁纸选择页）。
+ *
+ * 必须在 LVGL 锁内调用：先取消本页在途的全屏/缩略图请求，再注销回调，
+ * 后台随后不会有任何结果发布到已隐藏的图片查看器。
+ */
+void ui_image_viewer_backend_detach(void);
+
+/**
+ * @brief 恢复图片查看器自己的后台回调。
+ *
+ * 接管期间被取消的缩略图不会自动重发；这里作废网格槽位身份，若总览
+ * 仍可见则立即重新请求，回到图片模式时不需要用户滚动才恢复。
+ */
+void ui_image_viewer_backend_attach(void);
+
 #ifdef __cplusplus
 }
 #endif

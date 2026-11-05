@@ -12,6 +12,7 @@
 #include "ui_clock_settings.h"
 #include "ui_motion_settings.h"
 #include "ui_bluetooth_settings.h"
+#include "ui_lock_wallpaper_settings.h"
 #include "bt_audio.h"
 
 static lv_obj_t *s_page = NULL; /**< 设置页面容器 */
@@ -44,7 +45,10 @@ static const struct {
     { LV_SYMBOL_BLUETOOTH,"蓝牙"       },
     { LV_SYMBOL_GPS,      "姿态感应"   },  /* 姿态感应用 GPS/指南针图标代替 */
     { NULL,               "时钟"       },  /* 小表盘使用矢量绘制，不依赖字库图标 */
-    { LV_SYMBOL_IMAGE,    "锁屏设置"   },  /* 锁屏页面设置 */
+    /* “锁屏和壁纸”是原“锁屏设置”入口的改名：点击后进入独立的
+     * 锁屏/壁纸设置子页（防误触、锁屏设置占位、壁纸选择）。只替换
+     * 文案，图标、按钮尺寸、两列网格位置和点击逻辑仍由本文件统一管理。 */
+    { LV_SYMBOL_IMAGE,    "锁屏和壁纸" },
 };
 #define ITEM_COUNT (sizeof(s_items) / sizeof(s_items[0]))
 
@@ -116,9 +120,9 @@ static void bt_item_long_pressed_cb(lv_event_t *e)
  * 索引 1 是“蓝牙”：短按切换电源意图（开关状态不写 NVS，上电默认
  * 关闭），长按已由 bt_item_long_pressed_cb() 打开设置页，这里必须
  * 丢弃同一次交互产生的 CLICKED，避免“进页面顺带切换开关”。
- * 索引 2 是“姿态感应”，索引 3 是“时钟”；其余条目保留原入口，
- * 后续按各自功能接入。两个已存在的子页都只是覆盖在设置主页上的
- * 全屏页面，隐藏/显示不改变设置主页的网格、状态栏和手势。
+ * 索引 2 是“姿态感应”，索引 3 是“时钟”，索引 4 是“锁屏和壁纸”；
+ * 其余条目保留原入口，后续按各自功能接入。所有子页都只是覆盖在
+ * 设置主页上的全屏页面，隐藏/显示不改变设置主页的网格、状态栏和手势。
  */
 static void item_click_cb(lv_event_t *e)
 {
@@ -136,6 +140,9 @@ static void item_click_cb(lv_event_t *e)
     }
     else if(idx==2) ui_motion_settings_show();
     else if(idx==3) ui_clock_settings_show();
+    /* 索引 4：锁屏和壁纸子页。页面样式/进出动画与姿态感应、时钟子页
+     * 一致；防误触开关和壁纸选择都在该子页内完成，不改变本页网格。 */
+    else if(idx==4) ui_lock_wallpaper_settings_show();
     /* 其余设置项保留原入口，后续按各自功能接入。 */
 }
 

@@ -23,6 +23,8 @@ void ui_statusbar_set_visible(bool visible) { status_visible=visible; }
 /* Settings-page regression includes the real ui_settings.c; the motion page is
  * out of scope here, so its entry point is a no-op double. */
 void ui_motion_settings_show(void) {}
+/* “锁屏和壁纸”子页同样只做链接占位；时钟测试不点击该入口。 */
+void ui_lock_wallpaper_settings_show(void) {}
 /* ui_settings.c 的蓝牙入口同样只做链接占位：时钟测试不点击蓝牙按钮，
  * 也不验证蓝牙状态机；最小 double 保持该页面可独立编译。 */
 static bool bt_power_double;

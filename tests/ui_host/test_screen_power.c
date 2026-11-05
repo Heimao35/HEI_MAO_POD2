@@ -126,9 +126,20 @@ esp_err_t rtc_gpio_deinit(gpio_num_t pin)
 esp_err_t rtc_gpio_hold_dis(gpio_num_t pin)
 { assert(pin==6 || pin==10 || pin==12); held_pads &= ~(1ULL<<pin); ++hold_releases; return ESP_OK; }
 esp_err_t esp_sleep_enable_ext1_wakeup_io(uint64_t mask, int mode)
-{ assert((mask == ((1ULL << 6) | (1ULL << 10)) || mask == (1ULL << 12)) && mode == ESP_EXT1_WAKEUP_ANY_LOW); enabled_ext1 |= mask; return ESP_OK; }
+{
+    /* 触摸(6)可以单独重新启用，也可以与电源键(10)一起；运动(12)单独。 */
+    assert((mask == (1ULL << 6) || mask == ((1ULL << 6) | (1ULL << 10)) ||
+            mask == (1ULL << 12)) && mode == ESP_EXT1_WAKEUP_ANY_LOW);
+    enabled_ext1 |= mask;
+    return ESP_OK;
+}
 esp_err_t esp_sleep_disable_ext1_wakeup_io(uint64_t mask)
-{ assert(mask == (1ULL << 12)); enabled_ext1 &= ~mask; return ESP_OK; }
+{
+    /* 防误触会在每次睡眠前移除触摸位；抬手亮屏关闭时移除运动位。 */
+    assert(mask == (1ULL << 6) || mask == (1ULL << 12));
+    enabled_ext1 &= ~mask;
+    return ESP_OK;
+}
 esp_err_t esp_sleep_enable_timer_wakeup(uint64_t us)
 { assert(!ui_locked && sd_locked && us == 1000000ULL); return ESP_OK; }
 uint64_t esp_sleep_get_ext1_wakeup_status(void) { return wake_status; }
@@ -436,6 +447,35 @@ int main(void)
     screen_power_step();
     assert(!(enabled_ext1 & (1ULL<<12)) && !held_pads);
     puts("PASS BMI270 sleep barrier, conditional EXT1 and HOLD cleanup do not bypass gesture validation");
+
+    /* 防误触：熄屏后触摸边沿和持续低电平都不能唤醒；进入 Light-sleep
+     * 前 GPIO6 必须从 EXT1 移除，电源键仍可正常唤醒。 */
+    screen_power_set_touch_wake(false);
+    touch_level = 1;
+    touch_points = 1;
+    unsigned touch_probes_off = touch_reads, resumes_off = resume_calls;
+    touch_edge(&touch);
+    test_ticks += 20;
+    screen_power_step();
+    assert(screen_power_is_dark() && touch_reads == touch_probes_off &&
+           resume_calls == resumes_off);
+    touch_level = 0;
+    for (unsigned n = 0; n < 5; ++n) {
+        test_ticks += 20;
+        screen_power_step();
+        assert(screen_power_is_dark() && touch_reads == touch_probes_off &&
+               resume_calls == resumes_off);
+    }
+    unsigned sleeps_off = sleep_calls;
+    screen_power_step();
+    assert(sleep_calls == sleeps_off + 1 && !(enabled_ext1 & (1ULL << 6)) &&
+           !held_pads);
+    screen_power_key_short_press();
+    screen_power_step();
+    assert(!screen_power_is_dark() && resume_calls == resumes_off + 1);
+    screen_power_set_touch_wake(true);
+    touch_level = 1;
+    puts("PASS anti-touch keeps the dark screen asleep on touch and removes GPIO6 from EXT1");
     lv_deinit();
     puts("ALL SCREEN POWER TESTS PASSED");
     return 0;

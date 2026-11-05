@@ -67,6 +67,32 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME ebook COMMAND ebook_tests)
 
+# “锁屏和壁纸”子页 + 壁纸选择页：卡片/开关、四列网格、全屏确认/取消、
+# 右滑返回以及 image_viewer 回调交接；SD/Flash/JPEG 全部使用替身。
+add_executable(lock_wallpaper_tests test_lock_wallpaper.c
+    ${REPO}/main/ui/ui_lock_wallpaper_settings.c
+    ${REPO}/main/ui/ui_wallpaper_picker.c)
+target_include_directories(lock_wallpaper_tests PRIVATE
+    ../screen_host/stubs stubs ../media_host/stubs "${REPO}/main" "${REPO}/main/ui")
+target_link_libraries(lock_wallpaper_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(lock_wallpaper_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable -ffunction-sections -fdata-sections)
+  target_link_options(lock_wallpaper_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+endif()
+add_test(NAME lock_wallpaper COMMAND lock_wallpaper_tests)
+
+# 壁纸 Flash 双槽存储：首次/第二次保存、CRC 回退、写中断保留旧槽，
+# 以及 front/back PSRAM 复用；用 NOR 语义的 RAM 分区替身。
+add_executable(wallpaper_tests test_wallpaper.c)
+target_include_directories(wallpaper_tests PRIVATE
+    stubs ../animation_host/stubs ../media_host/stubs "${REPO}/main")
+target_link_libraries(wallpaper_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(wallpaper_tests PRIVATE -O1 -Wall -Wextra -ffunction-sections -fdata-sections)
+  target_link_options(wallpaper_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+endif()
+add_test(NAME wallpaper COMMAND wallpaper_tests)
+
 # Chunked bulk reads: take/release the SD lock between 64 KiB blocks so the
 # audio worker can refill PCM, detach during a read, and pending-handle close.
 add_executable(sd_bulk_read_tests test_sd_bulk_read.c)

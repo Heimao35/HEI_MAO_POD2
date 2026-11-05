@@ -14,6 +14,9 @@ ui_device_state_t *ui_get_device_state(void) { return &state; }
 static bool motion_steps, motion_wake;
 bool ui_motion_settings_steps_enabled(void) { return motion_steps; }
 bool ui_motion_settings_wake_enabled(void) { return motion_wake; }
+/* “锁屏和壁纸”页由 UI 拥有防误触意图；本测试用可变替身验证快照读写。 */
+static bool anti_touch_double;
+bool ui_lock_wallpaper_settings_anti_touch_enabled(void) { return anti_touch_double; }
 /* 配对记录由蓝牙 worker 维护；本测试用可变替身验证快照会读取/保存它。 */
 static bool bt_paired_double;
 static uint8_t bt_bda_double[6];
@@ -62,18 +65,19 @@ int main(void)
     assert(player_settings_init()==ESP_OK && s_ready && !s_have_saved);
     player_settings_restore_ui(); assert(state.brightness==80 && state.volume==50);
     state.manual_brightness=29; state.brightness=29; state.volume=0; state.muted=true; state.auto_brightness=true;
-    motion_steps=true; motion_wake=true;
+    motion_steps=true; motion_wake=true; anti_touch_double=true;
     music_item_t item; memset(&item,0,sizeof(item)); strcpy(item.name,"中文歌曲目录"); strcpy(item.audio,"同名音频.flac");
     player_settings_set_song(&item);
     player_settings_t before,after;
     player_settings_capture(&before);
-    assert(before.motion_steps && before.motion_wake);
+    assert(before.motion_steps && before.motion_wake && before.anti_touch);
     assert(player_settings_save(&before)==ESP_OK && commits==1 && opens>=3);
     assert(player_settings_save(&before)==ESP_OK && commits==1); /* unchanged: no flash write */
     reboot_ram(); assert(player_settings_init()==ESP_OK);
-    bool steps=false,wake=false;
+    bool steps=false,wake=false,anti=false;
     player_settings_get_motion(&steps,&wake);
-    assert(steps && wake);
+    player_settings_get_anti_touch(&anti);
+    assert(steps && wake && anti);
     player_settings_restore_ui(); player_settings_capture(&after);
     assert(player_settings_equal(&before,&after));
     assert(state.brightness==29 && state.volume==0 && state.muted && state.auto_brightness);
@@ -130,12 +134,30 @@ int main(void)
     encoded[field7+3]=0; ++len;
     put16(encoded+6,len); put32(encoded+8,crc32(encoded+12,len-12));
     assert(decode(encoded,len,&after)==ESP_ERR_INVALID_SIZE);
-    /* 旧版快照没有 7/8 字段：解码必须成功且两个开关默认关闭。 */
-    len=encode(&before,encoded)-8;
-    after.motion_steps=after.motion_wake=true;
+    /* 旧版快照没有 7/8/11 字段：解码必须成功，姿态开关默认关闭，
+     * 防误触默认关闭（升级前熄屏触摸仍可唤醒）。字段 7/8/11 各占
+     * 4 字节，因此从尾部去掉 12 字节模拟旧固件写出的快照。 */
+    len=encode(&before,encoded)-12;
+    after.motion_steps=after.motion_wake=true; after.anti_touch=true;
     put16(encoded+6,len); put32(encoded+8,crc32(encoded+12,len-12));
-    assert(decode(encoded,len,&after)==ESP_OK && !after.motion_steps && !after.motion_wake);
-    puts("PASS motion TLV fields reject bad values/lengths and default off in older blobs");
+    assert(decode(encoded,len,&after)==ESP_OK &&
+           !after.motion_steps && !after.motion_wake && !after.anti_touch);
+    puts("PASS motion/anti-touch TLV fields reject bad values/lengths and default off in older blobs");
+    /* 防误触字段 11 与姿态字段同样只接受单字节 0/1。 */
+    len=encode(&before,encoded);
+    size_t field11=SETTINGS_HEADER;
+    while (field11+3<=len && encoded[field11]!=11)
+        field11+=3U+get16(encoded+field11+1);
+    assert(field11+4<=len && encoded[field11]==11 && get16(encoded+field11+1)==1);
+    encoded[field11+3]=2;
+    put32(encoded+8,crc32(encoded+12,len-12));
+    assert(decode(encoded,len,&after)==ESP_ERR_INVALID_ARG);
+    len=encode(&before,encoded);
+    put16(encoded+field11+1,2);
+    memmove(encoded+field11+4,encoded+field11+3,len-(field11+3));
+    encoded[field11+3]=1; ++len;
+    put16(encoded+6,len); put32(encoded+8,crc32(encoded+12,len-12));
+    assert(decode(encoded,len,&after)==ESP_ERR_INVALID_SIZE);
     disk_len=encode(&before,disk); put16(disk+4,2); reboot_ram();
     assert(player_settings_init()==ESP_ERR_NOT_SUPPORTED && !s_ready);
     unsigned written=sets;

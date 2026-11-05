@@ -30,9 +30,11 @@
 #include "ui_adj_panel.h"
 #include "ui_lockscreen.h"
 #include "ui_motion_settings.h"
+#include "ui_lock_wallpaper_settings.h"
 #include "sd_bulk_read.h"
 #include "sd_card.h"
 #include "lock_animation.h"
+#include "wallpaper.h"
 #include "pmic_axp2101.h"
 #include "music_player_adapter.h"
 #include "video_player.h"
@@ -354,6 +356,20 @@ void app_main(void)
     esp_err_t settings_ret=player_settings_init();
     if (settings_ret!=ESP_OK) ESP_LOGW(TAG,"Settings unavailable: %s",esp_err_to_name(settings_ret));
 
+    /* “锁屏和壁纸 → 防误触”：先写屏幕电源的触摸唤醒允许标志，再创建
+     * UI。screen_power_init() 晚于本处，但它的初始 EXT1 掩码会读取这个
+     * 原子值，因此冷启动时就不会把触摸引脚加入唤醒源。 */
+    bool anti_touch=false;
+    player_settings_get_anti_touch(&anti_touch);
+    screen_power_set_touch_wake(!anti_touch);
+
+    /* 壁纸只从 Flash 读取，不访问 SD；必须在 UI 创建前完成，让三个
+     * 首页 canvas 第一次创建时就拿到有效缓冲。分区不存在（未烧录新
+     * 分区表）时返回 NOT_FOUND，UI 仍正常启动，只是没有背景图。 */
+    esp_err_t wallpaper_ret=wallpaper_init();
+    if (wallpaper_ret!=ESP_OK && wallpaper_ret!=ESP_ERR_NOT_FOUND)
+        ESP_LOGW(TAG,"Wallpaper unavailable: %s",esp_err_to_name(wallpaper_ret));
+
     /* 蓝牙应用层状态机：上电默认关闭，不读 NVS、不启动 SDIO 或 Bluetooth。
      * 提前初始化是为了让随后创建的蓝牙设置页/状态栏读取确定的 OFF 状态；
      * 配对记录在下面恢复，真正的 SDIO worker 在 SD 卡初始化完成后启动。 */
@@ -388,6 +404,9 @@ void app_main(void)
     bool motion_steps = false, motion_wake = false;
     player_settings_get_motion(&motion_steps, &motion_wake);
     ui_motion_settings_restore(motion_steps, motion_wake);
+    /* “锁屏和壁纸”子页的防误触开关视觉随 NVS 恢复；anti_touch 已在
+     * player_settings_init 之后读取，这里不重复访问 Flash。 */
+    ui_lock_wallpaper_settings_restore(anti_touch);
     ui_adj_panel_update(); /* 同步恢复的音量/亮度及静音/自动亮度图标。 */
 
     /* 注册亮度/音量回调：UI只投递请求，显示/音频任务分别写硬件。 */

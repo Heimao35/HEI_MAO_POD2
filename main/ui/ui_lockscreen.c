@@ -99,6 +99,10 @@ static void play_mjpeg(unsigned generation)
      * FreeRTOS 的 tick 仍用于睡眠，但余数会在后续帧由截止时间补偿。 */
     const int64_t frame_us = 1000000LL / ANIM_FPS;
     int64_t next_us = esp_timer_get_time();
+    /* 解码器暂不可用时的重试计数与日志节流。正常路径不会进入；它只
+     * 用于 JPEG 引擎创建失败/被占用时保留当前帧。 */
+    unsigned decoder_retries = 0;
+    bool error_logged = false;
     while (atomic_load(&s_visible) && generation == atomic_load(&s_anim_generation)) {
         /* 解码到"不在显示"的那一块。LVGL 可能还在绘制上一帧，JPEG 的
          * 2DDMA 不能写它正在读的缓冲。解码失败或没抢到 LVGL 锁时不切换
@@ -110,6 +114,10 @@ static void play_mjpeg(unsigned generation)
                                             target, DECODE_BUF_SZ,
                                             &out_size, 1000);
         if (ret == ESP_OK) {
+            decoder_retries = 0;
+            /* 成功一帧后重新允许记录下一个真实解码错误，而不是被最初的
+             * 瞬态失败永久压掉。 */
+            error_logged = false;
             if (lvgl_port_lock(50)) {
                 /* 先确认本轮仍有效，再把解码输出直接设为 canvas 缓冲。
                  * 464x464 的 canvas 放在 460x460 的锁屏页里，右/下各 4
@@ -125,8 +133,26 @@ static void play_mjpeg(unsigned generation)
                 lvgl_port_unlock();
             }
         } else {
-            ESP_LOGW(TAG, "JPEG decode err: %s", esp_err_to_name(ret));
+            /* 引擎尚未创建（INVALID_STATE/NO_MEM）或被其他模块暂时占用
+             * （TIMEOUT）时，不要消耗当前帧：否则等引擎就绪后动画会从
+             * 中间开始，短动画甚至会在等待期间被读完、完全看不到。
+             * 固定让出 250ms 后重试同一帧，最多 5 秒；真正的格式/数据
+             * 错误仍跳到下一帧。日志只打印第一次，避免 60fps 刷屏。 */
+            bool transient = ret == ESP_ERR_INVALID_STATE ||
+                             ret == ESP_ERR_NO_MEM ||
+                             ret == ESP_ERR_TIMEOUT;
+            if (!error_logged) {
+                ESP_LOGW(TAG, "JPEG decode err: %s%s", esp_err_to_name(ret),
+                         transient ? "; retrying same frame" : "");
+                error_logged = true;
+            }
+            if (transient) {
+                if (++decoder_retries > 20) break;
+                vTaskDelay(pdMS_TO_TICKS(250));
+                continue;
+            }
         }
+        decoder_retries = 0;
 
         next_us += frame_us;
         int64_t now = esp_timer_get_time();

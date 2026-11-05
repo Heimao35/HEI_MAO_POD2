@@ -55,6 +55,15 @@ extern "C" {
 #define UI_COLOR_SLIDER_BG      lv_color_hex(0x484848)
 /** 按键/卡片按下时的中性提亮色；与白色描边配合，不改变布局。 */
 #define UI_COLOR_PRESSED_BG     lv_color_hex(0x3A3A3A)
+/**
+ * 图片/电子书“首页”卡片的不透明度。
+ *
+ * 卡片底色仍是 UI_COLOR_LIST_ROW_BG，但允许用户壁纸从卡片后面透出：
+ * 70% 不透明度在深色照片上仍能保证 22px 白色标题清晰，同时能明显看到
+ * 背景图；调整此值即可整体改变两处首页卡片的通透程度。只影响首页
+ * 卡片，不改变总览/书架/阅读页和播放器的既有背景。
+ */
+#define UI_HOME_CARD_BG_OPA     LV_OPA_70
 
 /**
  * @brief 为可点击对象添加统一按下反馈：中性提亮 + 2px 白色描边。

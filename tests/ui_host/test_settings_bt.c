@@ -5,6 +5,7 @@
  * screen child tree) so this test does not need the Bluetooth page's statics. */
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "lvgl.h"
 
@@ -12,7 +13,7 @@ const lv_font_t *ui_font_14(void) { return &lv_font_montserrat_14; }
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 
 static bool status_visible = true;
-static unsigned clock_shown, motion_shown, bt_shown;
+static unsigned clock_shown, motion_shown, bt_shown, lock_page_shown;
 static unsigned bt_set_calls;
 static bool bt_enabled;
 
@@ -20,6 +21,9 @@ void ui_statusbar_set_visible(bool visible) { status_visible = visible; }
 void ui_clock_settings_show(void) { ++clock_shown; }
 void ui_motion_settings_show(void) { ++motion_shown; }
 void ui_bluetooth_settings_show(void) { ++bt_shown; }
+/* 原“锁屏设置”入口改名为“锁屏和壁纸”并进入新子页；页面本体在
+ * test_lock_wallpaper.c 中用真实实现验证，这里只检查入口接线。 */
+void ui_lock_wallpaper_settings_show(void) { ++lock_page_shown; }
 void bt_audio_set_enabled(bool enabled) { ++bt_set_calls; bt_enabled = enabled; }
 bool bt_audio_is_enabled(void) { return bt_enabled; }
 
@@ -172,7 +176,17 @@ int main(void)
     advance(40);
     tap_obj(pointer, motion_button);
     assert(motion_shown == 1);
-    puts("PASS clock/motion entries keep their original click behavior");
+    /* 第 5 个入口（索引 4）已从“锁屏设置”改名为“锁屏和壁纸”，点击必须
+     * 打开新子页，而不是沿用旧的占位行为。 */
+    lv_obj_t *lock_item = lv_obj_get_child(grid, 4);
+    lv_obj_t *lock_button = lv_obj_get_child(lock_item, 0);
+    lv_obj_t *lock_caption = lv_obj_get_child(lock_item, 1);
+    assert(!strcmp(lv_label_get_text(lock_caption), "锁屏和壁纸"));
+    lv_obj_scroll_to_view(lock_button, LV_ANIM_OFF);
+    advance(40);
+    tap_obj(pointer, lock_button);
+    assert(lock_page_shown == 1 && ui_settings_is_visible());
+    puts("PASS clock/motion entries keep original clicks; renamed lock/wallpaper entry opens its subpage");
 
     /* The subpage switch can change power while the grid is covered. Hide and
      * reopen the settings page to verify the entry resynchronizes its palette. */

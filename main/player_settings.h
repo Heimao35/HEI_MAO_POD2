@@ -29,6 +29,10 @@ typedef struct {
      * 不保存传感器在线状态、当天步数或芯片配置；开机后由 UI 恢复开关
      * 视觉并向 BMI270 worker 重新投递请求。 */
     bool motion_steps, motion_wake;
+    /* “锁屏和壁纸”子页的防误触开关：true 表示熄屏后触摸不唤醒屏幕。
+     * 只保存用户意图；开机由 main 恢复开关视觉并交给 screen_power，
+     * 真实的 EXT1 唤醒源调整在熄屏进入 Light-sleep 时完成。 */
+    bool anti_touch;
     /* 最近一次成功配对的蓝牙设备。只保存地址和当时已知的名称；
      * 开关状态按需求不持久化，上电仍默认关闭。 */
     bool bt_paired;
@@ -50,6 +54,10 @@ void player_settings_restore_ui(void);
  * 必须在 ui_manager_init() 之后、持有 LVGL 锁时调用，再交给
  * ui_motion_settings_restore() 套用到开关视觉与传感器请求。 */
 void player_settings_get_motion(bool *steps, bool *wake);
+/* 读取 NVS 快照中的防误触意图；仅访问 RAM。main 在创建 UI 前读取，
+ * 既用于初始化“锁屏和壁纸”开关，也用于设置 screen_power 的触摸唤醒
+ * 允许标志（防误触打开 = 熄屏触摸不唤醒）。 */
+void player_settings_get_anti_touch(bool *anti_touch);
 /* 读取 NVS 快照中的配对设备；仅访问 RAM。main 在 bt_audio_init 后调用，
  * 把结果交给 bt_audio_set_paired，供“打开蓝牙自动重连”使用。 */
 void player_settings_get_bluetooth(bool *valid, uint8_t bda[6],

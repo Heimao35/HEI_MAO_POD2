@@ -1006,6 +1006,14 @@ static void ui_timer_cb(lv_timer_t *timer)
 
     if (!image_page_active()) return;
 
+    /* 锁屏或壁纸选择页可能取消过在途缩略图。回到图片页且总览可见时，
+     * 按当前滚动窗口补发请求，避免槽位停在占位图直到用户滚动。锁屏
+     * 期间模式页被隐藏，image_page_active() 为假，不会在锁屏动画期间
+     * 抢占 JPEG/SD。 */
+    if (s_overview_visible && !s_overview_transition && !s_grid_valid &&
+        s_folder < IMAGE_FOLDER_COUNT && s_ready[s_folder])
+        update_grid_window();
+
     uint32_t generation = sd_card_get_generation();
     if (generation != s_sd_generation) {
         s_sd_generation = generation;
@@ -1082,10 +1090,12 @@ void ui_image_viewer_on_mode_leave(void)
 
 void ui_image_viewer_close_for_lock(void)
 {
-    /* 锁屏只收起全屏；总览状态保留在锁屏页下方，解锁后继续浏览。 */
+    /* 锁屏只收起全屏；总览状态保留在锁屏页下方，解锁后继续浏览。
+     * 这里作废网格身份而不只是取消在途请求：被取消的槽位不会自动重发，
+     * 解锁后由 ui_timer_cb() 在页面重新可见时补请求当前窗口。 */
     if (s_full_active) exit_full();
     image_viewer_cancel_full();
-    image_viewer_clear_thumbs();
+    reset_grid();
     ui_statusbar_set_visible(true);
 }
 
@@ -1121,7 +1131,9 @@ static void create_home_card(lv_obj_t *parent, image_folder_t folder)
     lv_obj_set_pos(card, HOME_CARD_X,
                    HOME_CARD_Y0 + (int32_t)folder * (HOME_CARD_H + HOME_CARD_GAP));
     lv_obj_set_style_bg_color(card, UI_COLOR_LIST_ROW_BG, 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    /* 首页卡片允许壁纸透出：底色不变，只降低不透明度；标题仍是 22px
+     * 白色字。总览/全屏页有独立不透明背景，不受此值影响。 */
+    lv_obj_set_style_bg_opa(card, UI_HOME_CARD_BG_OPA, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_radius(card, HOME_CARD_RADIUS, 0);
     lv_obj_set_style_pad_all(card, 0, 0);
@@ -1371,7 +1383,11 @@ void ui_image_viewer_create(lv_obj_t *parent)
     lv_obj_set_size(s_page, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_page, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(s_page, UI_COLOR_PAGE_BG, 0);
-    lv_obj_set_style_bg_opa(s_page, LV_OPA_COVER, 0);
+    /* 页面背景透明：壁纸层固定在模式页最底层（ui_manager 创建），
+     * 首页直接透出壁纸。总览/全屏页保留自己的不透明背景，不受影响；
+     * 没有壁纸时看到的是壁纸层的原页面底色 UI_COLOR_PAGE_BG，外观与
+     * 改动前一致。 */
+    lv_obj_set_style_bg_opa(s_page, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_page, 0, 0);
     lv_obj_set_style_radius(s_page, 0, 0);
     lv_obj_set_style_pad_all(s_page, 0, 0);
@@ -1427,4 +1443,39 @@ void ui_image_viewer_create(lv_obj_t *parent)
 lv_obj_t *ui_image_viewer_get_page(void)
 {
     return s_page;
+}
+
+/* 壁纸选择页会临时复用 image_viewer 的扫描/缩略图/全屏解码。后台只有
+ * 一份 UI 回调表，所以打开壁纸页前必须先让图片查看器注销；否则同一张
+ * 缩略图会被两个页面同时接收，槽位 token 也可能互相覆盖。
+ *
+ * 两个函数都在 LVGL 锁内调用（壁纸页的 show/hide 来自触摸回调），与
+ * worker 的 publish_* 使用同一把锁，切换期间不会有旧回调在途。 */
+void ui_image_viewer_backend_detach(void)
+{
+    image_viewer_cancel_full();
+    image_viewer_clear_thumbs();
+    image_viewer_set_ops(NULL, NULL);
+}
+
+void ui_image_viewer_backend_attach(void)
+{
+    image_viewer_set_ops(&s_ops, NULL);
+    /* 接管期间后台的扫描结果可能被发布到壁纸页，本页的 s_scan_pending
+     * 不该继续挂着；否则 15 秒后会把页面误标成“图片读取失败”。清掉
+     * 挂起标志并记录当前时间，未就绪时主动补一次扫描。 */
+    s_scan_pending = false;
+    s_last_scan_tick = lv_tick_get();
+    /* detach 已取消在途缩略图，但槽位里可能仍记着“这张图已请求”，
+     * 直接返回总览会留下永久占位图。作废整个网格身份后按当前滚动
+     * 窗口重新请求；总览不可见时只清空，进入图片模式会重新扫描。 */
+    reset_grid();
+    /* 只有图片页当前就是可见模式时才立即补扫；其他模式下等真正进入
+     * 图片模式由 on_mode_enter() 触发。这样刚从壁纸页返回时不会马上
+     * 重扫目录、作废壁纸页刚热起来的缩略图缓存。 */
+    if (image_page_active() && (!s_ready[0] || !s_ready[1])) {
+        s_scan_pending = true;
+        image_viewer_request_scan();
+    }
+    if (s_overview_visible) update_grid_window();
 }

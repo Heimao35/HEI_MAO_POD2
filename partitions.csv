@@ -8,3 +8,6 @@ fontfs,   data, spiffs,  ,        2M,
 # Runtime animation store: two slots, each 4MiB payload + 4KiB header.
 # Appended after fontfs; all existing partition addresses remain unchanged.
 lockanim, data, 0x40, 0x1110000, 0x802000,
+# 用户壁纸：两个槽位，各 4KiB 头 + 464x464 RGB565（430,592B），槽 0x70000。
+# 从 0x1920000 开始，位于 lockanim 之后，所有既有分区地址不变。
+wallpaper, data, 0x41, 0x1920000, 0xE0000,

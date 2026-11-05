@@ -66,6 +66,9 @@ bool ui_lockscreen_is_visible(void) { return false; }
 void ui_statusbar_set_visible(bool visible) { statusbar_visible = visible; }
 const lv_font_t *ui_font_18(void) { return &lv_font_montserrat_18; }
 const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
+/* 壁纸模块由独立测试覆盖；本页只验证“首页最底层会创建一个 canvas”。
+ * 返回 NULL 表示没有壁纸，页面其余布局与手势不应受影响。 */
+lv_obj_t *wallpaper_create_canvas(lv_obj_t *parent) { (void)parent; return NULL; }
 
 /* ---------------- LVGL harness ---------------- */
 static uint32_t ticks;

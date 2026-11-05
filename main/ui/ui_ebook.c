@@ -1070,7 +1070,9 @@ static void create_home(lv_obj_t *parent)
     lv_obj_set_size(card, HOME_CARD_W, HOME_CARD_H);
     lv_obj_set_pos(card, HOME_CARD_X, HOME_CARD_Y);
     lv_obj_set_style_bg_color(card, UI_COLOR_LIST_ROW_BG, 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    /* 与图片查看器首页相同的通透度：保留原卡片底色和 22px 白字，
+     * 只让用户壁纸从卡片后透出；书架/阅读页不受影响。 */
+    lv_obj_set_style_bg_opa(card, UI_HOME_CARD_BG_OPA, 0);
     lv_obj_set_style_border_width(card, 0, 0);
     lv_obj_set_style_radius(card, HOME_CARD_RADIUS, 0);
     lv_obj_set_style_pad_all(card, 0, 0);
@@ -1289,7 +1291,10 @@ void ui_ebook_create(lv_obj_t *parent)
     lv_obj_set_size(s_page, UI_HOR_RES, UI_VER_RES);
     lv_obj_set_pos(s_page, 0, 0);
     lv_obj_set_style_bg_color(s_page, UI_COLOR_PAGE_BG, 0);
-    lv_obj_set_style_bg_opa(s_page, LV_OPA_COVER, 0);
+    /* 页面背景透明：壁纸层固定在模式页最底层（ui_manager 创建），
+     * 首页直接透出壁纸；书架和阅读页各自有不透明背景，不受影响。
+     * 没有壁纸时看到的是壁纸层的原页面底色，外观与改动前一致。 */
+    lv_obj_set_style_bg_opa(s_page, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_page, 0, 0);
     lv_obj_set_style_radius(s_page, 0, 0);
     lv_obj_set_style_pad_all(s_page, 0, 0);
