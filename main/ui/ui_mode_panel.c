@@ -3,16 +3,21 @@
  * @brief 模式切换栏实现
  *
  * 结构：
- *   s_overlay  全屏透明遮罩（点击收起面板）
+ *   s_overlay  全屏透明命中层（不绘制任何颜色，只负责点击空白收起面板）
  *   s_panel    左侧面板容器，宽 UI_MODE_PANEL_WIDTH
  *     └─ 纵向排列的圆角矩形按钮，每个代表一个模式
  *
- * 动画：从屏幕左侧外滑入/滑出，渐慢曲线。
+ * 动画：面板从屏幕左侧外滑入/滑出，渐慢曲线。
+ * 遮罩（包括静态调暗）已全部移除：原来的整屏遮罩既做 opacity 动画，
+ * 又会在每次展开时把整屏压暗；两者都会让 LVGL 对全屏做额外的重绘/
+ * 混合，在模式切换和音频解码同时进行时明显加重掉帧。现在只保留一个
+ * 全透明命中层处理“点击空白收起”，视觉上不再有任何遮罩；面板滑出
+ * 结束后命中层立即隐藏。
  */
 
 #include "ui_mode_panel.h"
 
-static lv_obj_t *s_overlay = NULL; /**< 全屏遮罩，用于点击空白区域收起 */
+static lv_obj_t *s_overlay = NULL; /**< 全屏透明命中层，用于点击空白区域收起 */
 static lv_obj_t *s_panel   = NULL; /**< 左侧面板容器 */
 static bool s_visible = false;
 static ui_mode_switch_cb_t s_switch_cb = NULL;
@@ -30,7 +35,7 @@ static const struct {
 #define MODE_COUNT (sizeof(s_modes) / sizeof(s_modes[0]))
 
 /**
- * @brief 遮罩点击回调 —— 点击面板外区域收起面板
+ * @brief 命中层点击回调 —— 点击面板外区域收起面板
  */
 static void overlay_click_cb(lv_event_t *e)
 {
@@ -59,13 +64,13 @@ static void mode_btn_cb(lv_event_t *e)
  */
 void ui_mode_panel_create(lv_obj_t *parent)
 {
-    /* ---- 全屏遮罩 ---- */
+    /* ---- 全屏透明命中层 ----
+     * 不再绘制黑色遮罩：背景完全透明，只保留 CLICKABLE 的整屏区域，
+     * 让“点击面板外收起”行为不变。 */
     s_overlay = lv_obj_create(parent);
     lv_obj_set_size(s_overlay, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_overlay, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_overlay, lv_color_black(), 0);
-    /* 遮罩透明度 80/255，增大使遮罩更暗 */
-    lv_obj_set_style_bg_opa(s_overlay, 80, 0);
+    lv_obj_set_style_bg_opa(s_overlay, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_overlay, 0, 0);
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(s_overlay, overlay_click_cb, LV_EVENT_CLICKED, NULL);
@@ -129,24 +134,13 @@ static void panel_anim_x_cb(void *obj, int32_t v)
     lv_obj_set_x((lv_obj_t *)obj, v);
 }
 
-/** @brief 遮罩透明度动画执行回调 */
-static void overlay_anim_opa_cb(void *obj, int32_t v)
-{
-    lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
-}
-
-/** @brief 遮罩淡出动画完成回调 */
-static void overlay_hide_ready(lv_anim_t *a)
-{
-    (void)a;
-    lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
-}
-
-/** @brief 面板隐藏动画完成回调 */
+/** @brief 面板隐藏动画完成回调：面板滑出后才隐藏全屏命中层。 */
 static void panel_hide_ready(lv_anim_t *a)
 {
     (void)a;
     lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    /* 命中层本身不绘制任何像素，面板滑出完成后立即隐藏即可。 */
+    lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     s_visible = false;
 }
 
@@ -158,22 +152,14 @@ void ui_mode_panel_show(void)
     if (!s_panel || s_visible) return;
 
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_bg_opa(s_overlay, 0, 0);
+    /* 命中层始终完全透明，不绘制遮罩、也不启动 opacity 动画；只负责
+     * 让面板外的空白区域点击收起。 */
+    lv_obj_set_style_bg_opa(s_overlay, LV_OPA_TRANSP, 0);
     lv_obj_move_foreground(s_overlay);
     lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_panel);
 
-    /* 遮罩淡入动画（比面板滑动稍长，使渐变更平滑） */
-    lv_anim_t a_ov;
-    lv_anim_init(&a_ov);
-    lv_anim_set_var(&a_ov, s_overlay);
-    lv_anim_set_values(&a_ov, 0, 80);
-    lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
-    lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
-    lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
-    lv_anim_start(&a_ov);
-
-    /* 面板滑入动画 */
+    /* 只保留面板滑入动画；全透明命中层不参与动画。 */
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_panel);
@@ -193,18 +179,8 @@ void ui_mode_panel_hide(void)
 {
     if (!s_panel || !s_visible) return;
 
-    /* 遮罩淡出动画 */
-    lv_anim_t a_ov;
-    lv_anim_init(&a_ov);
-    lv_anim_set_var(&a_ov, s_overlay);
-    lv_anim_set_values(&a_ov, 80, 0);
-    lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
-    lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
-    lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
-    lv_anim_set_completed_cb(&a_ov, overlay_hide_ready);
-    lv_anim_start(&a_ov);
-
-    /* 面板滑出动画 */
+    /* 只做面板滑出；全透明命中层保持到面板滑出完成，再由完成回调
+     * 立即隐藏，不再启动任何整屏淡出或混合。 */
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, s_panel);

@@ -82,7 +82,8 @@ int main(void)
     assert(ui_adj_panel_is_visible() && !ui_adj_panel_is_modal());
     assert(lv_obj_has_flag(s_bright_col,LV_OBJ_FLAG_HIDDEN));
     assert(lv_obj_has_flag(s_overlay,LV_OBJ_FLAG_HIDDEN));
-    assert(!lv_anim_get(s_overlay,overlay_anim_opa_cb));
+    /* 遮罩不再有透明度动画：覆盖层上不应存在任何动画。 */
+    assert(!lv_anim_get(s_overlay,NULL));
     lv_point_t p={20,200};assert(lv_indev_search_obj(root,&p)==button);
     touch(i,20,200,LV_INDEV_STATE_PRESSED);touch(i,20,200,LV_INDEV_STATE_RELEASED);
     assert(other_clicks==1);
@@ -108,6 +109,8 @@ int main(void)
     ui_adj_panel_show();advance(500);
     assert(ui_adj_panel_is_modal() && !lv_obj_has_flag(s_bright_col,LV_OBJ_FLAG_HIDDEN));
     assert(!lv_obj_has_flag(s_overlay,LV_OBJ_FLAG_HIDDEN));
+    /* 静态遮罩已移除：全屏命中层完全透明，但仍负责空白点击收起。 */
+    assert(lv_obj_get_style_bg_opa(s_overlay,0)==LV_OPA_TRANSP);
     assert(lv_obj_get_width(s_panel)==UI_ADJ_PANEL_WIDTH);
     advance(6000);assert(ui_adj_panel_is_modal() && !s_closing);
     p=(lv_point_t){20,200};assert(lv_indev_search_obj(root,&p)==s_overlay);
@@ -167,7 +170,7 @@ int main(void)
     assert(dark && !ui_adj_panel_is_visible() && !ui_adj_panel_is_modal());
     assert(lv_obj_has_flag(s_panel,LV_OBJ_FLAG_HIDDEN));
     assert(lv_obj_has_flag(s_overlay,LV_OBJ_FLAG_HIDDEN));
-    assert(!lv_anim_get(s_panel,panel_anim_x_cb) && !lv_anim_get(s_overlay,overlay_anim_opa_cb));
+    assert(!lv_anim_get(s_panel,panel_anim_x_cb) && !lv_anim_get(s_overlay,NULL));
     assert(lv_timer_get_paused(s_volume_timer) && s_volume_activity==panel_activity);
     assert(lv_display_get_inactive_time(d)==idle && state.brightness==brightness && !br_calls);
     assert(lv_slider_get_value(s_vol_slider)==state.volume);

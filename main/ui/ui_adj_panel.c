@@ -3,7 +3,7 @@
  * @brief 声光调节栏实现（重构版）
  *
  * 结构：
- *   s_overlay  全屏透明遮罩（点击收起）
+ *   s_overlay  全屏透明命中层（不绘制任何颜色，只负责点击空白收起）
  *   s_panel    右侧面板，宽 UI_ADJ_PANEL_WIDTH，透明背景
  *     ├─ 左列：亮度图标(EYE_OPEN) + 亮度滑条(56x280) + 自动亮度按钮(字母A)
  *     └─ 右列：音量图标 + 音量滑条(56x280) + 静音按钮
@@ -25,9 +25,10 @@ static lv_obj_t *s_auto_btn      = NULL;
 static lv_obj_t *s_auto_icon     = NULL;
 static lv_obj_t *s_mute_btn      = NULL;  /**< 静音切换按钮 */
 static lv_obj_t *s_mute_icon     = NULL;  /**< 静音按钮图标 */
-/* 两种展开来源共用现有滑条和滑入曲线。手势模式仍显示亮度+音量并使用
- * 原遮罩；实体键模式只显示音量，透明容器不参与命中，空白处可直接操作
- * 下层页面。所有对象、计时和状态均只在 LVGL 线程/锁内访问。 */
+/* 两种展开来源共用现有滑条和滑入曲线。手势模式仍显示亮度+音量；全屏
+ * 命中层完全透明，只处理“点击空白收起”，不再绘制任何静态遮罩或
+ * opacity 动画；实体键模式只显示音量，透明容器不参与命中，空白处可
+ * 直接操作下层页面。所有对象、计时和状态均只在 LVGL 线程/锁内访问。 */
 static lv_obj_t *s_bright_col;
 static lv_timer_t *s_volume_timer;
 static bool s_volume_only;
@@ -233,12 +234,13 @@ static lv_obj_t *create_round_btn(lv_obj_t *parent, const char *text,
 
 void ui_adj_panel_create(lv_obj_t *parent)
 {
-    /* ---- 全屏遮罩 ---- */
+    /* ---- 全屏透明命中层 ----
+     * 不绘制黑色遮罩：展开面板时页面保持原亮度；这一层只提供整屏
+     * CLICKABLE 区域，处理“点击空白收起”的原有交互。 */
     s_overlay = lv_obj_create(parent);
     lv_obj_set_size(s_overlay, UI_HOR_RES, UI_VER_RES);
     lv_obj_align(s_overlay, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(s_overlay, 80, 0);
+    lv_obj_set_style_bg_opa(s_overlay, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_overlay, 0, 0);
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(s_overlay, overlay_click_cb, LV_EVENT_CLICKED, NULL);
@@ -325,21 +327,13 @@ void ui_adj_panel_create(lv_obj_t *parent)
 
 static void panel_anim_x_cb(void *obj, int32_t v) { lv_obj_set_x((lv_obj_t *)obj, v); }
 
-static void overlay_anim_opa_cb(void *obj, int32_t v)
-{
-    lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
-}
-
-static void overlay_hide_ready(lv_anim_t *a)
-{
-    (void)a;
-    lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
-}
-
 static void panel_hide_ready(lv_anim_t *a)
 {
     (void)a;
     lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    /* 全屏命中层不绘制任何像素，面板滑出完成后立即隐藏；不再有整屏
+     * opacity 渐变。音量单列/锁屏路径也在这里统一清除隐藏状态。 */
+    lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     s_visible = false;
     s_closing = false;
     s_volume_touch = false;
@@ -365,14 +359,12 @@ static void show_panel(bool volume_only)
 {
     if (!s_panel) return;
     if (s_visible && !s_closing && s_volume_only == volume_only) return;
-    bool on_lockscreen = ui_lockscreen_is_visible();
     s_volume_only = volume_only;
     s_closing = false;
-    lv_anim_delete(s_overlay, overlay_anim_opa_cb);
 
     if (volume_only) {
-        /* 按键展开完全不显示遮罩，也不启动其渐变；仅控件本身接收触摸。
-         * 隐藏亮度列后缩成单列，避免保留一个不可见的半屏触摸占位。 */
+        /* 按键展开不显示命中层；仅控件本身接收触摸。隐藏亮度列后
+         * 缩成单列，避免保留一个不可见的半屏触摸占位。 */
         lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_bright_col, LV_OBJ_FLAG_HIDDEN);
         lv_timer_resume(s_volume_timer);
@@ -383,17 +375,9 @@ static void show_panel(bool volume_only)
         lv_obj_remove_flag(s_bright_col, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_overlay);
+        /* 命中层始终完全透明：不绘制静态遮罩、也不做 opacity 动画。
+         * 展开时只有面板自己滑入，页面保持原亮度。 */
         lv_obj_set_style_bg_opa(s_overlay, LV_OPA_TRANSP, 0);
-        if (!on_lockscreen) {
-            lv_anim_t a_ov;
-            lv_anim_init(&a_ov);
-            lv_anim_set_var(&a_ov, s_overlay);
-            lv_anim_set_values(&a_ov, 0, 80);
-            lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
-            lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
-            lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
-            lv_anim_start(&a_ov);
-        }
     }
     int32_t width = volume_only ? VOLUME_PANEL_WIDTH : UI_ADJ_PANEL_WIDTH;
     lv_obj_set_width(s_panel, width);
@@ -433,20 +417,12 @@ void ui_adj_panel_hide(void)
     if (!s_panel || !s_visible || s_closing) return;
     s_closing = true;
     lv_timer_pause(s_volume_timer);
-    lv_anim_delete(s_overlay, overlay_anim_opa_cb);
     if (s_volume_only || ui_lockscreen_is_visible()) {
+        /* 这两种模式没有命中层，立即隐藏。 */
         lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_anim_t a_ov;
-        lv_anim_init(&a_ov);
-        lv_anim_set_var(&a_ov, s_overlay);
-        lv_anim_set_values(&a_ov, lv_obj_get_style_bg_opa(s_overlay, 0), 0);
-        lv_anim_set_duration(&a_ov, UI_ANIM_DURATION_MS + 100);
-        lv_anim_set_path_cb(&a_ov, lv_anim_path_linear);
-        lv_anim_set_exec_cb(&a_ov, overlay_anim_opa_cb);
-        lv_anim_set_completed_cb(&a_ov, overlay_hide_ready);
-        lv_anim_start(&a_ov);
     }
+    /* 全屏面板：命中层保持到面板滑出完成，由 panel_hide_ready() 立即
+     * 隐藏；它本身不绘制像素，也不会产生整屏重绘/混合。 */
     animate_panel((int32_t)UI_HOR_RES, true);
 }
 
