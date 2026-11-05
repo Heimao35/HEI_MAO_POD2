@@ -223,11 +223,15 @@ int main(void)
     hp_present=true;audio_output_select(0,generation,false);steps(3);
     assert(!audio_output_is_playing() && !audio_output_is_active() && !tx_enabled && device_state.headphone_inserted);
     assert(!s_file); /* restored selection doesn't leave a file open or autoplay */
+    /* 仅恢复/选中不打开解码器：避免其内部缓冲提前占用内部堆，首次播放
+     * 才能按“先 I2S、后解码器”的顺序申请 DMA。 */
+    assert(opens==0 && !s_decoder);
     /* Cold artwork can own SD for several attempts; keep request pending. */
     sd_lock_failures=3;audio_output_toggle();steps(2);
     assert(audio_output_is_play_requested() && !audio_output_is_playing());
     steps(40);
     assert(audio_output_is_playing() && tx_enabled && last_rate==192000 && audio_output_time_ms()>0);
+    assert(opens==1 && s_decoder);
     audio_output_toggle();steps(3);uint32_t paused=audio_output_time_ms();
     assert(!tx_enabled && !audio_output_is_active());steps(20);assert(audio_output_time_ms()==paused);
     audio_output_toggle();steps(24);assert(audio_output_is_playing() && audio_output_time_ms()>=paused);

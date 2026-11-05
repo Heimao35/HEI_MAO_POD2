@@ -385,28 +385,29 @@ static esp_err_t open_session(command_t c)
     s_current=c;
     atomic_store(&s_detached,false);
     s_mp3_session=!info.is_flac;
-    /* 真正的播放请求：在打开音频解码器之前先预留 I2S 通道和 DMA 缓冲。
-     * FLAC/MP3 解码器（尤其 FLAC）打开的瞬间会占用内部内存，而 I2S 需要
-     * 8×2KiB 的 MALLOC_CAP_DMA|INTERNAL 缓冲；实测首次上电首次播放时
-     * 解码器先分配会把内部 DMA 堆压到不足 2KiB，i2s_alloc_dma_desc()
-     * 直接 NO_MEM，整首歌被判定失败。probe 已经得到采样率，先建通道，
-     * 后续 configure_tx() 只需按解码器实际格式重配时钟。
-     * 仅在 c.play 时执行：保持“开机曲库扫描阶段不分配 GDMA”的既有设计，
-     * 单纯选中/恢复歌曲不会提前占用 I2S。 */
-    if(c.play) {
-        uint32_t preroll=supported_rate(info.sample_rate)?info.sample_rate:48000U;
-        esp_err_t tx_ret=create_tx(preroll);
-        if(tx_ret!=ESP_OK)return tx_ret;
-    }
-    esp_audio_simple_dec_cfg_t cfg={.dec_type=info.is_flac?ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:ESP_AUDIO_SIMPLE_DEC_TYPE_MP3};
-    esp_audio_err_t err=esp_audio_simple_dec_open(&cfg,&s_decoder);
-    if(err!=ESP_AUDIO_ERR_OK)return ESP_ERR_NOT_SUPPORTED;
+    /* 时长/位置来自 probe，选中但未播放时也要先发布给界面。 */
     portENTER_CRITICAL(&s_cmd_mux);
     if(s_cmd.serial==c.serial) {
         atomic_store(&s_duration,(uint32_t)(info.duration_ms/1000));
         atomic_store(&s_position,0);
     }
     portEXIT_CRITICAL(&s_cmd_mux);
+    /* 仅选中/开机恢复：只做 probe，不打开音频解码器。
+     * FLAC/MP3 解码器打开后其内部缓冲会一直占用内部堆，直到首次播放；
+     * 首次播放再申请 I2S 的 8×2KiB MALLOC_CAP_DMA|INTERNAL 缓冲时就会
+     * 出现 i2s_alloc_dma_desc NO_MEM，只能靠 250ms 重试恢复。现在真正
+     * 播放时会以 play=true 重新调用本函数，先 create_tx() 再打开解码器，
+     * 首次播放不再出现这次失败；空闲期也少占一份解码器内存。
+     * 暂停/恢复不受影响：已播放的会话暂停时不会重新进入本函数。 */
+    if(!c.play) return ESP_OK;
+    /* 真正的播放请求：在打开解码器之前先预留 I2S 通道和 DMA 缓冲。
+     * probe 已得到采样率；后续 configure_tx() 只按解码器实际格式重配时钟。 */
+    uint32_t preroll=supported_rate(info.sample_rate)?info.sample_rate:48000U;
+    esp_err_t tx_ret=create_tx(preroll);
+    if(tx_ret!=ESP_OK)return tx_ret;
+    esp_audio_simple_dec_cfg_t cfg={.dec_type=info.is_flac?ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:ESP_AUDIO_SIMPLE_DEC_TYPE_MP3};
+    esp_audio_err_t err=esp_audio_simple_dec_open(&cfg,&s_decoder);
+    if(err!=ESP_AUDIO_ERR_OK)return ESP_ERR_NOT_SUPPORTED;
     return ESP_OK;
 }
 static esp_err_t read_input(void)
