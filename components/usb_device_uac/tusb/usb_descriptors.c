@@ -94,7 +94,9 @@ char const *string_desc_arr [] = {
     CONFIG_UAC_TUSB_MANUFACTURER,       // 1: Manufacturer
     CONFIG_UAC_TUSB_PRODUCT,            // 2: Product
     CONFIG_UAC_TUSB_SERIAL_NUM,         // 3: Serials, should use chip ID
-    "usb uac",                      // 4: UAC control Interface
+    /* 本地补丁：Windows 在声音设置/设备管理器里显示的 UAC 接口名。
+     * 上游默认 "usb uac"，这里改成产品名，便于用户识别本设备。 */
+    "Hei Mao Pod",                  // 4: UAC control Interface
 #if SPEAK_CHANNEL_NUM
     "speaker",                     // 5: Speak Interface
 #endif

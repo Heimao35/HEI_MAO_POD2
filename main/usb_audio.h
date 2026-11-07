@@ -38,6 +38,13 @@ void usb_audio_mode_leave(void);
 /** 主机已枚举完成（RAM 原子快照，供日志/界面查询）。 */
 bool usb_audio_host_ready(void);
 
+/**
+ * 声卡页的 USB 线状态（RAM，不访问 I2C）：
+ * 0 = 没有检测到 VBUS（未插线）；1 = 有 VBUS 但主机尚未枚举；
+ * 2 = 主机已枚举（可播放）。供界面提示“请插入 USB 数据线/等待主机”。
+ */
+uint8_t usb_audio_cable_status(void);
+
 #ifdef __cplusplus
 }
 #endif

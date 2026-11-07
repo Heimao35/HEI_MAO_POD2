@@ -80,6 +80,9 @@ CONFIG_UAC_SPEAKER_CHANNEL_NUM=2
 CONFIG_UAC_MIC_CHANNEL_NUM=0
 CONFIG_UAC_BIT_RESOLUTION_24_IN_24=y
 CONFIG_UAC_BIT_RESOLUTION_16=n
+# 主机（Windows 声音设置/设备管理器）显示的产品名与UAC接口名。
+# 接口名在 components/usb_device_uac/tusb/usb_descriptors.c 的字符串表里。
+CONFIG_UAC_TUSB_PRODUCT="Hei Mao Pod"
 # UAC 任务固定在音频核（CPU0），优先级低于 audio_output（6）：
 # 高速口传输完成频率高，放到 UI 核会占满 IDLE1 并导致界面卡死。
 CONFIG_UAC_TINYUSB_TASK_CORE=0

@@ -734,6 +734,13 @@ void ui_wallpaper_picker_show(void)
      * 不相交，切换期间迟到的旧结果会被本页/图片页各自丢弃。 */
     ui_image_viewer_backend_detach();
     image_viewer_set_ops(&s_picker_ops, NULL);
+    /* 本地补丁：图片后台worker在离开图片模式时会被销毁；本页复用图片
+     * 后台但不需要先进入图片模式，所以必须在这里确保worker存在，否则
+     * 扫描/缩略图请求会全部落空（设置里打开壁纸选择看不到任何图片）。 */
+    esp_err_t worker_ret = image_viewer_ensure_started();
+    if (worker_ret != ESP_OK)
+        ESP_LOGW(TAG, "Wallpaper picker image worker unavailable: %s",
+                 esp_err_to_name(worker_ret));
 
     /* 图片列表缓存：与图片查看器一样，只有在“尚未扫描”或“SD 卡代次
      * 变化（换卡/重新挂载）”时才重新遍历目录。反复打开本页沿用上次

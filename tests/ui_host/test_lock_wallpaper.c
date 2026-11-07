@@ -47,6 +47,9 @@ void image_viewer_set_ops(const image_viewer_ops_t *value, void *ctx)
     ops = value ? *value : (image_viewer_ops_t){0};
 }
 void image_viewer_request_scan(void) { ++scans; }
+/* 本地补丁：壁纸选择页复用图片后台，但图片worker可能在离开图片模式时
+ * 被销毁；打开选择页前会调用 ensure_started()，这里桩成功即可。 */
+esp_err_t image_viewer_ensure_started(void) { return ESP_OK; }
 void image_viewer_request_thumbnail(image_folder_t folder, uint32_t index,
                                     uint32_t slot, uint32_t token)
 {

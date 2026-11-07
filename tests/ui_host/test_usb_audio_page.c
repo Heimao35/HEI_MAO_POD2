@@ -19,6 +19,8 @@ const lv_font_t *ui_font_22(void) { return &lv_font_montserrat_22; }
 static unsigned enters, leaves;
 void usb_audio_mode_enter(void) { ++enters; }
 void usb_audio_mode_leave(void) { ++leaves; }
+/* 线缆状态：本测试固定为“未插入”，状态行保持默认提示。 */
+uint8_t usb_audio_cable_status(void) { return 0; }
 
 static void advance(unsigned ms)
 {
@@ -60,7 +62,7 @@ int main(void)
     lv_obj_remove_flag(page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_update_layout(page);
     assert(lv_obj_get_width(console) == UI_HOR_RES);
-    assert(lv_obj_get_height(console) == 120);
+    assert(lv_obj_get_height(console) == 150);
     lv_area_t area;
     lv_obj_get_coords(console, &area);
     assert(area.x1 == 0 && area.x2 == UI_HOR_RES - 1);
@@ -74,7 +76,10 @@ int main(void)
     /* 两行文字：22px 标题 + 18px 规格，均使用配置的字体。 */
     lv_obj_t *title = lv_obj_get_child(console, 0);
     lv_obj_t *spec = lv_obj_get_child(console, 1);
-    assert(title && spec && lv_obj_get_child_count(console) == 2);
+    assert(title && spec && lv_obj_get_child_count(console) == 3);
+    /* 第三行是 USB 数据线状态占位，默认提示插入数据线。 */
+    lv_obj_t *status = lv_obj_get_child(console, 2);
+    assert(status && !strcmp(lv_label_get_text(status), "请插入 USB 数据线"));
     assert(!strcmp(lv_label_get_text(title), "USB声卡模式"));
     assert(lv_obj_get_style_text_font(title, 0) == ui_font_22());
     assert(lv_color_eq(lv_obj_get_style_text_color(title, 0), UI_COLOR_TEXT));

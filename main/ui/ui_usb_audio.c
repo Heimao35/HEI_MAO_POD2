@@ -24,15 +24,20 @@
 #include "ui_fonts.h"
 #include "usb_audio.h"
 
+#include <string.h>
+
 /* 与视频播放器控制台相同的淡入淡出时长（ui_video_player.c 的
  * CONTROLS_FADE_MS）。只复制数值，不引用视频模块内部符号。 */
 #define USB_CONSOLE_FADE_MS 220
-/* 控制台高度：两行文字（22px 标题 + 18px 规格）加行距后的最小高度，
- * 增大只会加高控制台，不影响页面其它元素。 */
-#define USB_CONSOLE_HEIGHT  120
+/* 控制台高度：三行文字（22px 标题 + 18px 规格 + 18px 线缆状态）加行距
+ * 后的高度；增大只会加高控制台，不影响页面其它元素。 */
+#define USB_CONSOLE_HEIGHT  150
+/* USB 线状态轮询周期：只读 RAM 原子量，不访问 I2C/SD。 */
+#define USB_STATUS_POLL_MS  500
 
 static lv_obj_t *s_page;
 static lv_obj_t *s_console;
+static lv_obj_t *s_status;   /* 第三行：USB 数据线/主机状态 */
 static lv_opa_t s_console_opa = LV_OPA_COVER;
 static bool s_console_visible = true;
 
@@ -85,12 +90,76 @@ static void console_hide(void)
     lv_anim_start(&a);
 }
 
+/* 判定“轻点”的最大位移（像素）。从屏幕边缘左右滑动唤出模式栏/声光栏时，
+ * LVGL 仍可能给页面发 CLICKED；用按下到释放的位移把它排除，避免切换面板
+ * 的同时把控制台也切了。与主屏幕 40px 的手势阈值错开，普通点按不受影响。 */
+#define USB_CONSOLE_TAP_MAX_MOVE 20
+
+static lv_point_t s_press_point;
+
+static void page_pressed_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    if (indev) lv_indev_get_point(indev, &s_press_point);
+}
+
 /** 点击页面任意位置：控制台可见则收起，否则唤出。 */
 static void page_click_cb(lv_event_t *e)
 {
     (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    if (indev) {
+        lv_point_t p;
+        lv_indev_get_point(indev, &p);
+        const int32_t dx = p.x - s_press_point.x;
+        const int32_t dy = p.y - s_press_point.y;
+        const int32_t adx = dx < 0 ? -dx : dx;
+        const int32_t ady = dy < 0 ? -dy : dy;
+        /* 边缘滑动/拖动不当作点击：否则打开模式栏或声光栏时会误切换控制台。 */
+        if (adx > USB_CONSOLE_TAP_MAX_MOVE || ady > USB_CONSOLE_TAP_MAX_MOVE)
+            return;
+    }
     if (s_console_visible) console_hide();
     else console_show();
+}
+
+/* ---------------- USB 数据线状态提示 ---------------- */
+
+/**
+ * 第三行文字：0=未检测到插入，1=已插入但主机未枚举，2=主机已连接。
+ * 只读 usb_audio 的 RAM 快照；状态不变时不重设文本，避免无谓重绘。
+ */
+static void status_update(void)
+{
+    if (!s_status) return;
+    const char *text;
+    lv_color_t color;
+    switch (usb_audio_cable_status()) {
+    case 2:
+        text = "USB 已连接";
+        color = UI_COLOR_TEXT;
+        break;
+    case 1:
+        text = "已插入，等待主机识别";
+        color = UI_COLOR_TEXT_SECONDARY;
+        break;
+    default:
+        text = "请插入 USB 数据线";
+        color = UI_COLOR_TEXT_CAPTION;
+        break;
+    }
+    if (strcmp(lv_label_get_text(s_status), text) == 0) return;
+    lv_label_set_text(s_status, text);
+    lv_obj_set_style_text_color(s_status, color, 0);
+}
+
+static void status_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    /* 页面隐藏时不更新，避免无谓的标签重绘。 */
+    if (!s_page || lv_obj_has_flag(s_page, LV_OBJ_FLAG_HIDDEN)) return;
+    status_update();
 }
 
 /* ---------------- 页面创建 ---------------- */
@@ -109,6 +178,7 @@ void ui_usb_audio_create(lv_obj_t *parent)
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_SCROLLABLE);
     /* 全局手势（边缘模式栏/状态栏下拉）需要事件冒泡到主屏幕。 */
     lv_obj_add_flag(s_page, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(s_page, page_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_page, page_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* ---- 横向控制台：与屏幕等宽、垂直居中 ---- */
@@ -143,6 +213,14 @@ void ui_usb_audio_create(lv_obj_t *parent)
     /* 规格是纯 ASCII，18px 全字库即可，无需额外字模。 */
     lv_obj_set_style_text_font(spec, ui_font_18(), 0);
 
+    /* 第三行：USB 数据线/主机状态。默认提示插入数据线；进入模式后由
+     * status_update() 和 500ms 轮询刷新（只读 RAM，不访问 I2C/SD）。 */
+    s_status = lv_label_create(s_console);
+    lv_label_set_text(s_status, "请插入 USB 数据线");
+    lv_obj_set_style_text_color(s_status, UI_COLOR_TEXT_CAPTION, 0);
+    lv_obj_set_style_text_font(s_status, ui_font_18(), 0);
+    lv_timer_create(status_timer_cb, USB_STATUS_POLL_MS, NULL);
+
     /* 与其它模式页一致：创建后隐藏，由 ui_manager 的模式切换显示。 */
     lv_obj_add_flag(s_page, LV_OBJ_FLAG_HIDDEN);
 }
@@ -161,6 +239,8 @@ void ui_usb_audio_on_mode_enter(void)
         lv_obj_remove_flag(s_console, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_opa(s_console, LV_OPA_COVER, 0);
     }
+    /* 立即刷新一次线缆提示，不必等下一次500ms轮询。 */
+    status_update();
     usb_audio_mode_enter();
 }
 

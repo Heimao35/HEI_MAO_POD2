@@ -214,6 +214,10 @@ static void close_pcm(void)
 static bool start_session(void)
 {
     if (!open_pcm()) return false;
+    /* 本地补丁：握手前可能有残留数据（上一次会话的 ring 内容或主机提前
+     * 送来的帧）。此时 s_session 仍为 false，回调不会写入，可以安全地
+     * 停止 TX 并清空 PCM ring，保证新会话从空缓冲开始。 */
+    audio_output_video_flush();
     atomic_store(&s_frames_in, 0);
     atomic_store(&s_frames_dropped, 0);
     atomic_store(&s_frames_slipped, 0);
@@ -368,4 +372,11 @@ void usb_audio_mode_leave(void)
 bool usb_audio_host_ready(void)
 {
     return atomic_load(&s_host_ready);
+}
+
+uint8_t usb_audio_cable_status(void)
+{
+    if (atomic_load(&s_host_ready)) return 2;      /* 主机已枚举 */
+    if (pmic_axp2101_vbus_present()) return 1;     /* 有VBUS，但还不是主机 */
+    return 0;                                      /* 没有检测到USB插入 */
 }

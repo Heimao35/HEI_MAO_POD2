@@ -28,6 +28,16 @@ static const char *TAG = "usbd_uac";
 #define UAC_TINYUSB_RHPORT 0
 #endif
 
+/* 本地补丁：每次主机开流（alt=1）后丢弃前 N 毫秒的数据。Windows 在设备
+ * 重新枚举/重新开流时会把上次会话残留的缓冲补发过来，表现为“一连接声卡
+ * 就自动播放一段旧音频”。实测 300ms 窗口内主机就送来了 295ms 数据且之后
+ * 仍有残留，说明补发时长超过 300ms，这里提高到 1000ms。
+ * 窗口只在开流时生效，播放中途不受影响；代价是开流后 1 秒内的真实音频
+ * 也会被丢弃（正常使用中流会保持打开，不会每次播放都触发）。 */
+#define UAC_STREAM_DISCARD_MS 1000
+/* 24bit/2ch 的帧大小，用于统计丢弃了多少音频帧。 */
+#define SPK_FRAME_BYTES ((size_t)SPEAK_CHANNEL_NUM * CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX)
+
 const uint32_t sample_rates[] = {DEFAULT_SAMPLE_RATE};
 
 #define N_SAMPLE_RATES  TU_ARRAY_SIZE(sample_rates)
@@ -84,6 +94,14 @@ typedef struct {
     size_t mic_bytes_per_ms;
     volatile bool spk_active;
     volatile bool mic_active;
+    /* 本地补丁：主机开流（alt=1）后的一段时间内丢弃收到的数据。Windows
+     * 在设备重新枚举/重新开流时可能补发上次会话残留的缓冲，表现为声卡
+     * 一连接就“自动播放一段旧音频”。窗口内数据不送声卡。 */
+    int64_t spk_discard_until_us;
+    bool spk_discard_logged;
+    /* 本次开流窗口内丢弃的帧数，窗口结束后打印一次，便于判断主机补发了
+     * 多少残留音频。 */
+    uint32_t spk_discard_frames;
     /* 本地补丁：反初始化标志。SPK任务在安全点自行退出，避免在调用
      * output_cb（持有音频临界区）时被vTaskDelete强行删除。 */
     volatile bool shutdown;
@@ -366,6 +384,13 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     if (s_uac_device->spk_itf_num == itf && alt != 0) {
         /* 新一轮数据流：清空上游FIFO，避免上一次未消费的数据混入。 */
         tud_audio_n_clear_ep_out_ff(0);
+        /* 本地补丁：每次开流都屏蔽一小段数据。主机（Windows）既可能在
+         * 设备重新枚举后补发残留，也可能在重新打开流时才补发，因此不能
+         * 只对“第一次开流”生效。窗口很短，播放中途不受影响。 */
+        s_uac_device->spk_discard_until_us =
+            esp_timer_get_time() + (int64_t)UAC_STREAM_DISCARD_MS * 1000;
+        s_uac_device->spk_discard_logged = false;
+        s_uac_device->spk_discard_frames = 0;
         s_uac_device->spk_resolution = spk_resolutions_per_format[alt - 1];
         s_uac_device->spk_active = true;
         s_uac_device->spk_bytes_per_ms = s_uac_device->current_sample_rate / 1000 * SPEAK_CHANNEL_NUM * CFG_TUD_AUDIO_FUNC_1_FORMAT_1_N_BYTES_PER_SAMPLE_RX;
@@ -487,6 +512,30 @@ static void usb_spk_task(void *pvParam)
             const int got = tud_audio_n_read(s_uac_device->func_id,
                                              s_uac_device->spk_buf, need);
             if (got <= 0) break;
+            /* 本地补丁：开流窗口内丢弃数据（主机补发的残留音频）。
+             * 只统计含非零样本的块，日志里的时长≈主机真正补发的音频长度，
+             * 主机送静音不计入，便于判断窗口是否足够。 */
+            if (esp_timer_get_time() < s_uac_device->spk_discard_until_us) {
+                for (int i = 0; i < got; ++i) {
+                    if (s_uac_device->spk_buf[i]) {
+                        s_uac_device->spk_discard_frames +=
+                            (uint32_t)(got / (int)SPK_FRAME_BYTES);
+                        break;
+                    }
+                }
+                continue;
+            }
+            /* 窗口结束后报告本次丢弃量，便于确认主机是否补发了残留。 */
+            if (!s_uac_device->spk_discard_logged) {
+                s_uac_device->spk_discard_logged = true;
+                if (s_uac_device->spk_discard_frames &&
+                    s_uac_device->current_sample_rate) {
+                    ESP_LOGW(TAG, "Discarded %u frames (%u ms) of host audio at stream open",
+                             (unsigned)s_uac_device->spk_discard_frames,
+                             (unsigned)((uint64_t)s_uac_device->spk_discard_frames * 1000U /
+                                        s_uac_device->current_sample_rate));
+                }
+            }
             if (s_uac_device->user_cfg.output_cb) {
                 s_uac_device->user_cfg.output_cb(s_uac_device->spk_buf, (size_t)got,
                                                  s_uac_device->user_cfg.cb_ctx);
