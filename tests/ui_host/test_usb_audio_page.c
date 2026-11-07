@@ -95,10 +95,16 @@ int main(void)
     assert(lv_obj_get_style_opa(console, 0) == LV_OPA_COVER);
     puts("PASS tap-to-toggle console with 220ms fade, hidden only after fade-out");
 
-    /* 进入/离开模式只投递 usb_audio 通知，不阻塞 UI。 */
+    /* 进入模式时控制台强制恢复完全显示，不继承上一次的隐藏状态。 */
+    lv_obj_send_event(page, LV_EVENT_CLICKED, NULL); /* 先隐藏 */
+    advance(300);
+    assert(lv_obj_has_flag(console, LV_OBJ_FLAG_HIDDEN));
     ui_usb_audio_on_mode_enter();
+    assert(!lv_obj_has_flag(console, LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_get_style_opa(console, 0) == LV_OPA_COVER);
     ui_usb_audio_on_mode_leave();
     assert(enters == 1 && leaves == 1);
+    puts("PASS console is forced visible on every mode entry");
 
     lv_deinit();
     puts("ALL USB AUDIO PAGE TESTS PASSED");

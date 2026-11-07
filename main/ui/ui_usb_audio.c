@@ -151,6 +151,16 @@ lv_obj_t *ui_usb_audio_get_page(void) { return s_page; }
 
 void ui_usb_audio_on_mode_enter(void)
 {
+    /* 每次进入声卡模式都把控制台恢复为完全显示，不继承上一次的显隐状态：
+     * 取消可能仍在进行的淡入/淡出动画后直接设为可见。此函数在LVGL锁内
+     * 被 ui_manager 的模式切换调用，可以直接操作对象。 */
+    if (s_console) {
+        lv_anim_delete(s_console, console_fade_exec);
+        s_console_visible = true;
+        s_console_opa = LV_OPA_COVER;
+        lv_obj_remove_flag(s_console, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(s_console, LV_OPA_COVER, 0);
+    }
     usb_audio_mode_enter();
 }
 
