@@ -72,6 +72,10 @@ static uint64_t s_file_size,s_file_offset,s_sent_total;
 static uint8_t s_flac_header[42];
 static bool s_flac_prefix,s_mp3_session;
 static uint32_t s_last_sent;
+/* 解码器驻留标记：只由音频 worker 更新，其他任务只读。
+ * 音乐解码器打开后内部堆只剩十几 KiB、最大连续块约 9 KiB（实机日志），
+ * 12/16 KiB 的模式 worker 栈无法再重建；UI 用这个快照决定能否销毁 worker。 */
+static atomic_bool s_decoder_open;
 static esp_audio_simple_dec_handle_t s_decoder;
 static esp_audio_simple_dec_raw_t s_raw;
 static esp_audio_simple_dec_info_t s_format;
@@ -227,6 +231,7 @@ bool audio_output_is_active(void)
      * 事件。不能在媒体 worker 尚未接力前误把曲间空隙当成空闲睡眠。 */
     return s_task && (atomic_load(&s_active)||command().play||atomic_load(&s_finished));
 }
+bool audio_output_session_open(void) {return atomic_load(&s_decoder_open);}
 bool audio_output_take_finished(void) {return atomic_exchange(&s_finished,false);}
 static bool request_quiescence(unsigned owner,bool pause)
 {
@@ -306,7 +311,10 @@ static bool close_session(void)
 {
     stop_tx();
     if(!close_file())return false;
-    if(s_decoder) {esp_audio_simple_dec_close(s_decoder);s_decoder=NULL;}
+    if(s_decoder) {
+        esp_audio_simple_dec_close(s_decoder);s_decoder=NULL;
+        atomic_store(&s_decoder_open,false);
+    }
     memset(&s_raw,0,sizeof(s_raw));memset(&s_format,0,sizeof(s_format));
     s_pcm_bytes=s_pcm_offset=0;s_file_offset=0;s_sent_total=0;s_last_sent=0;
     s_read_size=0;
@@ -417,6 +425,7 @@ static esp_err_t open_session(command_t c)
     esp_audio_simple_dec_cfg_t cfg={.dec_type=info.is_flac?ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:ESP_AUDIO_SIMPLE_DEC_TYPE_MP3};
     esp_audio_err_t err=esp_audio_simple_dec_open(&cfg,&s_decoder);
     if(err!=ESP_AUDIO_ERR_OK)return ESP_ERR_NOT_SUPPORTED;
+    atomic_store(&s_decoder_open,true);
     return ESP_OK;
 }
 static esp_err_t read_input(void)

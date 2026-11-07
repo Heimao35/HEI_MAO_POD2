@@ -7,6 +7,7 @@
  */
 #include "ebook.h"
 
+#include "audio_output.h"
 #include "jpeg_codec.h"
 #include "sd_bulk_read.h"
 #include "sd_card.h"
@@ -988,10 +989,34 @@ esp_err_t ebook_ensure_started(void)
     if (!s_book_mux) s_book_mux = xSemaphoreCreateMutex();
     if (!s_req_mux || !s_book_mux) return ESP_ERR_NO_MEM;
     atomic_store(&s_worker_exit, false);
-    if (xTaskCreatePinnedToCore(ebook_worker, "ebook", EBOOK_WORKER_STACK,
-                                NULL, EBOOK_WORKER_PRIO, &s_task, 0) != pdPASS) {
+    /* 本地补丁：上一个 worker 的 12 KiB 栈由空闲任务在 vTaskDelete 后回收，
+     * running 标志清零并不代表内存已经回到内部堆。音乐播放时 CPU0 的音频
+     * worker 会连续解码，空闲任务可能延迟回收；这里最多重试 150 ms，避免
+     * 模式切换瞬间偶发 ESP_ERR_NO_MEM（与 video_player 相同的竞态）。 */
+    const unsigned retry_max = 30U; /* 30 x 5ms = 最多等待 150ms */
+    esp_err_t create_err = ESP_ERR_NO_MEM;
+    for (unsigned attempt = 0; attempt <= retry_max; ++attempt) {
+        if (xTaskCreatePinnedToCore(ebook_worker, "ebook", EBOOK_WORKER_STACK,
+                                    NULL, EBOOK_WORKER_PRIO, &s_task, 0) == pdPASS) {
+            create_err = ESP_OK;
+            break;
+        }
         s_task = NULL;
-        return ESP_ERR_NO_MEM;
+        if (attempt == 0)
+            ESP_LOGW(TAG, "Ebook worker stack not reclaimable yet "
+                     "(internal free %u B, largest %u B); retrying",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (attempt < retry_max) vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (create_err != ESP_OK) {
+        ESP_LOGE(TAG, "Ebook worker create failed "
+                 "(internal free %u B, largest %u B)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        return create_err;
     }
     atomic_store(&s_worker_running, true);
     ESP_LOGI(TAG, "Ebook worker restarted");
@@ -1002,6 +1027,12 @@ esp_err_t ebook_ensure_started(void)
 void ebook_request_worker_exit(void)
 {
     if (!s_task || !atomic_load(&s_worker_running)) return;
+    /* 本地补丁：音乐解码器驻留时内部堆最大连续块只有约 9 KiB，12 KiB 的
+     * 电子书任务栈无法重建；解码器打开期间保留 worker，关闭后再按需销毁。 */
+    if (audio_output_session_open()) {
+        ESP_LOGD(TAG, "Music decoder open; ebook worker kept");
+        return;
+    }
     atomic_store(&s_worker_exit, true);
     xTaskNotifyGive(s_task);
 }

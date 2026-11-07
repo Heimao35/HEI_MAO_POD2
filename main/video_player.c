@@ -1638,10 +1638,37 @@ esp_err_t video_player_ensure_started(void)
     s_error = false;
     s_skip_next = false;
     s_deadline = 0;
-    if (xTaskCreatePinnedToCore(video_task, "video", VIDEO_TASK_STACK, NULL,
-                                VIDEO_TASK_PRIO, &s_task, 0) != pdPASS) {
+    /* 本地补丁：刚退出的 worker 用 vTaskDelete(NULL) 结束自己，但它的任务栈
+     * 要等空闲任务真正回收后才回到内部堆；s_worker_running 在 vTaskDelete
+     * 之前就已清零，所以上面的等待并不能保证内存已经可用。音乐播放时 CPU0
+     * 上的音频 worker（优先级 6）会连续解码，空闲任务可能几十毫秒得不到调度，
+     * 此时立刻创建 16 KiB 的视频任务会偶发 ESP_ERR_NO_MEM（实机日志：图片
+     * worker 退出后立即进入视频模式）。这里最多重试 150 ms，给空闲任务一次
+     * 回收上一个 worker 栈的机会；正常模式切换第一次就能成功。 */
+    const unsigned retry_max = 30U; /* 30 x 5ms = 最多等待 150ms */
+    esp_err_t create_err = ESP_ERR_NO_MEM;
+    for (unsigned attempt = 0; attempt <= retry_max; ++attempt) {
+        if (xTaskCreatePinnedToCore(video_task, "video", VIDEO_TASK_STACK, NULL,
+                                    VIDEO_TASK_PRIO, &s_task, 0) == pdPASS) {
+            create_err = ESP_OK;
+            break;
+        }
         s_task = NULL;
-        return ESP_ERR_NO_MEM;
+        if (attempt == 0)
+            ESP_LOGW(TAG, "Video worker stack not reclaimable yet "
+                     "(internal free %u B, largest %u B); retrying",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        if (attempt < retry_max) vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (create_err != ESP_OK) {
+        ESP_LOGE(TAG, "Video worker create failed "
+                 "(internal free %u B, largest %u B)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        return create_err;
     }
     atomic_store(&s_worker_running, true);
     ESP_LOGI(TAG, "Video worker restarted");
@@ -1656,6 +1683,15 @@ esp_err_t video_player_ensure_started(void)
 void video_player_request_worker_exit(void)
 {
     if (!s_task || !atomic_load(&s_worker_running)) return;
+    /* 本地补丁：音乐解码器驻留时内部堆只剩十几 KiB、最大连续块约 9 KiB
+     * （实机日志 largest=9216 B），16 KiB 的视频任务栈无法重建。解码器
+     * 打开期间保留 worker；解码器关闭（如播放视频/进入声卡模式）后，下一
+     * 次离开模式再正常销毁。否则会出现“播放音乐→进视频模式→worker 创建
+     * 失败→点视频无反应”。 */
+    if (audio_output_session_open()) {
+        ESP_LOGD(TAG, "Music decoder open; video worker kept");
+        return;
+    }
     if (!enqueue(CMD_SHUTDOWN, 0, 0)) atomic_store(&s_worker_exit, true);
 }
 

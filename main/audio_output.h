@@ -16,6 +16,8 @@ bool audio_output_is_playing(void);
 bool audio_output_is_play_requested(void);
 /* Includes pending natural EOS until playlist continuation consumes it. */
 bool audio_output_is_active(void);
+/* 音乐解码器是否已打开（暂停但保留解码器时同样为 true）。 */
+bool audio_output_session_open(void);
 bool audio_output_take_finished(void);
 /* 外部关机/Light-sleep屏障，不改变用户暂停偏好。true表示已停DMA、关闭
  * 文件、停止后续I2C/解码。调用者必须与false配对；不在LVGL锁内等待。 */
