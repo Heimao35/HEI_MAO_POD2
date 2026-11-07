@@ -24,6 +24,16 @@ endif()
 enable_testing()
 add_test(NAME player_ui COMMAND player_ui_tests)
 
+# 模式切换栏：六个按钮的顺序/尺寸、USB 声卡与拍照入口、矢量相机图标结构。
+add_executable(mode_panel_tests test_mode_panel.c)
+target_include_directories(mode_panel_tests PRIVATE stubs ../media_host/stubs "${REPO}/main" "${REPO}/main/ui")
+target_link_libraries(mode_panel_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(mode_panel_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable -ffunction-sections -fdata-sections)
+  target_link_options(mode_panel_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+endif()
+add_test(NAME mode_panel COMMAND mode_panel_tests)
+
 # Video page object ordering, preview descriptors, canvas handoff and lifecycle
 # with a simulated backend; no SD/JPEG/audio device is touched.
 add_executable(video_ui_tests test_video_ui.c)

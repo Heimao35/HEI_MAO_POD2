@@ -40,6 +40,7 @@ idf_component_register(SRCS "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c
                               "ui/ui_video_player.c"
                               "ui/ui_image_viewer.c"
                               "ui/ui_ebook.c"
+                              "ui/ui_placeholder.c"
                               "ui/ui_mode_panel.c"
                               "ui/ui_adj_panel.c"
                               "ui/ui_settings.c"

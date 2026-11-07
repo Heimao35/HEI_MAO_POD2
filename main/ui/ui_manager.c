@@ -3,7 +3,8 @@
  * @brief UI 管理器实现 —— 页面切换、边缘手势检测、定时刷新
  *
  * 层级关系（从底到顶）：
- *   1. 模式页面（音乐/视频/图片/电子书）—— 同级互斥，同一时间只显示一个
+ *   1. 模式页面（音乐/视频/图片/电子书/USB 声卡/拍照）—— 同级互斥，
+ *      同一时间只显示一个；后两者本轮只是占位页，没有实际功能
  *   2. 锁屏页面 —— 覆盖模式页面
  *   3. 模式切换栏（左侧面板）/ 声光调节栏（右侧面板）
  *   4. 设置页面 —— 全屏覆盖
@@ -20,6 +21,7 @@
 #include "ui_video_player.h"
 #include "ui_image_viewer.h"
 #include "ui_ebook.h"
+#include "ui_placeholder.h"
 #include "ui_mode_panel.h"
 #include "ui_adj_panel.h"
 #include "ui_settings.h"
@@ -348,6 +350,14 @@ void ui_manager_init(void)
 
     ui_ebook_create(scr);
     s_mode_pages[UI_MODE_EBOOK] = ui_ebook_get_page();
+
+    /* USB 声卡与拍照：本轮只有占位页。页面对象与上面四个模式页同级，
+     * 创建顺序保持在锁屏/面板/状态栏之前，z-order 不变。它们同样默认
+     * 隐藏，由下面的统一循环处理；模式切换、锁屏遮挡和手势都走现有
+     * 逻辑，不需要为这两个模式增加 enter/leave 钩子。 */
+    ui_placeholder_create(scr);
+    s_mode_pages[UI_MODE_USB_AUDIO] = ui_placeholder_get_page(UI_MODE_USB_AUDIO);
+    s_mode_pages[UI_MODE_CAMERA] = ui_placeholder_get_page(UI_MODE_CAMERA);
 
     /* 默认只显示音乐页面，其余隐藏 */
     for (int i = 0; i < UI_MODE_MAX; i++) {

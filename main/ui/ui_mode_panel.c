@@ -7,6 +7,11 @@
  *   s_panel    左侧面板容器，宽 UI_MODE_PANEL_WIDTH
  *     └─ 纵向排列的圆角矩形按钮，每个代表一个模式
  *
+ * 模式顺序：音乐、视频、图片、电子书、USB 声卡、拍照。按钮仍是 80x80、
+ * 间距 12px；六个按钮的总高度超过可用高度，面板沿用已有的“纵向可滚动”
+ * 设置（LV_DIR_VER），上下拖动即可看到后面的模式，滚动条保持隐藏。
+ * 新增模式只追加在表尾，不改变原有四项的顺序和按钮尺寸。
+ *
  * 动画：面板从屏幕左侧外滑入/滑出，渐慢曲线。
  * 遮罩（包括静态调暗）已全部移除：原来的整屏遮罩既做 opacity 动画，
  * 又会在每次展开时把整屏压暗；两者都会让 LVGL 对全屏做额外的重绘/
@@ -22,15 +27,28 @@ static lv_obj_t *s_panel   = NULL; /**< 左侧面板容器 */
 static bool s_visible = false;
 static ui_mode_switch_cb_t s_switch_cb = NULL;
 
-/** 模式信息表：符号 + 模式枚举 */
+/** 模式按钮图标的来源。内置符号字体没有相机字符，需要单独绘制。 */
+typedef enum {
+    MODE_ICON_SYMBOL,  /**< LVGL 内置 FontAwesome 符号（LV_SYMBOL_*） */
+    MODE_ICON_CAMERA,  /**< 用 ui_camera_icon_create() 画出的矢量图标 */
+} mode_icon_t;
+
+/** 模式信息表：符号 + 模式枚举 + 图标来源 */
 static const struct {
     const char *symbol;
     ui_mode_t   mode;
+    mode_icon_t icon;
 } s_modes[] = {
-    { LV_SYMBOL_AUDIO,  UI_MODE_MUSIC },  /* 音乐 */
-    { LV_SYMBOL_VIDEO,  UI_MODE_VIDEO },  /* 视频 */
-    { LV_SYMBOL_IMAGE,  UI_MODE_IMAGE },  /* 图片 */
-    { LV_SYMBOL_FILE,   UI_MODE_EBOOK },  /* 电子书 */
+    { LV_SYMBOL_AUDIO,  UI_MODE_MUSIC,     MODE_ICON_SYMBOL },  /* 音乐 */
+    { LV_SYMBOL_VIDEO,  UI_MODE_VIDEO,     MODE_ICON_SYMBOL },  /* 视频 */
+    { LV_SYMBOL_IMAGE,  UI_MODE_IMAGE,     MODE_ICON_SYMBOL },  /* 图片 */
+    { LV_SYMBOL_FILE,   UI_MODE_EBOOK,     MODE_ICON_SYMBOL },  /* 电子书 */
+    /* USB 声卡：内置符号表已包含 USB 字符（0xF287，montserrat_24/48
+     * 都有），直接复用，不需要额外字库或图形绘制。 */
+    { LV_SYMBOL_USB,    UI_MODE_USB_AUDIO, MODE_ICON_SYMBOL },  /* USB 声卡 */
+    /* 拍照：内置字体没有相机字符，改用白色描边的矢量图标；symbol 字段
+     * 不使用，保持 NULL 以免被误当成字体符号。 */
+    { NULL,             UI_MODE_CAMERA,    MODE_ICON_CAMERA },  /* 拍照 */
 };
 #define MODE_COUNT (sizeof(s_modes) / sizeof(s_modes[0]))
 
@@ -114,11 +132,18 @@ void ui_mode_panel_create(lv_obj_t *parent)
         /* 按下时统一提亮并显示白色描边，松开自动恢复。 */
         ui_apply_pressed_style(btn);
 
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, s_modes[i].symbol);
-        lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
-        lv_obj_center(lbl);
+        /* 图标跟随按钮居中：字体符号用 label，拍照模式用矢量图标。
+         * 两种方式占用同一个 80x80 触摸区，按钮尺寸、间距、按下反馈
+         * 和点击回调完全一致。 */
+        if (s_modes[i].icon == MODE_ICON_CAMERA) {
+            lv_obj_center(ui_camera_icon_create(btn, 40));
+        } else {
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, s_modes[i].symbol);
+            lv_obj_set_style_text_color(lbl, UI_COLOR_TEXT, 0);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
+            lv_obj_center(lbl);
+        }
 
         lv_obj_add_event_cb(btn, mode_btn_cb, LV_EVENT_CLICKED,
                             (void *)(uintptr_t)s_modes[i].mode);

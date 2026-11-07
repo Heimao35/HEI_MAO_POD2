@@ -65,6 +65,10 @@ void ui_image_viewer_on_mode_enter(void) {}
 void ui_image_viewer_on_mode_leave(void) {}
 void ui_image_viewer_close_for_lock(void) {}
 bool ui_image_viewer_is_fullscreen_active(void) { return false; }
+/* USB 声卡/拍照占位页由独立测试覆盖；ui_manager 只需要这两个符号，
+ * 返回 NULL 表示本测试不创建额外模式页，手势/锁屏路径保持不变。 */
+void ui_placeholder_create(lv_obj_t *p) { (void)p; }
+lv_obj_t *ui_placeholder_get_page(ui_mode_t mode) { (void)mode; return NULL; }
 void ui_ebook_create(lv_obj_t *p) { (void)p; }
 void ui_ebook_on_mode_enter(void) {}
 void ui_ebook_on_mode_leave(void) {}

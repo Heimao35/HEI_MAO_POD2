@@ -85,6 +85,74 @@ static inline void ui_apply_pressed_style(lv_obj_t *obj)
     lv_obj_set_style_border_opa(obj, LV_OPA_80, LV_STATE_PRESSED);
 }
 
+/**
+ * @brief 用基础图形绘制一个“相机”图标（圆角机身 + 顶部凸起 + 圆形镜头）。
+ *
+ * 不用字体图标的原因：LVGL 内置 Montserrat/FontAwesome 字符集里没有
+ * 相机字符（工程使用的 lv_font_montserrat_24/48 的符号表只包含
+ * LV_SYMBOL_* 那一组，FontAwesome 的 camera(F030) 不在其中）。设置页的
+ * 时钟表盘此前也是出于同样原因改为图形绘制，这里沿用同一做法。
+ *
+ * 图标完全由白色描边 + 透明填充构成，颜色取 UI_COLOR_TEXT，与模式栏里
+ * 其它字体符号的观感一致；所有子对象都不接触摸，点击事件仍然交给父
+ * 按钮/页面处理。尺寸按传入宽度等比换算，因此同一个函数可以同时用于
+ * 80px 模式按钮（约 40px 图标）和占位页的大图标。
+ *
+ * @param parent 父对象（模式按钮、占位页容器等）
+ * @param width  图标宽度（像素）；高度为宽度的 7/8，描边约 width/24
+ * @return 图标容器对象；尺寸已设为 width x height，位置由调用者决定
+ */
+static inline lv_obj_t *ui_camera_icon_create(lv_obj_t *parent, int32_t width)
+{
+    /* 先算出机身、凸起和镜头的比例，避免调用处再写一套像素常量。 */
+    const int32_t w      = width;
+    const int32_t h      = (w * 7) / 8;   /* 整个图标的包围盒高度 */
+    const int32_t body_y = h / 5;         /* 机身顶边，上面留给凸起 */
+    const int32_t body_h = h - body_y;    /* 机身高度 */
+    const int32_t lens   = (w * 5) / 10;  /* 镜头直径 */
+    const int32_t bw     = (w + 12) / 24; /* 描边宽度：40px→2，72px→3 */
+
+    lv_obj_t *icon = lv_obj_create(parent);
+    lv_obj_set_size(icon, w, h);
+    lv_obj_set_style_bg_opa(icon, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(icon, 0, 0);
+    lv_obj_set_style_pad_all(icon, 0, 0);
+    lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 顶部凸起（取景器/闪光灯）：比机身窄，坐在机身上沿。先创建它，
+     * 后面创建的机身边线会盖住接缝，形成连续的水平轮廓。 */
+    lv_obj_t *hump = lv_obj_create(icon);
+    lv_obj_set_size(hump, w / 3, body_y + bw);
+    lv_obj_set_pos(hump, w / 8, 0);
+    lv_obj_set_style_radius(hump, bw, 0);
+    lv_obj_set_style_bg_opa(hump, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(hump, UI_COLOR_TEXT, 0);
+    lv_obj_set_style_border_width(hump, bw, 0);
+    lv_obj_remove_flag(hump, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 机身：占满宽度，圆角随尺寸缩放。 */
+    lv_obj_t *body = lv_obj_create(icon);
+    lv_obj_set_size(body, w, body_h);
+    lv_obj_set_pos(body, 0, body_y);
+    lv_obj_set_style_radius(body, w / 8, 0);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(body, UI_COLOR_TEXT, 0);
+    lv_obj_set_style_border_width(body, bw, 0);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 镜头：位于机身正中，纯圆描边。 */
+    lv_obj_t *lens_obj = lv_obj_create(icon);
+    lv_obj_set_size(lens_obj, lens, lens);
+    lv_obj_set_pos(lens_obj, (w - lens) / 2, body_y + (body_h - lens) / 2);
+    lv_obj_set_style_radius(lens_obj, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(lens_obj, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(lens_obj, UI_COLOR_TEXT, 0);
+    lv_obj_set_style_border_width(lens_obj, bw, 0);
+    lv_obj_remove_flag(lens_obj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    return icon;
+}
+
 /* ======================== 状态栏参数 ======================== */
 /** 状态栏高度 (像素)，同时也是下拉手势的检测区域高度，增大使状态栏更高 */
 #define UI_STATUSBAR_HEIGHT     38
@@ -112,6 +180,12 @@ typedef enum {
     UI_MODE_VIDEO,        /**< 视频播放器模式 */
     UI_MODE_IMAGE,        /**< 图片查看器模式 */
     UI_MODE_EBOOK,        /**< 电子书模式 */
+    /* 以下两个模式本轮只提供入口和占位页，不包含实际功能。
+     * 追加在末尾可以保持既有模式的下标不变：模式切换动画用下标决定
+     * 上下滑动方向，新增项只会出现在电子书之后，原有四页的动画方向
+     * 与顺序完全不受影响。 */
+    UI_MODE_USB_AUDIO,    /**< USB 声卡模式（占位页，未实现音频功能） */
+    UI_MODE_CAMERA,       /**< 拍照模式（占位页，未实现拍照/录像） */
     UI_MODE_MAX           /**< 模式总数，用于数组大小 */
 } ui_mode_t;
 
