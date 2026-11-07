@@ -83,6 +83,9 @@ CONFIG_UAC_BIT_RESOLUTION_16=n
 # 主机（Windows 声音设置/设备管理器）显示的产品名与UAC接口名。
 # 接口名在 components/usb_device_uac/tusb/usb_descriptors.c 的字符串表里。
 CONFIG_UAC_TUSB_PRODUCT="Hei Mao Pod"
+# Windows 按VID/PID+序列号缓存设备实例和音频端点名；换一个新序列号可以
+# 强制主机重新创建音频端点，使托盘/声音设置显示新的产品名。
+CONFIG_UAC_TUSB_SERIAL_NUM="HeiMaoPod-0001"
 # UAC 任务固定在音频核（CPU0），优先级低于 audio_output（6）：
 # 高速口传输完成频率高，放到 UI 核会占满 IDLE1 并导致界面卡死。
 CONFIG_UAC_TINYUSB_TASK_CORE=0
