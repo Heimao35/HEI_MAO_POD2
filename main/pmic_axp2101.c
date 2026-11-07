@@ -23,14 +23,17 @@ static const char *TAG = "axp2101";
 #define PMIC_RETRY_MS       2000
 #define PMIC_IRQ_DRAIN_MAX  4
 
-/* AXP2101 datasheet rev 1.4: pp.31-34, 41-45, 50, 52-54 and 56.
- * Register ownership is limited to the gauge/IRQs and the two user-requested
- * supplies. Charger setpoints and all other rails keep their existing values. */
+/* AXP2101 datasheet rev 1.4: pp.31-34, 41-45, 47-50, 52-54 and 56.
+ * Register ownership is limited to the gauge/IRQs, the two user-requested
+ * supplies and the user-requested fast-charge current (0x62[4:0] only).
+ * Charge voltage/precharge/termination/input-current limits and all other
+ * rails keep their existing values. */
 #define REG_STATUS1         0x00
 #define REG_STATUS2         0x01
 #define REG_MODULE_ENABLE   0x18
 #define REG_IRQ_ENABLE0     0x40
 #define REG_IRQ_STATUS0     0x48
+#define REG_CHARGE_CURRENT  0x62
 #define REG_DCDC_ENABLE     0x80
 #define REG_DCDC4_VOLTAGE   0x85
 #define REG_LDO_ENABLE      0x90
@@ -38,6 +41,10 @@ static const char *TAG = "axp2101";
 #define REG_BATTERY_PERCENT 0xA4
 #define DCDC4_VOLTAGE_MASK  0x7F
 #define ALDO3_VOLTAGE_MASK  0x1F
+#define CHARGE_CURRENT_MASK   0x1F
+/* 0x62[4:0] 编码（手册 p.48）：N<=8 为 25*N mA，N>8 为 200+100*(N-8) mA。
+ * N=14 => 200 + 6*100 = 800mA。 */
+#define CHARGE_CURRENT_800MA  0x0E
 /* DCDC4: 1.20V is code 70, then 20mV/step => 1.80V is code 100.
  * ALDO3: 0.5V + code * 0.1V => 3.3V is code 28. */
 #define DCDC4_1800MV        0x64
@@ -137,6 +144,11 @@ static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_device;
 
 static bool s_configured;
+/* 充电电流设定独立于电池采样：0x62 写失败只影响这一项，不能把电量/VBUS
+ * 标成未知，也不能阻止供电轨初始化重试。PMIC POR 会复位所有寄存器，
+ * 因此每个上电周期都必须重新写一次。 */
+static bool s_charger_configured;
+static bool s_charger_fault_logged;
 /* Rail startup has an independent lifetime from battery sampling. A monitor
  * retry must not cycle chips that have already been powered successfully. */
 static atomic_bool s_outputs_ready;
@@ -185,6 +197,31 @@ static esp_err_t update_field_checked(uint8_t reg, uint8_t mask, uint8_t target)
                  (unsigned)reg, (unsigned)target, (unsigned)after, (unsigned)mask);
         return ESP_ERR_INVALID_RESPONSE;
     }
+    return ESP_OK;
+}
+
+/* 用户明确要求把恒流充电电流设为 800mA。只读改写 0x62[4:0]，其余高位为
+ * 只读/保留；充电使能 0x18[1]、输入限流 0x16、充电电压 0x64、预充/截止
+ * 电流 0x61/0x63 全部保持原值。
+ * 800mA 只是设定上限：手册 p.18/p.21/p.23/p.25 说明实际电流还会被输入
+ * 限流(IINLIM)、VINDPM、TS 电池温度和 die 温度热调节折返压低；AXP2101 是
+ * 线性充电器，(VBUS-VBAT)*ICHG 全部变成 PMIC 发热，本板 5x5mm QFN-40 在
+ * die 到 100C 时会自动降流，所以设 800mA 不等于持续 800mA。
+ * 该寄存器没有掉电保持，PMIC POR 后恢复默认，需每次上电重新写入。 */
+static esp_err_t configure_charger(void)
+{
+    uint8_t before;
+    esp_err_t ret = read_register(REG_CHARGE_CURRENT, &before);
+    if (ret != ESP_OK) return ret;
+    const uint8_t previous = before & CHARGE_CURRENT_MASK;
+    ret = update_field_checked(REG_CHARGE_CURRENT, CHARGE_CURRENT_MASK, CHARGE_CURRENT_800MA);
+    if (ret != ESP_OK) return ret;
+    /* 同一分段编码，仅用于日志显示旧值；保留编码按 0 记录。 */
+    const unsigned previous_ma = previous <= 8 ? previous * 25U
+                               : previous <= 16 ? 200U + 100U * (previous - 8U) : 0U;
+    ESP_LOGI(TAG, "Charger current: %u mA -> 800 mA (reg0x62 0x%02X -> 0x%02X)",
+             previous_ma, (unsigned)before,
+             (unsigned)((before & (uint8_t)~CHARGE_CURRENT_MASK) | CHARGE_CURRENT_800MA));
     return ESP_OK;
 }
 
@@ -350,8 +387,9 @@ static void publish_power_sample(const power_sample_t *sample)
 /* One bounded worker iteration, also exercised by the host regressions.
  * An I2C failure publishes unknown instead of leaving a stale charging icon;
  * the next scheduled attempt re-establishes the monitor without resetting
- * the gauge or changing charger settings. Rail initialization is independent:
- * failure still allows battery/VBUS publication and schedules the same retry. */
+ * the gauge or rewriting an already-accepted charger setting. Rail init and
+ * the charger setpoint are independent: their failure still allows
+ * battery/VBUS publication and schedules the same retry. */
 static esp_err_t monitor_step(void)
 {
     const esp_err_t output_ret = initialize_power_outputs();
@@ -360,6 +398,19 @@ static esp_err_t monitor_step(void)
     if (!s_configured) {
         ret = configure_monitor();
         if (ret == ESP_OK) s_configured = true;
+    }
+    /* 充电电流只配置一次，失败后随正常轮询重试。结果不并入 ret：一次
+     * 0x62 写失败不应让电量/VBUS 变成未知，也不应加快整机轮询节奏。 */
+    if (!s_charger_configured) {
+        const esp_err_t charger_ret = configure_charger();
+        if (charger_ret == ESP_OK) {
+            s_charger_configured = true;
+            s_charger_fault_logged = false;
+        } else if (!s_charger_fault_logged) {
+            ESP_LOGW(TAG, "Charger current setup failed: %s; retrying",
+                     esp_err_to_name(charger_ret));
+            s_charger_fault_logged = true;
+        }
     }
     if (ret == ESP_OK) ret = acknowledge_irqs();
     if (ret == ESP_OK) ret = read_power_sample(&sample);

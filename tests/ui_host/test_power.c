@@ -22,7 +22,7 @@ static int fail_write_reg = -1, ignored_write_reg = -1;
 static unsigned rail_writes;
 static uint8_t rail_write_order[32];
 static unsigned transactions, writes, notifications, buses, devices;
-static unsigned module_writes, irq_writes, status_reads;
+static unsigned module_writes, irq_writes, status_reads, charger_writes;
 static void (*irq_handler)(void *);
 static unsigned battery_updates;
 static bool posted_valid,posted_present,posted_pct_valid,posted_vbus;
@@ -75,7 +75,13 @@ esp_err_t i2c_master_transmit(i2c_master_dev_handle_t device, const uint8_t *wri
     if (unavailable) return ESP_ERR_TIMEOUT;
     uint8_t reg = write[0], value = write[1];
     if (reg == fail_write_reg) return ESP_ERR_TIMEOUT;
-    if (reg == 0x85 || reg == 0x94 || reg == 0x80 || reg == 0x90) {
+    if (reg == 0x62) {
+        /* 只允许改恒流充电电流字段 [4:0]=0b01110(800mA)；只读高位必须原样保留。 */
+        ++charger_writes;
+        assert((value & 0x1F) == 0x0E);
+        assert((value & (uint8_t)~0x1F) == (registers[reg] & (uint8_t)~0x1F));
+        if (reg != ignored_write_reg) registers[reg] = value;
+    } else if (reg == 0x85 || reg == 0x94 || reg == 0x80 || reg == 0x90) {
         assert(rail_writes < sizeof(rail_write_order));
         rail_write_order[rail_writes++] = reg;
         uint8_t mask = reg == 0x85 ? 0x7F : reg == 0x94 ? 0x1F : reg == 0x80 ? 0x08 : 0x04;
@@ -105,8 +111,10 @@ esp_err_t i2c_master_transmit(i2c_master_dev_handle_t device, const uint8_t *wri
         assert((value & 0xFC)==(registers[reg] & 0xFC));
         registers[reg] = value;
     } else {
-        /* Only the two requested rails, gauge and IRQ fields may be written.
-         * Charger settings, other rails, model/reset and key policy are forbidden. */
+        /* Only the two requested rails, gauge, the user-requested charge
+         * current field and IRQ fields may be written. Charge voltage/
+         * precharge/termination/input limit, other rails, model/reset and
+         * key policy remain forbidden. */
         assert(reg >= 0x48 && reg <= 0x4A);
         assert(value && !(value & ~s_irq_masks[reg - 0x48]));
         ++irq_writes;
@@ -215,6 +223,7 @@ int main(void)
     registers[0x80] = 0x65; /* DCDC4 off; DCDC1/3 and mode flags untouched. */
     registers[0x90] = 0xA9; /* ALDO3 off; unrelated LDOs remain enabled. */
     registers[0x18] = 0x03; /* gauge disabled; charger and watchdog bits must survive. */
+    registers[0x62] = 0xE5; /* 只读高位 0xE0 必须保留；原充电电流 N=5(125mA)。 */
     registers[0x00] = (1U << 5) | (1U << 3);
     registers[0x01] = (1U << 5) | 2;
     registers[0xA4] = 68;
@@ -233,6 +242,8 @@ int main(void)
     assert(!memcmp(rail_write_order, expected_order, sizeof(expected_order)));
     assert(registers[0x85] == 0xE4 && registers[0x94] == 0xBC);
     assert(registers[0x80] == 0x6D && registers[0x90] == 0xAD);
+    /* 800mA 只写一次，只读高位保持；充电使能等其余充电寄存器不在写集合内。 */
+    assert((registers[0x62] & 0x1F) == 0x0E && (registers[0x62] & 0xE0) == 0xE0 && charger_writes == 1);
     assert(registers[0x49] == 0);
     assert(!strcmp(lv_label_get_text(s_batt_pct), "68%"));
     assert(!lv_obj_has_flag(s_charge, LV_OBJ_FLAG_HIDDEN));
@@ -287,12 +298,26 @@ int main(void)
     fail_read_reg = -1;
     assert(monitor_step() == ESP_OK && state->battery_pct == 42 && state->charging);
     assert(module_writes == 1); /* already-enabled gauge never reset/re-enabled unnecessarily. */
+    assert(charger_writes == 1); /* 已接受的充电电流不会被后续轮询重写。 */
     unavailable = true;
     assert(monitor_step() == ESP_ERR_TIMEOUT && !state->power_valid);
     unavailable = false;
     assert(monitor_step() == ESP_OK && state->power_valid);
     assert(rail_writes == 4); /* Battery monitor retries never rewrite or cycle good rails. */
     puts("PASS partial/disconnected I2C reads invalidate stale UI; retry preserves gauge and already-started rails");
+
+    /* 充电电流是用户偏好项：写失败不能把电量/VBUS 标成未知，恢复后补写一次。 */
+    registers[0x62] = 0xE5;
+    s_charger_configured = false;
+    fail_write_reg = 0x62;
+    assert(monitor_step() == ESP_OK && !s_charger_configured);
+    assert(state->power_valid && state->battery_pct == 42 && state->charging);
+    fail_write_reg = -1;
+    assert(monitor_step() == ESP_OK && s_charger_configured);
+    assert((registers[0x62] & 0x1F) == 0x0E && (registers[0x62] & 0xE0) == 0xE0);
+    unsigned charger_before = charger_writes;
+    assert(monitor_step() == ESP_OK && charger_writes == charger_before);
+    puts("PASS charge current retries independently, preserves battery state and is not rewritten once accepted");
 
     registers[0x49] |= 1U << 7;
     repeated_irq = true;
