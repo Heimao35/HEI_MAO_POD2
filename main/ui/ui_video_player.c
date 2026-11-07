@@ -1367,6 +1367,11 @@ static void ui_timer_cb(lv_timer_t *timer)
 
 void ui_video_player_on_mode_enter(void)
 {
+    /* 离开视频模式时worker已被销毁；这里按需重建任务。库列表/缩略图
+     * 缓存仍保留，重建后直接显示原页面，不重新扫描SD。 */
+    esp_err_t start_ret = video_player_ensure_started();
+    if (start_ret != ESP_OK)
+        ESP_LOGW(TAG, "Video worker start deferred: %s", esp_err_to_name(start_ret));
     s_player_active = false;
     s_player_transitioning = false;
     s_page_transitioning = false;
@@ -1456,6 +1461,9 @@ void ui_video_player_on_mode_leave(void)
      * 再次进入视频模式时直接显示原页，不重新读索引/缩略图。只有关机、
      * 换卡扫描路径仍调用 video_player_release() 完整释放 PSRAM。 */
     video_player_stop();
+    /* 停止命令之后请求销毁worker：省下16KiB任务栈，PSRAM缓存保留。
+     * 只入队，不在这里等待任务退出（当前处于LVGL回调）。 */
+    video_player_request_worker_exit();
     ui_statusbar_set_visible(true);
 }
 

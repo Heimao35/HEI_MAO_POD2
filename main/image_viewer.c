@@ -71,6 +71,10 @@ static image_viewer_ops_t s_ops;
 static void *s_ops_ctx;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_req_mux;
+/* 本地补丁：离开图片模式时销毁worker任务（省12KiB内部RAM），保留互斥量、
+ * 图片缓冲与缩略图缓存；再次进入时由 image_viewer_ensure_started() 重建。 */
+static atomic_bool s_worker_exit;
+static atomic_bool s_worker_running;
 
 /* worker-only 文件名/计数；UI 只通过 LVGL 回调取得快照。 */
 static char *s_names[IMAGE_FOLDER_COUNT];
@@ -917,6 +921,15 @@ static void image_worker(void *arg)
 {
     (void)arg;
     for (;;) {
+        /* 本地补丁：退出请求优先。UI离开模式前已 cancel_full/clear_thumbs，
+         * 不会有未处理的显示引用；缓冲保留在PSRAM，直接结束任务即可。 */
+        if (atomic_exchange(&s_worker_exit, false)) {
+            s_task = NULL;
+            atomic_store(&s_worker_running, false);
+            ESP_LOGI(TAG, "Image worker exited; %u KiB stack freed",
+                     (unsigned)(IMAGE_WORKER_STACK / 1024U));
+            vTaskDelete(NULL);
+        }
         if (atomic_exchange(&s_scan_requested, false)) {
             do_scan();
             continue;
@@ -947,7 +960,46 @@ esp_err_t image_viewer_init(void)
         s_task = NULL;
         return ESP_ERR_NO_MEM;
     }
+    atomic_store(&s_worker_exit, false);
+    atomic_store(&s_worker_running, true);
     return ESP_OK;
+}
+
+/*
+ * 本地补丁：离开图片模式后按需重建worker。
+ * 只重建任务本身（12KiB栈），请求锁、图片/缩略图缓冲和扫描结果保留，
+ * 重新进入时不重新分配PSRAM、不重扫SD；重新进入后由UI按需补请求。
+ */
+esp_err_t image_viewer_ensure_started(void)
+{
+    if (s_task) return ESP_OK;
+    for (unsigned i = 0; i < 100 && atomic_load(&s_worker_running); ++i)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    if (atomic_load(&s_worker_running)) {
+        ESP_LOGW(TAG, "Image worker still exiting; start deferred");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_req_mux) {
+        s_req_mux = xSemaphoreCreateMutex();
+        if (!s_req_mux) return ESP_ERR_NO_MEM;
+    }
+    atomic_store(&s_worker_exit, false);
+    if (xTaskCreatePinnedToCore(image_worker, "img_view", IMAGE_WORKER_STACK,
+                                NULL, IMAGE_WORKER_PRIO, &s_task, 0) != pdPASS) {
+        s_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    atomic_store(&s_worker_running, true);
+    ESP_LOGI(TAG, "Image worker restarted");
+    return ESP_OK;
+}
+
+/* 请求销毁图片worker（离开图片模式时调用）。只置标志并唤醒，不等待退出。 */
+void image_viewer_request_worker_exit(void)
+{
+    if (!s_task || !atomic_load(&s_worker_running)) return;
+    atomic_store(&s_worker_exit, true);
+    notify_worker();
 }
 
 void image_viewer_set_ops(const image_viewer_ops_t *ops, void *ctx)

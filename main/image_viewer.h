@@ -89,6 +89,14 @@ typedef struct {
 /** @brief 创建 worker 与请求锁（不分配图片大缓冲，首次扫描时才分配）。 */
 esp_err_t image_viewer_init(void);
 
+/*
+ * 本地补丁：离开图片模式时销毁 worker（省12KiB内部RAM），再次进入时重建。
+ * 请求锁、图片缓冲和扫描结果保留；request 只置标志并唤醒，不等待退出，
+ * 可在LVGL锁内调用。
+ */
+void image_viewer_request_worker_exit(void);
+esp_err_t image_viewer_ensure_started(void);
+
 /** @brief 注册 UI 回调；可在 init 之前调用，只保存指针。 */
 void image_viewer_set_ops(const image_viewer_ops_t *ops, void *ctx);
 

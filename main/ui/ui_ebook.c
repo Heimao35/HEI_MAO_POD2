@@ -1328,6 +1328,11 @@ lv_obj_t *ui_ebook_get_page(void)
 
 void ui_ebook_on_mode_enter(void)
 {
+    /* 离开电子书模式时worker已被销毁；按需重建任务。书库表/封面缓存
+     * 保留，重建后直接复用，不重新扫描SD。 */
+    esp_err_t start_ret = ebook_ensure_started();
+    if (start_ret != ESP_OK)
+        ESP_LOGW(TAG, "Ebook worker start deferred: %s", esp_err_to_name(start_ret));
     if (s_reader_active) close_reader(false);
     s_library_visible = false;
     s_lib_transition = false;
@@ -1356,6 +1361,9 @@ void ui_ebook_on_mode_leave(void)
     set_hidden(s_reader, true);
     reader_controls_hide_now();
     set_hidden(s_home, false);
+    /* 关闭阅读页之后销毁worker：省下12KiB任务栈，书库表与封面缓存保留。
+     * 只置标志并唤醒，不在这里等待任务退出（当前处于LVGL回调）。 */
+    ebook_request_worker_exit();
     ui_statusbar_set_visible(true);
 }
 

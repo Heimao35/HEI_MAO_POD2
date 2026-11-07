@@ -56,6 +56,10 @@ void video_player_stop(void)
     test_state = VIDEO_STATE_IDLE;
 }
 void video_player_release(void) { ++releases; }
+/* 本地补丁：离开模式销毁worker、进入时重建；本测试只验证UI调用顺序。 */
+static unsigned worker_exits;
+void video_player_request_worker_exit(void) { ++worker_exits; }
+esp_err_t video_player_ensure_started(void) { return ESP_OK; }
 video_state_t video_player_get_state(void) { return test_state; }
 uint32_t video_player_get_index(void) { return test_index; }
 uint16_t video_player_get_progress(void) { return test_progress; }

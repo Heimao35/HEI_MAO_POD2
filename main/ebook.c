@@ -86,6 +86,10 @@ static void *s_ops_ctx;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_req_mux;
 static SemaphoreHandle_t s_book_mux;
+/* 本地补丁：离开电子书模式时销毁worker任务（省12KiB内部RAM），保留
+ * 两个互斥量、书库表和封面缓存；再次进入由 ebook_ensure_started() 重建。 */
+static atomic_bool s_worker_exit;
+static atomic_bool s_worker_running;
 
 /* 书本表由 worker 构建；s_books 只在 s_book_mux 内交换/读取。 */
 static ebook_book_t *s_books;
@@ -890,6 +894,15 @@ static void ebook_worker(void *arg)
             free_book();
             continue;
         }
+        /* 本地补丁：处理完扫描/关闭请求后才退出，保证阅读正文已释放。
+         * 书库表、封面缓存和互斥量保留，再次进入电子书模式直接复用。 */
+        if (atomic_exchange(&s_worker_exit, false)) {
+            s_task = NULL;
+            atomic_store(&s_worker_running, false);
+            ESP_LOGI(TAG, "Ebook worker exited; %u KiB stack freed",
+                     (unsigned)(EBOOK_WORKER_STACK / 1024U));
+            vTaskDelete(NULL);
+        }
 
         ebook_open_req_t open_req = {0};
         ebook_page_req_t page_req = {0};
@@ -952,7 +965,45 @@ esp_err_t ebook_init(void)
         s_task = NULL;
         return ESP_ERR_NO_MEM;
     }
+    atomic_store(&s_worker_exit, false);
+    atomic_store(&s_worker_running, true);
     return ESP_OK;
+}
+
+/*
+ * 本地补丁：离开电子书模式后按需重建worker。
+ * 只重建任务（12KiB栈）；互斥量、书库表和封面缓存保留，重新进入不需要
+ * 重新扫描或重新分配PSRAM。进入页面后由UI按需补请求。
+ */
+esp_err_t ebook_ensure_started(void)
+{
+    if (s_task) return ESP_OK;
+    for (unsigned i = 0; i < 100 && atomic_load(&s_worker_running); ++i)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    if (atomic_load(&s_worker_running)) {
+        ESP_LOGW(TAG, "Ebook worker still exiting; start deferred");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_req_mux) s_req_mux = xSemaphoreCreateMutex();
+    if (!s_book_mux) s_book_mux = xSemaphoreCreateMutex();
+    if (!s_req_mux || !s_book_mux) return ESP_ERR_NO_MEM;
+    atomic_store(&s_worker_exit, false);
+    if (xTaskCreatePinnedToCore(ebook_worker, "ebook", EBOOK_WORKER_STACK,
+                                NULL, EBOOK_WORKER_PRIO, &s_task, 0) != pdPASS) {
+        s_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    atomic_store(&s_worker_running, true);
+    ESP_LOGI(TAG, "Ebook worker restarted");
+    return ESP_OK;
+}
+
+/* 请求销毁电子书worker（离开电子书模式时调用）。只置标志并唤醒。 */
+void ebook_request_worker_exit(void)
+{
+    if (!s_task || !atomic_load(&s_worker_running)) return;
+    atomic_store(&s_worker_exit, true);
+    xTaskNotifyGive(s_task);
 }
 
 void ebook_set_ops(const ebook_ops_t *ops, void *ctx)

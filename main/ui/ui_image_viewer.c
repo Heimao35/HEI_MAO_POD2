@@ -1044,6 +1044,11 @@ static void ui_timer_cb(lv_timer_t *timer)
 
 void ui_image_viewer_on_mode_enter(void)
 {
+    /* 离开图片模式时worker已被销毁；按需重建任务。缓冲/扫描结果保留，
+     * 重建后不重新分配PSRAM，缺失的缩略图由定时器补请求。 */
+    esp_err_t start_ret = image_viewer_ensure_started();
+    if (start_ret != ESP_OK)
+        ESP_LOGW(TAG, "Image worker start deferred: %s", esp_err_to_name(start_ret));
     if (s_full_active) exit_full();
     if (s_overview_visible) {
         lv_anim_delete(s_overview, overview_anim_x_cb);
@@ -1085,6 +1090,9 @@ void ui_image_viewer_on_mode_leave(void)
     reset_grid();
     image_viewer_cancel_full();
     image_viewer_clear_thumbs();
+    /* 取消在途请求之后销毁worker：省下12KiB任务栈，图片缓冲与扫描结果
+     * 保留；只置标志并唤醒，不在这里等待任务退出（当前处于LVGL回调）。 */
+    image_viewer_request_worker_exit();
     ui_statusbar_set_visible(true);
 }
 

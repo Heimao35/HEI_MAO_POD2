@@ -51,6 +51,10 @@ void image_viewer_request_full(image_folder_t folder, uint32_t index,
 
 void image_viewer_cancel_full(void) { ++cancel_full_calls; }
 void image_viewer_clear_thumbs(void) { ++clear_thumbs_calls; }
+/* 本地补丁：离开模式销毁worker、进入时重建；本测试只验证UI调用顺序。 */
+static unsigned worker_exits;
+void image_viewer_request_worker_exit(void) { ++worker_exits; }
+esp_err_t image_viewer_ensure_started(void) { return ESP_OK; }
 static bool full_active_calls;
 void image_viewer_set_full_active(bool active) { full_active_calls = active; }
 

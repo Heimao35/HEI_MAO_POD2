@@ -69,6 +69,9 @@ typedef enum {
     CMD_SEEK,
     CMD_STOP,
     CMD_RELEASE,
+    /* 只结束worker任务（保留队列/库列表/缩略图缓存），由离开视频模式时
+     * 入队；放在FIFO里保证前面排队的stop/release/pause先执行完。 */
+    CMD_SHUTDOWN,
 } video_cmd_type_t;
 
 typedef struct {
@@ -83,6 +86,11 @@ static video_player_ops_t s_ops;
 static void *s_ops_ctx;
 static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
+/* 本地补丁：离开视频模式时只结束worker任务，队列、库列表与缩略图缓存
+ * 保留在PSRAM，再次进入模式由 video_player_ensure_started() 重建任务。
+ * s_worker_running 由worker在退出前清零，UI线程据此判断能否重建。 */
+static atomic_bool s_worker_exit;
+static atomic_bool s_worker_running;
 static atomic_uint s_state;
 static atomic_uint s_index;
 static atomic_uint s_progress;
@@ -1456,6 +1464,10 @@ static void handle_command(const video_cmd_t *cmd)
     case CMD_RELEASE:
         stop_session(true, true);
         break;
+    case CMD_SHUTDOWN:
+        /* 只置标志；worker在下一轮循环顶部（stop/release之后）退出。 */
+        atomic_store(&s_worker_exit, true);
+        break;
     default:
         break;
     }
@@ -1476,6 +1488,16 @@ static void video_task(void *arg)
         if (atomic_exchange(&s_stop_request, false)) {
             stop_session(false, true);
             continue;
+        }
+        /* 本地补丁：stop/release处理完之后才允许退出，保证播放会话先关闭。
+         * 只销毁任务本身，队列/库列表/缩略图缓存保留在PSRAM，再次进入视频
+         * 模式时由 video_player_ensure_started() 重建任务即可复用。 */
+        if (atomic_exchange(&s_worker_exit, false)) {
+            s_task = NULL;
+            atomic_store(&s_worker_running, false);
+            ESP_LOGI(TAG, "Video worker exited; %u KiB stack freed",
+                     (unsigned)(VIDEO_TASK_STACK / 1024U));
+            vTaskDelete(NULL);
         }
 
         /* 音轨生产者就是本 worker：每轮先补 PCM，再按音频时钟安排下一帧。
@@ -1518,7 +1540,9 @@ static void video_task(void *arg)
 
 static bool enqueue(uint8_t type, uint32_t arg, uint16_t arg16)
 {
-    if (!s_queue) return false;
+    /* worker退出后到再次进入模式之前不接受新命令（队列可能还留着上一条
+     * 无害命令，重建时统一 xQueueReset）。 */
+    if (!s_queue || !atomic_load(&s_worker_running)) return false;
     video_cmd_t cmd = {
         .type = type,
         .arg = arg,
@@ -1565,10 +1589,74 @@ esp_err_t video_player_init(void)
         s_queue = NULL;
         return ESP_ERR_NO_MEM;
     }
+    atomic_store(&s_worker_exit, false);
+    atomic_store(&s_worker_running, true);
     esp_err_t ret = sd_card_set_video_detach_callback(video_detach_cb);
     if (ret != ESP_OK) ESP_LOGW(TAG, "Video SD detach callback unavailable: %s",
                                 esp_err_to_name(ret));
     return ESP_OK;
+}
+
+/*
+ * 本地补丁：离开视频模式后按需重建worker。
+ *
+ * 只重建任务本身，队列、已扫描的库列表、页预览和缩略图 RAM 缓存都保留在
+ * PSRAM 中，所以重新进入视频模式不需要重新扫描 SD，也不需要重新生成缩略图；
+ * 省下的是 16 KiB 任务栈（内部 RAM）。
+ */
+esp_err_t video_player_ensure_started(void)
+{
+    if (s_task) return ESP_OK;
+    /* 上一个worker可能刚清零 running、正在执行 vTaskDelete：短暂等待，
+     * 避免它还在访问模块状态时又创建一个任务。 */
+    for (unsigned i = 0; i < 100 && atomic_load(&s_worker_running); ++i)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    if (atomic_load(&s_worker_running)) {
+        ESP_LOGW(TAG, "Video worker still exiting; start deferred");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_queue) {
+        s_queue = xQueueCreate(VIDEO_QUEUE_LEN, sizeof(video_cmd_t));
+        if (!s_queue) return ESP_ERR_NO_MEM;
+    } else {
+        /* 丢弃离开模式前残留的翻页/扫描命令。 */
+        xQueueReset(s_queue);
+    }
+    /* 重置状态机；库列表与缩略图缓存保留。 */
+    atomic_store(&s_state, VIDEO_STATE_IDLE);
+    atomic_store(&s_index, UINT32_MAX);
+    atomic_store(&s_progress, 0);
+    atomic_store(&s_playing_flag, false);
+    atomic_store(&s_reader_open, false);
+    atomic_store(&s_pending, 0);
+    atomic_store(&s_cancel, false);
+    atomic_store(&s_stop_request, false);
+    atomic_store(&s_release_request, false);
+    atomic_store(&s_worker_exit, false);
+    s_paused = false;
+    s_ended = false;
+    s_error = false;
+    s_skip_next = false;
+    s_deadline = 0;
+    if (xTaskCreatePinnedToCore(video_task, "video", VIDEO_TASK_STACK, NULL,
+                                VIDEO_TASK_PRIO, &s_task, 0) != pdPASS) {
+        s_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    atomic_store(&s_worker_running, true);
+    ESP_LOGI(TAG, "Video worker restarted");
+    return ESP_OK;
+}
+
+/*
+ * 请求销毁视频worker（离开视频模式时调用）。命令排在 stop/release 之后，
+ * worker 会在关闭播放会话后自行退出；队列满时用标志兜底。
+ * 不在这里等待任务退出：调用方位于LVGL回调中，等待会阻塞界面。
+ */
+void video_player_request_worker_exit(void)
+{
+    if (!s_task || !atomic_load(&s_worker_running)) return;
+    if (!enqueue(CMD_SHUTDOWN, 0, 0)) atomic_store(&s_worker_exit, true);
 }
 
 void video_player_set_ops(const video_player_ops_t *ops, void *ctx)

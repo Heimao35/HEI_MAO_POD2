@@ -61,6 +61,14 @@ typedef struct {
 /** @brief 创建命令队列和 worker。由 app_main 在 LVGL 锁外调用一次。 */
 esp_err_t video_player_init(void);
 
+/*
+ * 本地补丁：离开视频模式时销毁 worker（省16KiB内部RAM），再次进入时重建。
+ * 队列、库列表与缩略图缓存保留在PSRAM；两者都只操作标量/任务，不等待
+ * SD/JPEG，可在LVGL锁内调用。request 只入队，不等任务退出。
+ */
+void video_player_request_worker_exit(void);
+esp_err_t video_player_ensure_started(void);
+
 /** @brief 注册 UI 回调。由 UI 创建时调用一次；回调指针生命周期到关机。 */
 void video_player_set_ops(const video_player_ops_t *ops, void *ctx);
 

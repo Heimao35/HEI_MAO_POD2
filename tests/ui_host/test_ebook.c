@@ -22,6 +22,10 @@ static unsigned progress_sets;
 static uint32_t last_saved_page;
 
 esp_err_t ebook_init(void) { return ESP_OK; }
+/* 本地补丁：离开模式销毁worker、进入时重建；本测试只验证UI调用顺序。 */
+static unsigned worker_exits;
+void ebook_request_worker_exit(void) { ++worker_exits; }
+esp_err_t ebook_ensure_started(void) { return ESP_OK; }
 void ebook_set_ops(const ebook_ops_t *value, void *ctx)
 {
     (void)ctx;
