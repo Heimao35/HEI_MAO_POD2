@@ -8,6 +8,7 @@
 #include "motion_sensor.h"
 #include "sd_card.h"
 #include "music_player_adapter.h"
+#include "usb_audio.h"
 #include "ui/ui_manager.h"
 #include "ui/ui_lockscreen.h"
 #include "ui/ui_common.h"
@@ -284,7 +285,10 @@ static void dark_idle(void)
      * uses bounded Light-sleep intervals, retaining PSRAM/UI and allowing SD
      * hotplug and PMIC monitoring to run between intervals. Never Deep-sleep:
      * it cannot resume the existing UI and is inappropriate for this lock. */
-    if (s_touch_probe_pending || system_power_is_active() || music_player_adapter_is_playing() || !ui_lockscreen_anim_is_idle()) { audio_output_sleep(false); return; }
+    /* USB声卡已在主机侧枚举时禁止Light-sleep：休眠会停止I2S/USB事务，
+     * 电脑端的播放会中断或需要重新枚举。屏幕仍可保持熄灭，只是CPU不睡。 */
+    if (s_touch_probe_pending || system_power_is_active() || music_player_adapter_is_playing() ||
+        usb_audio_host_ready() || !ui_lockscreen_anim_is_idle()) { audio_output_sleep(false); return; }
     /* 实际音频已接入：播放/准备期间保持CPU运行；空闲睡眠还需让
      * DAC耳机监测任务确认停稳，避免I2C事务跨越显式Light-sleep。 */
     /* 低电平候选已在screen_power_step中读触摸数据。仍为低时不进入

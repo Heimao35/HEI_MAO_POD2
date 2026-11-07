@@ -26,7 +26,12 @@
 #include <errno.h>
 
 #define INPUT_BYTES (32U*1024U)
-#define READ_BYTES (16U*1024U)
+/* 16KiB -> 8KiB：USB声卡组件（UAC）常驻后占用约15.5KiB内部DMA内存
+ * （SPK FIFO 6.4KiB + 两个4KiB任务栈），16KiB staging + 16KiB I2S DMA
+ * 会超出内部DMA余量（实测加UAC后只剩15,215B，i2s_alloc_dma_desc失败）。
+ * 8KiB 仍是整扇区、64字节对齐的内部DMA读取，读取次数增加约一倍但都在
+ * 同一次SD锁内完成；不改变ring/DMA/解码水位。 */
+#define READ_BYTES (8U*1024U)
 #define SECTOR_BYTES 512U
 #define IO_ALIGNMENT 64U
 #define OUTPUT_MAX_BYTES (65536U*2U*4U) /* FLAC最大块65535帧，双声道32bit */
@@ -78,7 +83,8 @@ static bool s_have_retry,s_hp_dirty,s_hp;
 /* 视频 PCM 模式：共用同一 I2S/DAC/ring，但生产者是视频 worker。
  * s_video_cmd 与音乐命令共用 s_cmd_mux；serial 只用于 open/close，
  * play/flush/eof 用独立原子量，避免频繁重配 I2S。 */
-typedef struct {uint32_t serial;bool active,play;uint32_t rate;uint8_t channels,bits;} video_command_t;
+typedef struct {uint32_t serial;bool active,play;uint32_t rate;uint8_t channels,bits;
+    uint32_t start_bytes;bool no_bluetooth;} video_command_t;
 static video_command_t s_video_cmd;
 static uint32_t s_video_serial;              /* worker 已处理的 serial */
 static bool s_video_worker_active;           /* worker-only：stop_tx 不更新音乐进度 */
@@ -90,6 +96,9 @@ static atomic_bool s_video_eof_req;
 static atomic_bool s_video_started;          /* TX 已启动 */
 static atomic_uint s_video_flush_req,s_video_flush_ack;
 static atomic_uint s_video_rate_pub,s_video_frame_bytes_pub,s_video_bits_pub,s_video_ch_pub;
+/* USB声卡会话：不向蓝牙转发PCM，并使用配置的启动水位。生产者(TinyUSB
+ * 任务)和音频worker不同核，因此用原子量而不是命令结构体传递。 */
+static atomic_bool s_video_no_bt;
 /* 只在音频任务中计时、每 5s 汇总，ISR 仅维护内部 SRAM 中的无锁计数。
  * max 是单次最大墙钟耗时（包括抢占），work 是本窗口各阶段累计墙钟耗时；
  * decoded 是这些解码调用产出的音频时长，不能把单次 67ms 直接当成实时率。
@@ -441,9 +450,9 @@ static esp_err_t read_input(void)
         }
         /* ID3/FLAC帧通常不在扇区边界；直接读到parser的非对齐PSRAM会触发
          * v5.5.4 sdmmc_read_sectors()逐扇区临时DMA中转。物理位置向下对齐，
-         * 一次读16KiB到64字节对齐的内部DMA块，再复制逻辑音频范围。
+         * 一次读READ_BYTES(8KiB)到64字节对齐的内部DMA块，再复制逻辑音频范围。
          * 重读的扇区头最多511字节；尾标签和扇区补齐数据绝不交给解码器。
-         * parser输入固定32KiB，staging固定16KiB，大文件不增加内存占用。 */
+         * parser输入固定32KiB，staging固定8KiB，大文件不增加内存占用。 */
         while(s_raw.len<INPUT_BYTES && s_file_offset<s_file_size) {
             /* 保留本次没有用完的staging尾部，避免32KiB输入只差几字节时
              * 又读取整个16KiB，也避免下轮重读这些已经取到的扇区。 */
@@ -814,7 +823,8 @@ static void video_step(const video_command_t *v)
             esp_err_t ret=configure_tx();
             if(ret!=ESP_OK) {
                 atomic_store(&s_video_failed,true);
-                ESP_LOGW(TAG,"Video PCM unsupported: %s",esp_err_to_name(ret));
+                ESP_LOGW(TAG,"Video PCM unsupported: %s (DMA free %u B)",esp_err_to_name(ret),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
             } else {
                 atomic_store(&s_video_rate_pub,v->rate);
                 atomic_store(&s_video_frame_bytes_pub,(unsigned)v->channels*(v->bits/8));
@@ -825,6 +835,7 @@ static void video_step(const video_command_t *v)
             }
         } else {
             s_video_worker_active=false;
+            atomic_store(&s_video_no_bt,false);
             memset(&s_format,0,sizeof(s_format));
         }
         atomic_store(&s_video_ack,v->serial);
@@ -865,7 +876,9 @@ static void video_step(const video_command_t *v)
         return;
     }
     size_t queued=audio_pcm_queued(&s_pcm);
-    if(!s_tx_on && queued && (queued>=AUDIO_PCM_HIGH_BYTES || atomic_load(&s_video_eof_req))) {
+    /* USB声卡用 cfg.start_bytes 降低启动延迟；视频为0时保持原高水位。 */
+    size_t start_bytes=v->start_bytes?v->start_bytes:AUDIO_PCM_HIGH_BYTES;
+    if(!s_tx_on && queued && (queued>=start_bytes || atomic_load(&s_video_eof_req))) {
         if(start_video_tx()!=ESP_OK) {ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(50));return;}
         atomic_store(&s_video_started,true);
     }
@@ -904,6 +917,9 @@ esp_err_t audio_output_video_open(const audio_output_pcm_cfg_t *cfg)
     s_video_cmd.rate=cfg->sample_rate;
     s_video_cmd.channels=cfg->channels;
     s_video_cmd.bits=cfg->bits;
+    s_video_cmd.start_bytes=cfg->start_bytes;
+    s_video_cmd.no_bluetooth=cfg->no_bluetooth;
+    atomic_store(&s_video_no_bt,cfg->no_bluetooth);
     uint32_t serial=s_video_cmd.serial;
     portEXIT_CRITICAL(&s_cmd_mux);
     /* s_cmd.play 已在视频进入前由调用方置 false；这里只清视频专用请求。 */
@@ -988,7 +1004,7 @@ size_t audio_output_video_write(const void *pcm,size_t frames,uint32_t timeout_m
     while(done<frames) {
         const uint8_t *source=(const uint8_t*)pcm+done*frame_bytes;
         size_t n=audio_pcm_push(&s_pcm,source,frames-done,bits,channels);
-        if(n && bt_audio_is_connected() && rate)
+        if(n && !atomic_load(&s_video_no_bt) && bt_audio_is_connected() && rate)
             bt_stream_write(source,n,bits,channels,rate);
         done+=n;
         if(done==frames) break;
@@ -996,6 +1012,12 @@ size_t audio_output_video_write(const void *pcm,size_t frames,uint32_t timeout_m
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     return done;
+}
+
+size_t audio_output_pcm_queued(void)
+{
+    if(!video_command().active) return 0;
+    return audio_pcm_queued(&s_pcm);
 }
 
 uint64_t audio_output_video_time_us(void)

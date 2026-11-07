@@ -36,6 +36,16 @@ esp_err_t pmic_axp2101_restart(void);
 /* RAM快照：DAC必须等待两路供电配置验证成功后才释放RESET。 */
 bool pmic_axp2101_outputs_ready(void);
 
+/* 最近一次成功采样的 VBUS good（RAM 原子快照）。false 也可能是 I2C 尚
+ * 未成功采样；调用者只能把它当作“是否有外部5V”的提示，不能据此判断
+ * 主机是否存在。 */
+bool pmic_axp2101_vbus_present(void);
+
+/* 请求恒流充电电流（mA）。只改 0x62[4:0]，四舍五入到芯片支持的档位；
+ * 由 PMIC owner 任务在下次循环执行 I2C，可在 LVGL 锁内调用。用于 USB
+ * 声卡模式握手成功后临时降到 300mA，退出时恢复 800mA。 */
+esp_err_t pmic_axp2101_set_charge_current_ma(unsigned ma);
+
 /* Shared I2C1 owner scheduling for RTC requests/INT11. RAM notifications only;
  * the ISR form may only be called from a GPIO ISR. Not new wake sources. */
 void pmic_axp2101_notify_service(void);

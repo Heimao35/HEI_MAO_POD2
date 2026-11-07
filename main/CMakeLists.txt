@@ -1,4 +1,4 @@
-idf_component_register(SRCS "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c" "jpeg_codec.c" "main.c"
+idf_component_register(SRCS "usb_audio.c" "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c" "jpeg_codec.c" "main.c"
                               "sd_card.c"
                               "lock_animation.c"
                               "video_mjpeg.c"
@@ -40,6 +40,7 @@ idf_component_register(SRCS "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c
                               "ui/ui_video_player.c"
                               "ui/ui_image_viewer.c"
                               "ui/ui_ebook.c"
+                              "ui/ui_usb_audio.c"
                               "ui/ui_placeholder.c"
                               "ui/ui_mode_panel.c"
                               "ui/ui_adj_panel.c"
@@ -57,6 +58,7 @@ idf_component_register(SRCS "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c
                                   esp_lcd esp_lcd_touch_cst820
                                   esp_hw_support esp_timer driver
                                   esp_lvgl_port
+                                  usb_device_uac tinyusb
                                   esp_audio_codec spiffs nvs_flash esp_adc esp_driver_i2s)
 
 # Font assets are packaged into a separate read-only-at-runtime SPIFFS image.

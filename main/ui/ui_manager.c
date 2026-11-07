@@ -21,6 +21,7 @@
 #include "ui_video_player.h"
 #include "ui_image_viewer.h"
 #include "ui_ebook.h"
+#include "ui_usb_audio.h"
 #include "ui_placeholder.h"
 #include "ui_mode_panel.h"
 #include "ui_adj_panel.h"
@@ -351,12 +352,13 @@ void ui_manager_init(void)
     ui_ebook_create(scr);
     s_mode_pages[UI_MODE_EBOOK] = ui_ebook_get_page();
 
-    /* USB 声卡与拍照：本轮只有占位页。页面对象与上面四个模式页同级，
-     * 创建顺序保持在锁屏/面板/状态栏之前，z-order 不变。它们同样默认
-     * 隐藏，由下面的统一循环处理；模式切换、锁屏遮挡和手势都走现有
-     * 逻辑，不需要为这两个模式增加 enter/leave 钩子。 */
+    /* USB 声卡：真实页面（壁纸背景 + 全宽控制台），进入/离开模式时由
+     * ui_usb_audio 转交给 usb_audio worker 管理 USB 枚举与音频会话。
+     * 拍照仍是占位页。两者与上面四个模式页同级，创建顺序保持在锁屏/
+     * 面板/状态栏之前，z-order 不变；默认隐藏由下面的统一循环处理。 */
+    ui_usb_audio_create(scr);
+    s_mode_pages[UI_MODE_USB_AUDIO] = ui_usb_audio_get_page();
     ui_placeholder_create(scr);
-    s_mode_pages[UI_MODE_USB_AUDIO] = ui_placeholder_get_page(UI_MODE_USB_AUDIO);
     s_mode_pages[UI_MODE_CAMERA] = ui_placeholder_get_page(UI_MODE_CAMERA);
 
     /* 默认只显示音乐页面，其余隐藏 */
@@ -434,6 +436,8 @@ void ui_manager_switch_mode(ui_mode_t mode)
     if (s_current_mode == UI_MODE_VIDEO) ui_video_player_on_mode_leave();
     if (s_current_mode == UI_MODE_IMAGE) ui_image_viewer_on_mode_leave();
     if (s_current_mode == UI_MODE_EBOOK) ui_ebook_on_mode_leave();
+    /* 离开 USB 声卡：只投递通知，worker 在锁外恢复充电电流并软断开USB。 */
+    if (s_current_mode == UI_MODE_USB_AUDIO) ui_usb_audio_on_mode_leave();
 
     lv_obj_t *old_page = s_mode_pages[s_current_mode];
     lv_obj_t *new_page = s_mode_pages[mode];
@@ -475,6 +479,8 @@ void ui_manager_switch_mode(ui_mode_t mode)
     if (mode == UI_MODE_IMAGE) ui_image_viewer_on_mode_enter();
     /* 电子书模式回到书库入口；阅读页在离开时已关闭并释放正文。 */
     if (mode == UI_MODE_EBOOK) ui_ebook_on_mode_enter();
+    /* USB 声卡：开始等待 VBUS/主机握手；真正初始化在锁外。 */
+    if (mode == UI_MODE_USB_AUDIO) ui_usb_audio_on_mode_enter();
     ESP_LOGI(TAG, "Switched to mode %d", (int)mode);
 }
 

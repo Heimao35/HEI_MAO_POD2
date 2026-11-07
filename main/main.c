@@ -42,6 +42,7 @@
 #include "ebook.h"
 #include "jpeg_codec.h"
 #include "audio_output.h"
+#include "usb_audio.h"
 #include "ui_fonts.h"
 #include "ui_boot.h"
 
@@ -451,6 +452,12 @@ void app_main(void)
      * DAC任务自行等待PMIC供电就绪，全部初始化与文件/I2C在LVGL锁外。 */
     esp_err_t audio_ret=audio_output_init();
     if(audio_ret!=ESP_OK)ESP_LOGE(TAG,"Audio output init failed: %s",esp_err_to_name(audio_ret));
+
+    /* USB 声卡 worker：只创建协调任务，不初始化 USB。进入声卡模式且
+     * PMIC 报告 VBUS 后才初始化 TinyUSB；主循环/开机时间不受影响。 */
+    esp_err_t usb_audio_ret = usb_audio_init();
+    if (usb_audio_ret != ESP_OK)
+        ESP_LOGW(TAG, "USB audio init failed: %s", esp_err_to_name(usb_audio_ret));
 
     app_boot_progress(92,"Starting music library...");
     /* Background SD catalogue/cover/LRC loader. */

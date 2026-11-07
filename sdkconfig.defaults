@@ -69,3 +69,18 @@ CONFIG_LV_FS_POSIX_PATH="/fontfs/"
 
 # Audio DMA callback/ring are in internal RAM; keep feeding during NVS Flash writes.
 CONFIG_I2S_ISR_IRAM_SAFE=y
+
+# USB 声卡（espressif/usb_device_uac v1.3.2）：固定 96 kHz / 24 bit
+# （24-in-24 打包，3 字节/样本）/ 立体声扬声器，无麦克风。
+# 位宽由 choice 决定，CONFIG_UAC_BYTES_PER_SAMPLE 是派生符号、不可直接赋值。
+# 修改采样率或位宽必须同时修改 main/usb_audio.c 的 USB_AUDIO_* 常量，
+# 描述符在编译期生成，两者不一致会导致主机按错误格式发送数据。
+CONFIG_UAC_SAMPLE_RATE=96000
+CONFIG_UAC_SPEAKER_CHANNEL_NUM=2
+CONFIG_UAC_MIC_CHANNEL_NUM=0
+CONFIG_UAC_BIT_RESOLUTION_24_IN_24=y
+CONFIG_UAC_BIT_RESOLUTION_16=n
+# UAC 任务固定在音频核（CPU0），优先级低于 audio_output（6）：
+# 高速口传输完成频率高，放到 UI 核会占满 IDLE1 并导致界面卡死。
+CONFIG_UAC_TINYUSB_TASK_CORE=0
+CONFIG_UAC_SPK_TASK_CORE=0

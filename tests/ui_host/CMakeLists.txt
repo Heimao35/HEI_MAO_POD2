@@ -34,6 +34,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 add_test(NAME mode_panel COMMAND mode_panel_tests)
 
+# USB 声卡页面：壁纸透明背景、全宽控制台、点击切换显隐（220ms 淡入淡出）。
+add_executable(usb_audio_page_tests test_usb_audio_page.c)
+target_include_directories(usb_audio_page_tests PRIVATE stubs ../media_host/stubs "${REPO}/main" "${REPO}/main/ui")
+target_link_libraries(usb_audio_page_tests PRIVATE lvgl_host)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(usb_audio_page_tests PRIVATE -O1 -Wall -Wextra -Wno-unused-variable -ffunction-sections -fdata-sections)
+  target_link_options(usb_audio_page_tests PRIVATE -Wl,--gc-sections -static-libgcc)
+endif()
+add_test(NAME usb_audio_page COMMAND usb_audio_page_tests)
+
 # Video page object ordering, preview descriptors, canvas handoff and lifecycle
 # with a simulated backend; no SD/JPEG/audio device is touched.
 add_executable(video_ui_tests test_video_ui.c)

@@ -1,0 +1,115 @@
+menu "USB Device UAC"
+
+    config USB_DEVICE_UAC_AS_PART
+        bool "Using customer tinyusb configs and descriptors"
+        default n
+        help
+            If enable this feature, will need to write the `tusb_config.h` and `usb_descriptors.c` files in the project.
+
+    config UAC_SPEAKER_CHANNEL_NUM
+        int "UAC Speaker channel number"
+        range 0 8
+        default 1
+
+    config UAC_MIC_CHANNEL_NUM
+        int "UAC mic channel number"
+        range 0 4
+        default 1
+
+    config UAC_SAMPLE_RATE
+        int "UAC sample rate"
+        default 48000
+
+    choice UAC_BIT_RESOLUTION
+        prompt "UAC bit resolution"
+        default UAC_BIT_RESOLUTION_16
+        help
+            Bit resolution used for both speaker (RX) and microphone (TX) streams.
+            EP and software buffers scale automatically with the chosen width.
+
+        config UAC_BIT_RESOLUTION_16
+            bool "16-bit (in 16-bit slot)"
+
+        config UAC_BIT_RESOLUTION_24_IN_24
+            bool "24-bit (in 24-bit slot, packed)"
+
+        config UAC_BIT_RESOLUTION_24_IN_32
+            bool "24-bit (in 32-bit slot)"
+
+        config UAC_BIT_RESOLUTION_32
+            bool "32-bit (in 32-bit slot)"
+    endchoice
+
+    config UAC_BIT_RESOLUTION
+        int
+        default 16 if UAC_BIT_RESOLUTION_16
+        default 24 if UAC_BIT_RESOLUTION_24_IN_24 || UAC_BIT_RESOLUTION_24_IN_32
+        default 32 if UAC_BIT_RESOLUTION_32
+
+    config UAC_BYTES_PER_SAMPLE
+        int
+        default 2 if UAC_BIT_RESOLUTION_16
+        default 3 if UAC_BIT_RESOLUTION_24_IN_24
+        default 4 if UAC_BIT_RESOLUTION_24_IN_32 || UAC_BIT_RESOLUTION_32
+
+    config UAC_SPK_INTERVAL_MS
+        int "UAC SPK interval(ms)"
+        default 10
+        help
+            SPK: The first interval of reading data from UAC device, in ms. And make SPK FIFO to accommodate data of size n milliseconds.
+
+    config UAC_MIC_INTERVAL_MS
+        int "UAC MIC interval(ms)"
+        default 10
+        help
+            MIC: The interval of writing data to UAC device, in ms. Batch fetching data helps reduce latency at the slave end. And make MIC FIFO to accommodate data of size n milliseconds.
+
+    config UAC_SPK_NEW_PLAY_INTERVAL
+        int "UAC SPK new play interval(ms)"
+        default 100
+        help
+            SPK: A new playback is considered if it has been longer than a certain number of milliseconds since the last audio data was received.
+
+    config UAC_SUPPORT_MACOS
+        bool "Support MacOS"
+        default n
+        help
+            Enable conversion from 16.16 to 10.14 format on full-speed devices on MacOS.
+
+    menu "UAC Task Config"
+            config UAC_TINYUSB_TASK_PRIORITY
+                int "Tinyusb task priority"
+                default 5
+                range 1 15
+
+            config UAC_TINYUSB_TASK_CORE
+                int "Tinyusb task core"
+                default -1
+                range -1 1
+
+            config UAC_SPK_TASK_PRIORITY
+                int "SPK task priority"
+                default 5
+                range 1 15
+                depends on UAC_SPEAKER_CHANNEL_NUM != 0
+
+            config UAC_SPK_TASK_CORE
+                int "SPK task core"
+                default -1
+                range -1 1
+                depends on UAC_SPEAKER_CHANNEL_NUM != 0
+
+            config UAC_MIC_TASK_PRIORITY
+                int "MIC task priority"
+                default 5
+                range 1 15
+                depends on UAC_MIC_CHANNEL_NUM != 0
+
+            config UAC_MIC_TASK_CORE
+                int "MIC task core"
+                default -1
+                range -1 1
+                depends on UAC_MIC_CHANNEL_NUM != 0
+    endmenu
+
+endmenu

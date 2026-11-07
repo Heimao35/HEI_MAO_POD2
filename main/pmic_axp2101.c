@@ -149,12 +149,32 @@ static bool s_configured;
  * 因此每个上电周期都必须重新写一次。 */
 static bool s_charger_configured;
 static bool s_charger_fault_logged;
+/* 充电电流请求（0x62 编码+1，0=无请求）。任意任务可写，I2C 只由 PMIC
+ * owner 执行；USB 声卡模式用它临时切到 300mA。 */
+static atomic_uint s_charge_req;
+/* 最近一次有效采样的 VBUS good 快照（RAM），供 USB 声卡判断“有线插入”。 */
+static atomic_bool s_vbus_present;
 /* Rail startup has an independent lifetime from battery sampling. A monitor
  * retry must not cycle chips that have already been powered successfully. */
 static atomic_bool s_outputs_ready;
 bool pmic_axp2101_outputs_ready(void) { return atomic_load(&s_outputs_ready); }
+
+bool pmic_axp2101_vbus_present(void) { return atomic_load(&s_vbus_present); }
+
 static bool s_output_fault_logged;
 static bool s_fault_logged;
+
+static unsigned charge_code_for_ma(unsigned ma); /* 定义在 configure_charger 附近 */
+
+esp_err_t pmic_axp2101_set_charge_current_ma(unsigned ma)
+{
+    if (!s_worker) return ESP_ERR_INVALID_STATE;
+    const unsigned code = charge_code_for_ma(ma);
+    if (code > CHARGE_CURRENT_MASK) return ESP_ERR_INVALID_ARG;
+    atomic_store(&s_charge_req, code + 1U);
+    xTaskNotifyGive(s_worker);
+    return ESP_OK;
+}
 
 typedef struct {
     bool valid;
@@ -200,9 +220,46 @@ static esp_err_t update_field_checked(uint8_t reg, uint8_t mask, uint8_t target)
     return ESP_OK;
 }
 
-/* 用户明确要求把恒流充电电流设为 800mA。只读改写 0x62[4:0]，其余高位为
- * 只读/保留；充电使能 0x18[1]、输入限流 0x16、充电电压 0x64、预充/截止
- * 电流 0x61/0x63 全部保持原值。
+/* 0x62[4:0] 的 mA 换算；保留编码返回 0。 */
+static unsigned charge_ma_for_code(unsigned code)
+{
+    if (code <= 8) return code * 25U;
+    if (code <= 16) return 200U + 100U * (code - 8U);
+    return 0;
+}
+
+/* mA -> 0x62[4:0] 编码；超出 0..1000mA 返回 0xFF。 */
+static unsigned charge_code_for_ma(unsigned ma)
+{
+    if (ma > 1000) return 0xFF;
+    unsigned best = 0, best_diff = UINT32_MAX;
+    for (unsigned code = 0; code <= 16; ++code) {
+        const unsigned value = charge_ma_for_code(code);
+        const unsigned diff = value > ma ? value - ma : ma - value;
+        if (diff < best_diff) { best = code; best_diff = diff; }
+    }
+    return best;
+}
+
+/* 读改写 0x62[4:0] 并回读校验；其余位保持。充电使能、输入限流、充电
+ * 电压、预充/截止电流都不在这里修改。 */
+static esp_err_t apply_charge_current(unsigned code)
+{
+    if (code > CHARGE_CURRENT_MASK) return ESP_ERR_INVALID_ARG;
+    uint8_t before;
+    esp_err_t ret = read_register(REG_CHARGE_CURRENT, &before);
+    if (ret != ESP_OK) return ret;
+    ret = update_field_checked(REG_CHARGE_CURRENT, CHARGE_CURRENT_MASK, (uint8_t)code);
+    if (ret != ESP_OK) return ret;
+    ESP_LOGI(TAG, "Charger current: %u mA -> %u mA (reg0x62 0x%02X -> 0x%02X)",
+             charge_ma_for_code(before & CHARGE_CURRENT_MASK), charge_ma_for_code(code),
+             (unsigned)before,
+             (unsigned)((before & (uint8_t)~CHARGE_CURRENT_MASK) | code));
+    return ESP_OK;
+}
+
+/* 用户明确要求把恒流充电电流设为 800mA；USB 声卡模式在握手成功后通过
+ * pmic_axp2101_set_charge_current_ma(300) 临时降到 300mA，退出时恢复。
  * 800mA 只是设定上限：手册 p.18/p.21/p.23/p.25 说明实际电流还会被输入
  * 限流(IINLIM)、VINDPM、TS 电池温度和 die 温度热调节折返压低；AXP2101 是
  * 线性充电器，(VBUS-VBAT)*ICHG 全部变成 PMIC 发热，本板 5x5mm QFN-40 在
@@ -210,19 +267,28 @@ static esp_err_t update_field_checked(uint8_t reg, uint8_t mask, uint8_t target)
  * 该寄存器没有掉电保持，PMIC POR 后恢复默认，需每次上电重新写入。 */
 static esp_err_t configure_charger(void)
 {
-    uint8_t before;
-    esp_err_t ret = read_register(REG_CHARGE_CURRENT, &before);
-    if (ret != ESP_OK) return ret;
-    const uint8_t previous = before & CHARGE_CURRENT_MASK;
-    ret = update_field_checked(REG_CHARGE_CURRENT, CHARGE_CURRENT_MASK, CHARGE_CURRENT_800MA);
-    if (ret != ESP_OK) return ret;
-    /* 同一分段编码，仅用于日志显示旧值；保留编码按 0 记录。 */
-    const unsigned previous_ma = previous <= 8 ? previous * 25U
-                               : previous <= 16 ? 200U + 100U * (previous - 8U) : 0U;
-    ESP_LOGI(TAG, "Charger current: %u mA -> 800 mA (reg0x62 0x%02X -> 0x%02X)",
-             previous_ma, (unsigned)before,
-             (unsigned)((before & (uint8_t)~CHARGE_CURRENT_MASK) | CHARGE_CURRENT_800MA));
-    return ESP_OK;
+    /* 若启动阶段已有待处理请求（极少见），优先使用请求值，避免开机
+     * 800mA 覆盖用户/USB模式刚下发的设定。 */
+    const unsigned req = atomic_load(&s_charge_req);
+    const unsigned target = req ? req - 1U : CHARGE_CURRENT_800MA;
+    esp_err_t ret = apply_charge_current(target);
+    if (ret == ESP_OK && req) {
+        unsigned expected = req;
+        atomic_compare_exchange_strong(&s_charge_req, &expected, 0);
+    }
+    return ret;
+}
+
+/* 由 PMIC owner 在非暂停状态下执行；一次只处理一个请求，失败时保留
+ * 请求供下一轮轮询重试（I2C 暂时失败不会永久丢失设定）。 */
+static void service_charge_request(void)
+{
+    const unsigned req = atomic_exchange(&s_charge_req, 0);
+    if (!req) return;
+    if (apply_charge_current(req - 1U) != ESP_OK) {
+        unsigned expected = 0;
+        atomic_compare_exchange_strong(&s_charge_req, &expected, req);
+    }
 }
 
 static esp_err_t initialize_power_outputs(void)
@@ -423,6 +489,9 @@ static esp_err_t monitor_step(void)
         ESP_LOGI(TAG, "Monitor communication recovered");
         s_fault_logged = false;
     }
+    /* 仅成功采样时更新：I2C 失败保留上一次已知状态，不把 USB 声卡的
+     * “有线插入”判断误判为拔线。 */
+    if (ret == ESP_OK) atomic_store(&s_vbus_present, sample.vbus_present);
     /* 低电保护独立于 UI 发布：即使 LVGL 锁繁忙，也必须将有效状态/
      * 采样失败告知电源任务。只投递 RAM，不在 PMIC owner 中等待关机。 */
     system_power_update_battery(sample.valid,sample.battery_present,
@@ -491,6 +560,9 @@ static void monitor_task(void *arg)
         service_power_action();
         atomic_store(&s_monitor_busy,true);
         if(!atomic_load(&s_monitor_paused)) {
+            /* 充电电流请求（USB 声卡 300mA/恢复 800mA）只在非暂停时执行，
+             * 与其它 I2C 一样受 Light-sleep 屏障保护。 */
+            service_charge_request();
             TickType_t now=xTaskGetTickCount();
             if(first || notified || (TickType_t)(now-last_poll)>=pdMS_TO_TICKS(poll_ms)) {
                 first=false;last_poll=now;

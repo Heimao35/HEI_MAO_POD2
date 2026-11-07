@@ -34,6 +34,13 @@ typedef struct {
     uint32_t sample_rate; /* 与音乐相同的支持列表 */
     uint8_t channels;     /* 1/2 */
     uint8_t bits;         /* 16/24/32 */
+    /* 可选：启动TX前需要积累的ring字节数；0=沿用视频的高水位。
+     * USB声卡传入较小的值以降低启动延迟（96k/24立体声约576B/ms），
+     * 视频路径不设置该字段，行为不变。 */
+    uint32_t start_bytes;
+    /* true=本会话不向蓝牙送数据（USB声卡独占本机DAC）。视频不设置，
+     * 保持原有的“蓝牙优先”行为。 */
+    bool no_bluetooth;
 } audio_output_pcm_cfg_t;
 
 esp_err_t audio_output_video_open(const audio_output_pcm_cfg_t *cfg);
@@ -44,5 +51,8 @@ void audio_output_video_eof(void);
 size_t audio_output_video_write(const void *pcm,size_t frames,uint32_t timeout_ms);
 /* DMA已消费的真实音频帧对应时间；flush后从0开始。 */
 uint64_t audio_output_video_time_us(void);
+/* 当前PCM会话ring中尚未被DMA消费的字节数；无会话时返回0。
+ * USB声卡用它做主机/DAC时钟漂移修正（少量补帧/丢帧）。 */
+size_t audio_output_pcm_queued(void);
 bool audio_output_video_started(void);
 bool audio_output_video_play_requested(void);

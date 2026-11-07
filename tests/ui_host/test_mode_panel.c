@@ -38,6 +38,10 @@ int main(void)
 
     ui_mode_panel_create(lv_screen_active());
     ui_mode_panel_set_callback(on_switch);
+    /* LVGL 的 coords 在布局前不更新；按真实打开流程先展开再布局，之后
+     * 才能用 lv_obj_get_width/height 断言 80x80。 */
+    ui_mode_panel_show();
+    lv_obj_update_layout(lv_screen_active());
 
     /* 六个模式，原有四项顺序不变，新增两项追加在末尾。 */
     assert(MODE_COUNT == 6);

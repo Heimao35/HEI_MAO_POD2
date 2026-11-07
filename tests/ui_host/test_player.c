@@ -69,6 +69,12 @@ bool ui_image_viewer_is_fullscreen_active(void) { return false; }
  * 返回 NULL 表示本测试不创建额外模式页，手势/锁屏路径保持不变。 */
 void ui_placeholder_create(lv_obj_t *p) { (void)p; }
 lv_obj_t *ui_placeholder_get_page(ui_mode_t mode) { (void)mode; return NULL; }
+/* USB 声卡页面与 USB 会话由独立测试/实机覆盖；ui_manager 只需要创建、
+ * 取页和进入/离开钩子的符号。 */
+void ui_usb_audio_create(lv_obj_t *p) { (void)p; }
+lv_obj_t *ui_usb_audio_get_page(void) { return NULL; }
+void ui_usb_audio_on_mode_enter(void) {}
+void ui_usb_audio_on_mode_leave(void) {}
 void ui_ebook_create(lv_obj_t *p) { (void)p; }
 void ui_ebook_on_mode_enter(void) {}
 void ui_ebook_on_mode_leave(void) {}

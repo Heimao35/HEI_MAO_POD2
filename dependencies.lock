@@ -6,7 +6,7 @@ dependencies:
       require: private
       version: '>=4.1'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 0.5.3
   espressif/esp_audio_codec:
@@ -57,6 +57,22 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 2.7.2
+  espressif/tinyusb:
+    component_hash: a40b7f67df6ac254a4afd96c6401cc56f2059ae747d6d7e66b568bca53ad0edc
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    - esp32h4
+    - esp32s31
+    version: 0.19.0~3
   idf:
     source:
       type: idf
@@ -69,12 +85,14 @@ dependencies:
       type: service
     version: 9.4.0
 direct_dependencies:
+- espressif/cmake_utilities
 - espressif/esp_audio_codec
 - espressif/esp_lcd_co5300
 - espressif/esp_lcd_touch
 - espressif/esp_lvgl_port
+- espressif/tinyusb
 - idf
 - lvgl/lvgl
-manifest_hash: bb7ea6c5da88c182dcb03e31a17bad028d4a6f6982a82ab03c8c84aa04bec570
+manifest_hash: 04086e27f1ebb52062e304b2c9a0863d71ca0c86ca82d1db3ea26cb5f8239411
 target: esp32p4
 version: 2.0.0

@@ -15,3 +15,10 @@ dependencies:
   espressif/esp_audio_codec:
     version: 2.*
     public: false
+  ## USB 声卡（UAC2 扬声器）：UAC 组件已 vendor 到 components/usb_device_uac，
+  ## 并在本地打了两个补丁（HS 等时端点 bInterval=4；新增 uac_device_deinit()
+  ## 在退出声卡模式时释放约15 KiB内部RAM）。这里只保留它依赖的 TinyUSB，
+  ## main 需要直接包含 tusb.h。
+  espressif/tinyusb:
+    version: 0.19.*
+    public: false
