@@ -9,6 +9,7 @@
 #include "screen_power.h"
 #include "system_power.h"
 #include "ui/ui_lockscreen.h"
+#include "worker_task.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_attr.h"
@@ -48,6 +49,12 @@
  * These are BMI2_X/Y/Z or BMI2_NEG_X/Y/Z, not numeric axis indexes. */
 static const struct bmi2_remap s_board_axes = {BMI2_NEG_Y, BMI2_X, BMI2_Z};
 static const char *TAG = "motion_sensor";
+/* 方案 A+（2026-11-14）：BMI270 后台任务常驻，6 KiB 栈由 worker_task.h 从
+ * PSRAM 分配（TCB 仍在内部 RAM），替代原来的内部 6 KiB 栈。任务只做 I2C
+ * 配置/轮询、RTC 快照读取、UI 发布和抬手唤醒请求；RTC 快照来自 PMIC worker
+ * 维护的 RAM 缓存，不访问 NVS/Flash。任务常驻不退出；未来如需退出必须用
+ * worker_task_exit()，不能直接用 vTaskDelete(NULL)，否则 PSRAM 栈不会释放。 */
+#define MOTION_SENSOR_TASK_STACK 6144U
 static i2c_master_dev_handle_t s_device;
 static struct bmi2_dev s_bmi;
 static TaskHandle_t s_worker;
@@ -375,10 +382,15 @@ esp_err_t motion_sensor_init(void)
     /* PMIC/touch already installed the shared service; never uninstall it. */
     ret = gpio_isr_handler_add(IMU_IRQ_GPIO, imu_irq, NULL);
     if (ret != ESP_OK) goto fail;
-    if (xTaskCreate(sensor_worker, "motion_sensor", 6144, NULL, 2, &s_worker) != pdPASS) {
+    if (worker_task_create(sensor_worker, "motion_sensor",
+                           MOTION_SENSOR_TASK_STACK, NULL, 2, &s_worker,
+                           tskNO_AFFINITY) != pdPASS) {
         gpio_isr_handler_remove(IMU_IRQ_GPIO);
+        s_worker = NULL;
+        worker_task_log_create_failure(TAG, "Motion sensor");
         ret = ESP_ERR_NO_MEM; goto fail;
     }
+    ESP_LOGI(TAG, "Motion sensor worker started (PSRAM stack 6 KiB)");
     return ESP_OK;
 fail:
     i2c_master_bus_rm_device(s_device); s_device = NULL;
