@@ -423,9 +423,10 @@ static esp_err_t open_session(command_t c)
     /* 仅选中/开机恢复：只做 probe，不打开音频解码器。
      * FLAC/MP3 解码器打开后其内部缓冲会一直占用内部堆，直到首次播放；
      * 首次播放再申请 I2S 的 8×2KiB MALLOC_CAP_DMA|INTERNAL 缓冲时就会
-     * 出现 i2s_alloc_dma_desc NO_MEM，只能靠 250ms 重试恢复。现在真正
-     * 播放时会以 play=true 重新调用本函数，先 create_tx() 再打开解码器，
-     * 首次播放不再出现这次失败；空闲期也少占一份解码器内存。
+     * 出现 i2s_alloc_dma_desc NO_MEM。现在真正播放时会以 play=true 重新
+     * 调用本函数，先 create_tx() 再打开解码器，避免这种顺序问题；空闲期
+     * 也少占一份解码器内存。2026-11-14 起移除了 NO_MEM 的自动重试：
+     * 若仍分配失败会直接走 fail_current，便于串口定位。
      * 暂停/恢复不受影响：已播放的会话暂停时不会重新进入本函数。 */
     if(!c.play) return ESP_OK;
     /* 真正的播放请求：在打开解码器之前先预留 I2S 通道和 DMA 缓冲。
@@ -707,44 +708,11 @@ static void fail_current(esp_err_t ret,command_t failed)
     portEXIT_CRITICAL(&s_cmd_mux);
 }
 
-/* I2S 首次创建需要 8×2KiB 的内部 DMA 缓冲；FLAC/MP3 解码器刚打开或
- * 后台扫描/封面工作尚未结束时，内部 DMA 堆可能暂时不足。这种错误不应
- * 当成“这首歌无法播放”：关闭本次会话（释放解码器缓冲），保留用户的
- * 播放意图，250ms 后由 output_step 自动从头重新打开（open_session 会
- * 在解码器之前先建 I2S）。最多重试 5 秒，之后仍失败才走 fail_current。
- * 新的选歌/播放/暂停请求（serial/request 变化）立即取消旧的等待。 */
-#define PREPARE_RETRY_MAX 20U
-#define PREPARE_RETRY_MS  250U
-static TickType_t s_prepare_retry_at;
-static uint32_t s_prepare_retry_serial,s_prepare_retry_request;
-static unsigned s_prepare_retries;
-
-static bool prepare_retry_pending(command_t c)
-{
-    return s_prepare_retries && s_prepare_retry_serial==c.serial &&
-           s_prepare_retry_request==c.request &&
-           (int32_t)(xTaskGetTickCount()-s_prepare_retry_at)<0;
-}
-static bool prepare_retry_schedule(command_t c)
-{
-    /* 只在 I2S 尚未创建且用户仍想播放时重试；其它 NO_MEM（输出缓冲增长、
-     * 视频会话等）仍按原错误处理。s_tx 已存在说明 DMA 已经分配成功，
-     * 后续失败不是这类瞬态资源问题。 */
-    if(s_tx || !c.play || c.index==UINT32_MAX)return false;
-    if(s_prepare_retry_serial!=c.serial || s_prepare_retry_request!=c.request) {
-        s_prepare_retry_serial=c.serial;
-        s_prepare_retry_request=c.request;
-        s_prepare_retries=0;
-    }
-    if(s_prepare_retries>=PREPARE_RETRY_MAX)return false;
-    ++s_prepare_retries;
-    s_prepare_retry_at=xTaskGetTickCount()+pdMS_TO_TICKS(PREPARE_RETRY_MS);
-    close_session();
-    ESP_LOGW(TAG,"I2S DMA unavailable; retry %u/%u (DMA free %u B)",
-        s_prepare_retries,(unsigned)PREPARE_RETRY_MAX,
-        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL));
-    return true;
-}
+/* 2026-11-14：移除 I2S DMA NO_MEM 的 250ms×20 自动重试/回退机制。
+ * 该机制会在 staging 增大到 32KiB 后掩盖真实的 DMA 分配失败，让测试无法
+ * 判断是暂时碎片还是持久不足。现在首次播放/切歌遇到 NO_MEM 会直接走
+ * fail_current，打印 ESP_ERR_NO_MEM 并关闭会话；需要重试时由用户重新点
+ * 播放，便于配合串口日志判断 MALLOC_CAP_DMA 余量。 */
 static void poll_headphone(void)
 {
     TickType_t now=xTaskGetTickCount();
@@ -1085,23 +1053,15 @@ static void output_step(void)
             esp_err_t ret=open_session(c);
             if(ret==ESP_ERR_TIMEOUT) {s_current.serial=c.serial-1;return;}
             if(ret!=ESP_OK) {
-                if(ret==ESP_ERR_NO_MEM && prepare_retry_schedule(c))return;
                 fail_current(ret,c);return;
             }
         }
     }
     if(s_decoder && !card_current()) {fail_current(ESP_ERR_INVALID_STATE,c);close_session();return;}
     if(c.play && !s_decoder && c.index!=UINT32_MAX) {
-        /* I2S DMA 暂不可用时的 250ms 等待窗口；新请求会改变 identity，
-         * 不进入等待。 */
-        if(prepare_retry_pending(c)) {
-            ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(20));
-            return;
-        }
         esp_err_t ret=open_session(c);
         if(ret==ESP_ERR_TIMEOUT)return;
         if(ret!=ESP_OK) {
-            if(ret==ESP_ERR_NO_MEM && prepare_retry_schedule(c))return;
             fail_current(ret,c);return;
         }
     }
@@ -1141,10 +1101,8 @@ static void output_step(void)
     bool progress;esp_err_t ret=decode_step(&progress);
     record_max(&s_step_max,step_before);
     if(ret!=ESP_OK && ret!=ESP_ERR_TIMEOUT) {
-        /* 首次准备阶段 I2S 通道/DMA 暂时分配不到：保留播放意图，关闭
-         * 会话后自动重试；解码器已关闭，下一次 open_session 会先建 I2S
-         * 再打开解码器，等价于用户切歌重来，但不需要用户操作。 */
-        if(ret==ESP_ERR_NO_MEM && prepare_retry_schedule(c))return;
+        /* 2026-11-14：不再自动重试 NO_MEM；直接报错，便于串口定位 staging
+         * 32KiB 与 I2S DMA 的余量问题。用户重新点播放即可再次尝试。 */
         fail_current(ret,c);return;
     }
     if(!progress || ret==ESP_ERR_TIMEOUT)
