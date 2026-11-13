@@ -29,6 +29,7 @@
 #include "system_power.h"
 #include "tusb.h"
 #include "usb_device_uac.h"
+#include "worker_task.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -39,6 +40,18 @@
 #include <stddef.h>
 
 static const char *TAG = "usb_audio";
+
+/* 方案 A+（2026-11-14）：USB 声卡协调任务常驻，6 KiB 栈由 worker_task.h
+ * 从 PSRAM 分配（TCB 仍在内部 RAM）。旧实现是内部 4 KiB；UAC 初始化会走
+ * TinyUSB/PHY 的较深调用链，这里顺便加大到 6 KiB，给 usb_audio 任务留出
+ * 栈余量，同时把 4 KiB 普通内部栈换成 PSRAM，降低声卡模式的内部 RAM 压力。
+ *
+ * 本任务只做 UAC 生命周期、PCM 会话开关、充电请求和状态发布；不访问
+ * NVS/Flash（充电请求由 PMIC worker 执行 I2C）。UAC 组件自己的 TinyUSB/
+ * usb_spk_task 仍由组件在内部 RAM 创建，不在此处迁移。
+ * 任务常驻不退出；未来如需退出必须用 worker_task_exit()，不能直接用
+ * vTaskDelete(NULL)，否则 PSRAM 栈不会释放。 */
+#define USB_AUDIO_TASK_STACK 6144U
 
 /* 固定规格：与 sdkconfig 的 CONFIG_UAC_SAMPLE_RATE/BYTES_PER_SAMPLE 对应。
  * 修改这里必须同步修改 sdkconfig（描述符在编译期生成）。 */
@@ -349,10 +362,15 @@ static void usb_audio_task(void *arg)
 esp_err_t usb_audio_init(void)
 {
     if (s_task) return ESP_OK;
-    if (xTaskCreate(usb_audio_task, "usb_audio", 4096, NULL, 4, &s_task) != pdPASS) {
+    /* 方案 A+：6 KiB PSRAM 栈，优先级 4、不绑核与原实现一致。
+     * 本任务不访问 NVS/Flash，满足 worker_task.h 的使用前提。 */
+    if (worker_task_create(usb_audio_task, "usb_audio", USB_AUDIO_TASK_STACK,
+                           NULL, 4, &s_task, tskNO_AFFINITY) != pdPASS) {
         s_task = NULL;
+        worker_task_log_create_failure(TAG, "USB audio");
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG, "USB audio worker started (PSRAM stack 6 KiB)");
     return ESP_OK;
 }
 
