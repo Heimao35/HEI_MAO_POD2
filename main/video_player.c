@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "worker_task.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -69,9 +70,6 @@ typedef enum {
     CMD_SEEK,
     CMD_STOP,
     CMD_RELEASE,
-    /* 只结束worker任务（保留队列/库列表/缩略图缓存），由离开视频模式时
-     * 入队；放在FIFO里保证前面排队的stop/release/pause先执行完。 */
-    CMD_SHUTDOWN,
 } video_cmd_type_t;
 
 typedef struct {
@@ -86,11 +84,16 @@ static video_player_ops_t s_ops;
 static void *s_ops_ctx;
 static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
-/* 本地补丁：离开视频模式时只结束worker任务，队列、库列表与缩略图缓存
- * 保留在PSRAM，再次进入模式由 video_player_ensure_started() 重建任务。
- * s_worker_running 由worker在退出前清零，UI线程据此判断能否重建。 */
-static atomic_bool s_worker_exit;
-static atomic_bool s_worker_running;
+/* 2026-11-14（方案 A+）：worker 首次进入视频模式时创建，之后常驻，不再
+ * 销毁。与旧 d655aa2/ac1c1ab 的“离开模式销毁、进入模式重建”不同：
+ * - 任务栈由 worker_task.h 统一放在 PSRAM，不再占用 282KB 内部堆；
+ * - 因此不存在反复申请/释放 16KB 内部连续块的问题，也就不需要
+ *   audio_output_session_open() 之类的“解码器驻留时保留 worker”判断；
+ * - 离开视频模式仍会 stop/release 播放会话、视频文件、帧缓冲和音轨，
+ *   只保留队列、库索引和缩略图缓存；worker 空闲时阻塞在队列上，不占 CPU。
+ *
+ * 新增后台任务时请沿用同一约定：栈放 PSRAM、首次使用创建后常驻；只有
+ * 会访问 NVS/Flash 的任务才继续使用内部栈。详见 worker_task.h。 */
 static atomic_uint s_state;
 static atomic_uint s_index;
 static atomic_uint s_progress;
@@ -1464,10 +1467,6 @@ static void handle_command(const video_cmd_t *cmd)
     case CMD_RELEASE:
         stop_session(true, true);
         break;
-    case CMD_SHUTDOWN:
-        /* 只置标志；worker在下一轮循环顶部（stop/release之后）退出。 */
-        atomic_store(&s_worker_exit, true);
-        break;
     default:
         break;
     }
@@ -1489,16 +1488,11 @@ static void video_task(void *arg)
             stop_session(false, true);
             continue;
         }
-        /* 本地补丁：stop/release处理完之后才允许退出，保证播放会话先关闭。
-         * 只销毁任务本身，队列/库列表/缩略图缓存保留在PSRAM，再次进入视频
-         * 模式时由 video_player_ensure_started() 重建任务即可复用。 */
-        if (atomic_exchange(&s_worker_exit, false)) {
-            s_task = NULL;
-            atomic_store(&s_worker_running, false);
-            ESP_LOGI(TAG, "Video worker exited; %u KiB stack freed",
-                     (unsigned)(VIDEO_TASK_STACK / 1024U));
-            vTaskDelete(NULL);
-        }
+        /* 方案 A+：worker 首次创建后常驻，不在这里退出，也不再调用
+         * vTaskDelete(NULL)。任务栈由 xTaskCreatePinnedToCoreWithCaps 从
+         * PSRAM 静态分配；若未来确实需要退出，必须调用
+         * worker_task_exit()（vTaskDeleteWithCaps），普通 vTaskDelete 不会
+         * 释放 PSRAM 栈，会造成泄漏。 */
 
         /* 音轨生产者就是本 worker：每轮先补 PCM，再按音频时钟安排下一帧。
          * ring 满时 feed_audio 会保留尾部并在下一次继续，绝不丢样本。 */
@@ -1540,9 +1534,10 @@ static void video_task(void *arg)
 
 static bool enqueue(uint8_t type, uint32_t arg, uint16_t arg16)
 {
-    /* worker退出后到再次进入模式之前不接受新命令（队列可能还留着上一条
-     * 无害命令，重建时统一 xQueueReset）。 */
-    if (!s_queue || !atomic_load(&s_worker_running)) return false;
+    /* 方案 A+：worker 创建后常驻，不再有“退出窗口”。首次创建前队列可能
+     * 已有命令；ensure_started() 会用 xQueueReset 丢弃，避免旧命令在新
+     * 会话里执行。 */
+    if (!s_queue) return false;
     video_cmd_t cmd = {
         .type = type,
         .arg = arg,
@@ -1568,7 +1563,10 @@ static void video_detach_cb(void)
 
 esp_err_t video_player_init(void)
 {
-    if (s_task) return ESP_ERR_INVALID_STATE;
+    /* 方案 A+：init 只建立常驻的队列和 SD 卸载回调，不创建任务。
+     * worker 在第一次进入视频模式时由 video_player_ensure_started() 创建，
+     * 之后一直保留；它的 16 KiB 栈在 PSRAM，不占内部堆。 */
+    if (s_queue) return ESP_OK; /* 幂等：正常启动只调用一次 */
     atomic_init(&s_state, VIDEO_STATE_IDLE);
     atomic_init(&s_index, UINT32_MAX);
     atomic_init(&s_progress, 0);
@@ -1583,43 +1581,38 @@ esp_err_t video_player_init(void)
 
     s_queue = xQueueCreate(VIDEO_QUEUE_LEN, sizeof(video_cmd_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
-    if (xTaskCreatePinnedToCore(video_task, "video", VIDEO_TASK_STACK, NULL,
-                                VIDEO_TASK_PRIO, &s_task, 0) != pdPASS) {
-        vQueueDelete(s_queue);
-        s_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    atomic_store(&s_worker_exit, false);
-    atomic_store(&s_worker_running, true);
     esp_err_t ret = sd_card_set_video_detach_callback(video_detach_cb);
     if (ret != ESP_OK) ESP_LOGW(TAG, "Video SD detach callback unavailable: %s",
                                 esp_err_to_name(ret));
+    ESP_LOGI(TAG, "Video queue ready; worker starts on first mode entry");
     return ESP_OK;
 }
 
 /*
- * 本地补丁：离开视频模式后按需重建worker。
+ * 方案 A+：首次进入视频模式时创建 worker，之后常驻。
  *
- * 只重建任务本身，队列、已扫描的库列表、页预览和缩略图 RAM 缓存都保留在
- * PSRAM 中，所以重新进入视频模式不需要重新扫描 SD，也不需要重新生成缩略图；
- * 省下的是 16 KiB 任务栈（内部 RAM）。
+ * 为什么不再销毁/重建：
+ * - 旧逻辑在通用内部堆里反复申请 16 KiB 栈；TLSF 不能搬移/合并正在使用
+ *   的对象，栈块一旦被 12 KiB/4 KiB 的其它分配切开，就再也拼不回 16 KiB
+ *   连续块。实机出现过 internal free 仍有十几 KiB、largest block 却只有
+ *   9 KiB，导致 worker 创建失败。
+ * - 现在栈由 worker_task.h 统一从 PSRAM 分配（TCB 仍在内部 RAM），内部
+ *   堆完全不参与任务栈，不再产生这类碎片；PSRAM 有 32 MB，空闲 worker
+ *   不占 CPU，常驻成本只有栈本身。
+ * - 队列、库列表、页预览和缩略图缓存仍然保留；离开模式时的 stop/release
+ *   仍会关闭视频/音轨文件并释放帧缓冲，不改变原有播放语义。
+ *
+ * 新增后台任务请沿用“首次使用创建、之后常驻、栈在 PSRAM”的模式；只有
+ * 会调用 NVS/Flash 的任务才继续使用内部栈（见 worker_task.h 的说明）。
  */
 esp_err_t video_player_ensure_started(void)
 {
-    if (s_task) return ESP_OK;
-    /* 上一个worker可能刚清零 running、正在执行 vTaskDelete：短暂等待，
-     * 避免它还在访问模块状态时又创建一个任务。 */
-    for (unsigned i = 0; i < 100 && atomic_load(&s_worker_running); ++i)
-        vTaskDelay(pdMS_TO_TICKS(1));
-    if (atomic_load(&s_worker_running)) {
-        ESP_LOGW(TAG, "Video worker still exiting; start deferred");
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (s_task) return ESP_OK; /* 已创建：永久复用，不再重建 */
     if (!s_queue) {
         s_queue = xQueueCreate(VIDEO_QUEUE_LEN, sizeof(video_cmd_t));
         if (!s_queue) return ESP_ERR_NO_MEM;
     } else {
-        /* 丢弃离开模式前残留的翻页/扫描命令。 */
+        /* 丢弃首次创建前/上次离开前残留的翻页、扫描命令。 */
         xQueueReset(s_queue);
     }
     /* 重置状态机；库列表与缩略图缓存保留。 */
@@ -1632,67 +1625,41 @@ esp_err_t video_player_ensure_started(void)
     atomic_store(&s_cancel, false);
     atomic_store(&s_stop_request, false);
     atomic_store(&s_release_request, false);
-    atomic_store(&s_worker_exit, false);
     s_paused = false;
     s_ended = false;
     s_error = false;
     s_skip_next = false;
     s_deadline = 0;
-    /* 本地补丁：刚退出的 worker 用 vTaskDelete(NULL) 结束自己，但它的任务栈
-     * 要等空闲任务真正回收后才回到内部堆；s_worker_running 在 vTaskDelete
-     * 之前就已清零，所以上面的等待并不能保证内存已经可用。音乐播放时 CPU0
-     * 上的音频 worker（优先级 6）会连续解码，空闲任务可能几十毫秒得不到调度，
-     * 此时立刻创建 16 KiB 的视频任务会偶发 ESP_ERR_NO_MEM（实机日志：图片
-     * worker 退出后立即进入视频模式）。这里最多重试 150 ms，给空闲任务一次
-     * 回收上一个 worker 栈的机会；正常模式切换第一次就能成功。 */
-    const unsigned retry_max = 30U; /* 30 x 5ms = 最多等待 150ms */
-    esp_err_t create_err = ESP_ERR_NO_MEM;
-    for (unsigned attempt = 0; attempt <= retry_max; ++attempt) {
-        if (xTaskCreatePinnedToCore(video_task, "video", VIDEO_TASK_STACK, NULL,
-                                    VIDEO_TASK_PRIO, &s_task, 0) == pdPASS) {
-            create_err = ESP_OK;
-            break;
-        }
+
+    /* 栈指针在 PSRAM；任务永不退出，因此不需要 vTaskDeleteWithCaps。
+     * 首次创建只需一次分配；失败说明 PSRAM 已异常紧张，打印 PSRAM 和内部
+     * 堆的余量，方便定位（不是内部任务栈碎片问题）。 */
+    if (worker_task_create(video_task, "video", VIDEO_TASK_STACK, NULL,
+                           VIDEO_TASK_PRIO, &s_task, 0) != pdPASS) {
         s_task = NULL;
-        if (attempt == 0)
-            ESP_LOGW(TAG, "Video worker stack not reclaimable yet "
-                     "(internal free %u B, largest %u B); retrying",
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)heap_caps_get_largest_free_block(
-                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        if (attempt < retry_max) vTaskDelay(pdMS_TO_TICKS(5));
+        worker_task_log_create_failure(TAG, "Video");
+        return ESP_ERR_NO_MEM;
     }
-    if (create_err != ESP_OK) {
-        ESP_LOGE(TAG, "Video worker create failed "
-                 "(internal free %u B, largest %u B)",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(
-                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        return create_err;
-    }
-    atomic_store(&s_worker_running, true);
-    ESP_LOGI(TAG, "Video worker restarted");
+    ESP_LOGI(TAG, "Video worker started (PSRAM stack %u KiB)",
+             (unsigned)(VIDEO_TASK_STACK / 1024U));
     return ESP_OK;
 }
 
 /*
- * 请求销毁视频worker（离开视频模式时调用）。命令排在 stop/release 之后，
- * worker 会在关闭播放会话后自行退出；队列满时用标志兜底。
- * 不在这里等待任务退出：调用方位于LVGL回调中，等待会阻塞界面。
+ * 方案 A+：worker 首次创建后常驻，离开视频模式时不再销毁任务。
+ *
+ * 该函数保留为 UI 的兼容入口，故意为空：UI 仍按原时序先 stop 再调用本
+ * 函数，但播放会话、文件、帧缓冲的释放由 video_player_stop() 完成，队列/
+ * 库列表/缩略图缓存继续保留。这样运行期没有任何任务栈分配/释放，也不会
+ * 再出现“内部堆最大连续块不足导致视频 worker 创建失败”。
+ *
+ * 如果将来某个新任务确实需要在空闲时归还内存，请使用 worker_task_exit()
+ * （vTaskDeleteWithCaps），不要直接用 vTaskDelete(NULL)：后者的 PSRAM 栈
+ * 不会被释放。
  */
 void video_player_request_worker_exit(void)
 {
-    if (!s_task || !atomic_load(&s_worker_running)) return;
-    /* 本地补丁：音乐解码器驻留时内部堆只剩十几 KiB、最大连续块约 9 KiB
-     * （实机日志 largest=9216 B），16 KiB 的视频任务栈无法重建。解码器
-     * 打开期间保留 worker；解码器关闭（如播放视频/进入声卡模式）后，下一
-     * 次离开模式再正常销毁。否则会出现“播放音乐→进视频模式→worker 创建
-     * 失败→点视频无反应”。 */
-    if (audio_output_session_open()) {
-        ESP_LOGD(TAG, "Music decoder open; video worker kept");
-        return;
-    }
-    if (!enqueue(CMD_SHUTDOWN, 0, 0)) atomic_store(&s_worker_exit, true);
+    /* 有意留空。 */
 }
 
 void video_player_set_ops(const video_player_ops_t *ops, void *ctx)

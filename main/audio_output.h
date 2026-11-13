@@ -16,7 +16,9 @@ bool audio_output_is_playing(void);
 bool audio_output_is_play_requested(void);
 /* Includes pending natural EOS until playlist continuation consumes it. */
 bool audio_output_is_active(void);
-/* 音乐解码器是否已打开（暂停但保留解码器时同样为 true）。 */
+/* 音乐解码器是否已打开（暂停但保留解码器时同样为 true）。
+ * 注：模式 worker 已改为 PSRAM 栈常驻（方案 A+），生命周期不再依赖此
+ * 返回值；保留该接口用于诊断/未来按需策略。 */
 bool audio_output_session_open(void);
 bool audio_output_take_finished(void);
 /* 外部关机/Light-sleep屏障，不改变用户暂停偏好。true表示已停DMA、关闭

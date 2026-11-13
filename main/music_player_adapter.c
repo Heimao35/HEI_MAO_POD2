@@ -3,9 +3,6 @@
 #include "music_library.h"
 #include "audio_player.h"
 #include "audio_output.h"
-#include "video_player.h"
-#include "image_viewer.h"
-#include "ebook.h"
 #include "screen_power.h"
 #include "cover_loader.h"
 #include "music_background.h"
@@ -86,38 +83,14 @@ bool music_player_adapter_pause(bool pause)
 
 static bool media_available(void);
 
-/*
- * 本地补丁：音乐解码器打开后会占满内部堆（实机日志：解码器驻留时
- * internal free 约 17 KiB，最大连续块只有 9216 B），12 KiB/16 KiB 的
- * 模式 worker 任务栈无法再创建。因此真正开始播放前（此时解码器尚未打开、
- * 内部 RAM 充足）先把三个按需 worker 建出来；解码器打开期间三个 UI 的
- * 离开钩子也不会销毁它们（见 *_request_worker_exit 中的
- * audio_output_session_open() 判断）。
- *
- * 效果：没播放过音乐时仍按需释放约 40 KiB；播放音乐后不会再出现
- * “进入视频模式时 Video worker create failed: largest 9216 B，点视频
- * 无反应”，视频播放时的原有流程会先暂停音乐并关闭解码器，把内存让出来。
- */
-static void ensure_mode_workers_before_audio(void)
-{
-    esp_err_t ret = video_player_ensure_started();
-    if (ret != ESP_OK)
-        ESP_LOGW(TAG, "Video worker prestart failed: %s", esp_err_to_name(ret));
-    ret = image_viewer_ensure_started();
-    if (ret != ESP_OK)
-        ESP_LOGW(TAG, "Image worker prestart failed: %s", esp_err_to_name(ret));
-    ret = ebook_ensure_started();
-    if (ret != ESP_OK)
-        ESP_LOGW(TAG, "Ebook worker prestart failed: %s", esp_err_to_name(ret));
-}
-
 static void select_song(uint32_t index)
 {
     /* UI callbacks post one scalar index; the media task performs all file I/O. */
     if (media_paused()) return;
-    /* 只有用户选歌（autoplay）才会打开解码器；开机恢复只选中不播放，
-     * 不需要预建 worker。 */
-    if (!s_restore_only) ensure_mode_workers_before_audio();
+    /* 方案 A+（2026-11-14）：视频/图片/电子书 worker 首次进入各自模式时
+     * 才创建，栈在 PSRAM，内部堆不参与任务栈分配。因此选歌/播放不再需要
+     * 提前预建三个 worker，也不再依赖 audio_output_session_open() 判断
+     * 解码器是否驻留；这里只维护音乐选择与解码器请求。 */
     s_selected_index = index;
     audio_output_select(index,sd_card_get_generation(),!s_restore_only);
     ++s_request_serial;
@@ -518,14 +491,6 @@ static void media_worker(void *arg)
     }
 }
 
-/* 播放按钮（set_playing(true)）同样会打开解码器；恢复已暂停的会话时
- * worker 已存在，ensure 会立即返回，不会重复分配。 */
-static void adapter_set_playing(bool play)
-{
-    if (play) ensure_mode_workers_before_audio();
-    audio_output_set_playing(play);
-}
-
 esp_err_t music_player_adapter_init(void)
 {
     if (s_worker) return ESP_ERR_INVALID_STATE;
@@ -547,7 +512,7 @@ esp_err_t music_player_adapter_init(void)
         .get_duration_sec = get_duration_sec,
         .get_lyric_line = get_lyric_line,
         .is_playing = is_playing,
-        .set_playing = adapter_set_playing,
+        .set_playing = audio_output_set_playing,
         .is_play_requested = audio_output_is_play_requested,
         .take_finished = audio_output_take_finished,
     };

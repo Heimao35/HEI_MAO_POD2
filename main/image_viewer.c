@@ -12,8 +12,8 @@
  */
 #include "image_viewer.h"
 
-#include "audio_output.h"
 #include "jpeg_codec.h"
+#include "worker_task.h"
 #include "sd_bulk_read.h"
 #include "sd_card.h"
 #include "thumb_cache.h"
@@ -39,8 +39,8 @@ static const char *TAG = "image_viewer";
 #define IMAGE_DIR_CAM       SD_SYS_DIR "/MEDIA/cam"
 #define IMAGE_DIR_PICTURES  SD_SYS_DIR "/MEDIA/pictures"
 #define IMAGE_SD_LOCK_MS    5000U
-/* 12 KiB：与音乐扫描 worker 相当；JPEG 输出/输入缓冲都在 PSRAM 堆上，
- * 任务栈只保留 FatFs 调用和局部路径，避免挤占内部 DMA 余量。 */
+/* 12 KiB：worker 栈由 worker_task.h 从 PSRAM 分配（方案 A+），内部堆不再
+ * 参与任务栈；JPEG 输出/输入缓冲同样在 PSRAM。 */
 #define IMAGE_WORKER_STACK  12288U
 #define IMAGE_WORKER_PRIO   5
 
@@ -72,10 +72,13 @@ static image_viewer_ops_t s_ops;
 static void *s_ops_ctx;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_req_mux;
-/* 本地补丁：离开图片模式时销毁worker任务（省12KiB内部RAM），保留互斥量、
- * 图片缓冲与缩略图缓存；再次进入时由 image_viewer_ensure_started() 重建。 */
-static atomic_bool s_worker_exit;
-static atomic_bool s_worker_running;
+/* 方案 A+（2026-11-14）：worker 首次进入图片模式时创建，之后常驻。
+ * 12 KiB 任务栈由 worker_task.h 从 PSRAM 分配，内部堆不参与栈分配；因此
+ * 不再需要 d655aa2/ac1c1ab 的“离开销毁、进入重建”和解码器驻留判断。
+ * 离开模式仍会 cancel_full/clear_thumbs，worker 空闲时阻塞在通知上。
+ *
+ * 新增后台任务请沿用同一约定：栈放 PSRAM、首次使用创建后常驻；只有会
+ * 访问 NVS/Flash 的任务才使用内部栈。详见 worker_task.h。 */
 
 /* worker-only 文件名/计数；UI 只通过 LVGL 回调取得快照。 */
 static char *s_names[IMAGE_FOLDER_COUNT];
@@ -922,15 +925,9 @@ static void image_worker(void *arg)
 {
     (void)arg;
     for (;;) {
-        /* 本地补丁：退出请求优先。UI离开模式前已 cancel_full/clear_thumbs，
-         * 不会有未处理的显示引用；缓冲保留在PSRAM，直接结束任务即可。 */
-        if (atomic_exchange(&s_worker_exit, false)) {
-            s_task = NULL;
-            atomic_store(&s_worker_running, false);
-            ESP_LOGI(TAG, "Image worker exited; %u KiB stack freed",
-                     (unsigned)(IMAGE_WORKER_STACK / 1024U));
-            vTaskDelete(NULL);
-        }
+        /* 方案 A+：worker 首次创建后常驻，不退出、不调用 vTaskDelete。
+         * 任务栈来自 PSRAM；若未来确实要退出，必须用 worker_task_exit()
+         * （vTaskDeleteWithCaps），普通 vTaskDelete 不会释放 PSRAM 栈。 */
         if (atomic_exchange(&s_scan_requested, false)) {
             do_scan();
             continue;
@@ -951,86 +948,61 @@ static void image_worker(void *arg)
 
 esp_err_t image_viewer_init(void)
 {
-    if (s_task) return ESP_OK;
+    /* 方案 A+：init 只创建请求互斥量，不创建任务。worker 在第一次进入
+     * 图片模式（或壁纸选择页 ensure）时创建，之后常驻；12 KiB 栈在 PSRAM。 */
+    if (s_req_mux) return ESP_OK; /* 幂等 */
     s_req_mux = xSemaphoreCreateMutex();
     if (!s_req_mux) return ESP_ERR_NO_MEM;
-    if (xTaskCreatePinnedToCore(image_worker, "img_view", IMAGE_WORKER_STACK,
-                                NULL, IMAGE_WORKER_PRIO, &s_task, 0) != pdPASS) {
-        vSemaphoreDelete(s_req_mux);
-        s_req_mux = NULL;
-        s_task = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    atomic_store(&s_worker_exit, false);
-    atomic_store(&s_worker_running, true);
+    ESP_LOGI(TAG, "Image request lock ready; worker starts on first use");
     return ESP_OK;
 }
 
 /*
- * 本地补丁：离开图片模式后按需重建worker。
- * 只重建任务本身（12KiB栈），请求锁、图片/缩略图缓冲和扫描结果保留，
- * 重新进入时不重新分配PSRAM、不重扫SD；重新进入后由UI按需补请求。
+ * 方案 A+：首次进入图片模式时创建 worker，之后常驻。
+ *
+ * 为什么不再销毁/重建：
+ * - 旧逻辑在通用内部堆里反复申请 12 KiB 栈；它会把 16 KiB 的空闲块切成
+ *   12 KiB+4 KiB，4 KiB 被其它对象占用后，视频的 16 KiB 栈就再也拼不出来。
+ * - 现在 12 KiB 栈由 worker_task.h 从 PSRAM 分配（TCB 仍在内部 RAM），
+ *   内部堆不参与任务栈分配；离开模式不再释放任务，因此没有运行期栈碎片。
+ * - 请求锁、图片缓冲、缩略图缓存和扫描结果继续保留；离开模式仍由 UI
+ *   调用 cancel_full/clear_thumbs，worker 空闲时阻塞在通知上。
+ *
+ * 新增后台任务请沿用同一约定；会访问 NVS/Flash 的任务必须用内部栈。
  */
 esp_err_t image_viewer_ensure_started(void)
 {
-    if (s_task) return ESP_OK;
-    for (unsigned i = 0; i < 100 && atomic_load(&s_worker_running); ++i)
-        vTaskDelay(pdMS_TO_TICKS(1));
-    if (atomic_load(&s_worker_running)) {
-        ESP_LOGW(TAG, "Image worker still exiting; start deferred");
-        return ESP_ERR_INVALID_STATE;
-    }
+    if (s_task) return ESP_OK; /* 已创建：永久复用，不再重建 */
     if (!s_req_mux) {
         s_req_mux = xSemaphoreCreateMutex();
         if (!s_req_mux) return ESP_ERR_NO_MEM;
     }
-    atomic_store(&s_worker_exit, false);
-    /* 本地补丁：上一个 worker 的 12 KiB 栈由空闲任务在 vTaskDelete 后回收，
-     * running 标志清零并不代表内存已经回到内部堆。音乐播放时 CPU0 的音频
-     * worker 会连续解码，空闲任务可能延迟回收；这里最多重试 150 ms，避免
-     * 模式切换瞬间偶发 ESP_ERR_NO_MEM（与 video_player 相同的竞态）。 */
-    const unsigned retry_max = 30U; /* 30 x 5ms = 最多等待 150ms */
-    esp_err_t create_err = ESP_ERR_NO_MEM;
-    for (unsigned attempt = 0; attempt <= retry_max; ++attempt) {
-        if (xTaskCreatePinnedToCore(image_worker, "img_view", IMAGE_WORKER_STACK,
-                                    NULL, IMAGE_WORKER_PRIO, &s_task, 0) == pdPASS) {
-            create_err = ESP_OK;
-            break;
-        }
+    /* 栈指针在 PSRAM；任务永不退出，因此不需要 vTaskDeleteWithCaps。
+     * 失败时打印 PSRAM/内部堆余量：首次创建失败只可能是 PSRAM 异常紧张，
+     * 不再是内部堆 12 KiB 连续块碎片问题。 */
+    if (worker_task_create(image_worker, "img_view", IMAGE_WORKER_STACK, NULL,
+                           IMAGE_WORKER_PRIO, &s_task, 0) != pdPASS) {
         s_task = NULL;
-        if (attempt == 0)
-            ESP_LOGW(TAG, "Image worker stack not reclaimable yet "
-                     "(internal free %u B, largest %u B); retrying",
-                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                     (unsigned)heap_caps_get_largest_free_block(
-                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        if (attempt < retry_max) vTaskDelay(pdMS_TO_TICKS(5));
+        worker_task_log_create_failure(TAG, "Image");
+        return ESP_ERR_NO_MEM;
     }
-    if (create_err != ESP_OK) {
-        ESP_LOGE(TAG, "Image worker create failed "
-                 "(internal free %u B, largest %u B)",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(
-                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        return create_err;
-    }
-    atomic_store(&s_worker_running, true);
-    ESP_LOGI(TAG, "Image worker restarted");
+    ESP_LOGI(TAG, "Image worker started (PSRAM stack %u KiB)",
+             (unsigned)(IMAGE_WORKER_STACK / 1024U));
     return ESP_OK;
 }
 
-/* 请求销毁图片worker（离开图片模式时调用）。只置标志并唤醒，不等待退出。 */
+/*
+ * 方案 A+：worker 首次创建后常驻，离开图片模式时不再销毁任务。
+ *
+ * 该函数保留为 UI 兼容入口，故意为空。UI 离开模式前仍会
+ * image_viewer_cancel_full()/clear_thumbs()，停止在途解码；缓冲和扫描结果
+ * 继续保留，worker 空闲阻塞。若未来某个任务需要真正归还内存，请用
+ * worker_task_exit()（vTaskDeleteWithCaps），不要用 vTaskDelete(NULL)，
+ * 否则 PSRAM 栈不会被释放。
+ */
 void image_viewer_request_worker_exit(void)
 {
-    if (!s_task || !atomic_load(&s_worker_running)) return;
-    /* 本地补丁：音乐解码器驻留时内部堆最大连续块只有约 9 KiB，12 KiB 的
-     * 图片任务栈无法重建；解码器打开期间保留 worker，关闭后再按需销毁。 */
-    if (audio_output_session_open()) {
-        ESP_LOGD(TAG, "Music decoder open; image worker kept");
-        return;
-    }
-    atomic_store(&s_worker_exit, true);
-    notify_worker();
+    /* 有意留空。 */
 }
 
 void image_viewer_set_ops(const image_viewer_ops_t *ops, void *ctx)

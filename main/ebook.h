@@ -92,13 +92,18 @@ typedef struct {
                  bool ok, void *ctx);
 } ebook_ops_t;
 
-/** @brief 创建 worker 和请求锁；不访问 SD，不预分配书本/封面缓冲。 */
+/** @brief 创建请求锁；不创建任务、不访问 SD、不预分配书本/封面缓冲。 */
 esp_err_t ebook_init(void);
 
 /*
- * 本地补丁：离开电子书模式时销毁 worker（省12KiB内部RAM），再次进入时重建。
- * 互斥量、书库表与封面缓存保留；request 只置标志并唤醒，不等待退出，
- * 可在LVGL锁内调用。
+ * 方案 A+（2026-11-14）：worker 首次进入电子书模式时创建，之后常驻。
+ * 它的 12 KiB 栈由 worker_task.h 放在 PSRAM，内部堆不再参与任务栈分配，
+ * 因此不会因为 12/16 KiB 栈反复创建/销毁而产生碎片。
+ *
+ * worker 若将来需要真正退出，必须用 worker_task_exit()
+ * （vTaskDeleteWithCaps）；不能直接用 vTaskDelete()，否则 PSRAM 栈泄漏。
+ * request_worker_exit() 保留为 UI 兼容入口，当前是有意空实现；离开模式
+ * 时的 close_reader() 仍会释放阅读正文。
  */
 void ebook_request_worker_exit(void);
 esp_err_t ebook_ensure_started(void);

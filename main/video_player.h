@@ -58,13 +58,20 @@ typedef struct {
                   const char *message, void *ctx);
 } video_player_ops_t;
 
-/** @brief 创建命令队列和 worker。由 app_main 在 LVGL 锁外调用一次。 */
+/** @brief 创建命令队列和 SD 卸载回调；不创建 worker（首次进入模式时创建）。 */
 esp_err_t video_player_init(void);
 
 /*
- * 本地补丁：离开视频模式时销毁 worker（省16KiB内部RAM），再次进入时重建。
- * 队列、库列表与缩略图缓存保留在PSRAM；两者都只操作标量/任务，不等待
- * SD/JPEG，可在LVGL锁内调用。request 只入队，不等任务退出。
+ * 方案 A+（2026-11-14）：worker 首次进入视频模式时创建，之后常驻。
+ * 它的 16 KiB 栈由 worker_task.h 放在 PSRAM，内部堆不再参与任务栈分配，
+ * 因此不会因为内部堆被 12/4 KiB 分配切碎而无法重建。
+ *
+ * 新增后台任务请沿用同一约定：栈放 PSRAM、首次使用创建后常驻；只有会
+ * 访问 NVS/Flash 的任务才使用内部栈。worker 若将来需要真正退出，必须用
+ * worker_task_exit()（vTaskDeleteWithCaps），不能直接用 vTaskDelete()。
+ *
+ * request_worker_exit() 保留为 UI 兼容入口，当前是有意空实现；离开模式
+ * 时的播放会话/文件/帧缓冲释放仍由 video_player_stop() 完成。
  */
 void video_player_request_worker_exit(void);
 esp_err_t video_player_ensure_started(void);
