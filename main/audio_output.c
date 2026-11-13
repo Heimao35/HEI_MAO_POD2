@@ -26,12 +26,23 @@
 #include <errno.h>
 
 #define INPUT_BYTES (32U*1024U)
-/* 16KiB -> 8KiB：USB声卡组件（UAC）常驻后占用约15.5KiB内部DMA内存
- * （SPK FIFO 6.4KiB + 两个4KiB任务栈），16KiB staging + 16KiB I2S DMA
- * 会超出内部DMA余量（实测加UAC后只剩15,215B，i2s_alloc_dma_desc失败）。
- * 8KiB 仍是整扇区、64字节对齐的内部DMA读取，读取次数增加约一倍但都在
- * 同一次SD锁内完成；不改变ring/DMA/解码水位。 */
-#define READ_BYTES (8U*1024U)
+/* 2026-11-14：staging 16KiB -> 32KiB（按用户要求；16KiB 已实机验证）。
+ *
+ * 历史：最初为 16KiB；USB 声卡（UAC）常驻约 15.5KiB 内部 DMA（SPK FIFO
+ * 6.4KiB + 两个 4KiB 任务栈），16KiB staging + 16KiB I2S DMA 会超出内部
+ * DMA 余量（实测加 UAC 后只剩 15,215B，i2s_alloc_dma_desc 失败），因此
+ * 降为 8KiB。
+ *
+ * 之后方案 A+ 把 video/img_view/ebook、sd_music、usb_audio、motion_sensor
+ * 的任务栈移到 PSRAM，内部堆比旧固件多出约 62KiB；8->16KiB 实机正常，
+ * 播放音乐时其它 SD 读写造成的轻微卡顿也消失。现在按用户要求再增至
+ * 32KiB：相对 8KiB 多占 24KiB 内部 DMA，相对 16KiB 多占 16KiB。
+ *
+ * 32KiB 超过此前验证过的 16KiB 安全上限，UAC 初始化/首次播放的 DMA 余量
+ * 会进一步收紧。必须实测 `i2s_alloc_dma_desc NO_MEM`、UAC 初始化失败、
+ * 声卡模式杂音/掉线；若出现，先退回 16KiB（不是直接退回 8KiB），并记录
+ * UAC 前后的 MALLOC_CAP_DMA free/largest。不要无测量继续增大。 */
+#define READ_BYTES (32U*1024U)
 #define SECTOR_BYTES 512U
 #define IO_ALIGNMENT 64U
 #define OUTPUT_MAX_BYTES (65536U*2U*4U) /* FLAC最大块65535帧，双声道32bit */
@@ -459,9 +470,9 @@ static esp_err_t read_input(void)
         }
         /* ID3/FLAC帧通常不在扇区边界；直接读到parser的非对齐PSRAM会触发
          * v5.5.4 sdmmc_read_sectors()逐扇区临时DMA中转。物理位置向下对齐，
-         * 一次读READ_BYTES(8KiB)到64字节对齐的内部DMA块，再复制逻辑音频范围。
+         * 一次读READ_BYTES(32KiB)到64字节对齐的内部DMA块，再复制逻辑音频范围。
          * 重读的扇区头最多511字节；尾标签和扇区补齐数据绝不交给解码器。
-         * parser输入固定32KiB，staging固定8KiB，大文件不增加内存占用。 */
+         * parser输入固定32KiB，staging固定32KiB，大文件不增加内存占用。 */
         while(s_raw.len<INPUT_BYTES && s_file_offset<s_file_size) {
             /* 保留本次没有用完的staging尾部，避免32KiB输入只差几字节时
              * 又读取整个16KiB，也避免下轮重读这些已经取到的扇区。 */
@@ -1197,6 +1208,14 @@ esp_err_t audio_output_init(void)
     if(xTaskCreatePinnedToCore(output_task,"audio_out",24576,NULL,AUDIO_TASK_PRIO,&s_task,0)!=pdPASS) {
         ret=ESP_ERR_NO_MEM;goto fail;
     }
+    /* 32KiB staging 是开机分配的连续内部 DMA；记录启动时的 DMA 余量，便于
+     * 与 UAC 初始化日志对照。若这里余量已经很低，或首次播放/UAC 出现
+     * NO_MEM，应退回 16KiB 而不是继续增大。 */
+    ESP_LOGI(TAG,"Audio staging %u KiB; internal DMA free %u B, largest %u B",
+             (unsigned)(READ_BYTES/1024U),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(
+                 MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL));
     return ESP_OK;
 fail:
     if(irq_added)gpio_isr_handler_remove(IRQ_GPIO);
