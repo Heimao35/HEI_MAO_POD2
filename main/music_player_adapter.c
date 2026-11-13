@@ -9,6 +9,7 @@
 #include "lyric_parser.h"
 #include "sd_card.h"
 #include "ui/ui_music_player.h"
+#include "worker_task.h"
 #include "esp_heap_caps.h"
 #include "esp_lvgl_port.h"
 #include "esp_log.h"
@@ -20,6 +21,17 @@
 #include <string.h>
 
 static const char *TAG = "music_adapter";
+/* 12 KiB：与原 sd_music 栈一致；方案 A+ 下由 worker_task.h 放到 PSRAM。 */
+#define MUSIC_MEDIA_WORKER_STACK 12288U
+/* 方案 A+（2026-11-14）：音乐媒体 worker 的 12 KiB 栈也放在 PSRAM，
+ * 与 video/img_view/ebook 保持同一约定。它只做 SD 索引扫描、封面/歌词/
+ * 背景和 UI 发布；player_settings_set_song/get_song 只读写 RAM 快照，
+ * NVS 写入发生在 system_power/screen_power worker。**不要在本任务中新增
+ * nvs_*、esp_partition_*、esp_flash_* 等 Flash API**，否则 flash cache
+ * 关闭期间访问 PSRAM 栈会崩溃。
+ *
+ * 任务本身常驻，不退出；如果未来确实需要退出，必须用 worker_task_exit()
+ * （vTaskDeleteWithCaps），不能用 vTaskDelete(NULL)。 */
 static TaskHandle_t s_worker;
 static SemaphoreHandle_t s_parser_mutex;
 static atomic_uint_fast32_t s_duration_sec;
@@ -520,7 +532,16 @@ esp_err_t music_player_adapter_init(void)
     lvgl_port_lock(0);
     ui_music_player_bind(&backend);
     lvgl_port_unlock();
-    if (xTaskCreate(media_worker, "sd_music", 12288, NULL, 2, &s_worker) != pdPASS)
+
+    /* 方案 A+：12 KiB 栈从 PSRAM 分配（TCB 仍在内部 RAM），任务常驻。
+     * 这样本任务不再占用内部堆，也不再参与 12/16 KiB 栈的碎片化。
+     * 本任务不访问 NVS/Flash，满足 worker_task.h 的使用前提。 */
+    if (worker_task_create(media_worker, "sd_music", MUSIC_MEDIA_WORKER_STACK,
+                           NULL, 2, &s_worker, tskNO_AFFINITY) != pdPASS) {
+        s_worker = NULL;
+        worker_task_log_create_failure(TAG, "Music media");
         return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "Music media worker started (PSRAM stack 12 KiB)");
     return ESP_OK;
 }
