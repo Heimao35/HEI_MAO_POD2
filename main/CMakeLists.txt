@@ -1,4 +1,4 @@
-idf_component_register(SRCS "usb_audio.c" "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c" "jpeg_codec.c" "main.c"
+idf_component_register(SRCS "usb_audio.c" "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c" "jpeg_codec.c" "firmware_update.c" "main.c"
                               "sd_card.c"
                               "lock_animation.c"
                               "video_mjpeg.c"
@@ -52,8 +52,10 @@ idf_component_register(SRCS "usb_audio.c" "wallpaper.c" "sd_bulk_read.c" "ebook.
                               "ui/ui_wallpaper_picker.c"
                               "ui/ui_manager.c"
                               "ui/ui_power_dialog.c"
+                              "ui/ui_fw_update_dialog.c"
                     INCLUDE_DIRS "." "ui" "../u4_a2dp/main"
                     PRIV_REQUIRES fatfs sdmmc esp_driver_sdmmc esp_driver_jpeg esp_partition
+                                  app_update esp_app_format esp_bootloader_format bootloader_support
                                   esp_serial_slave_link
                                   esp_lcd esp_lcd_touch_cst820
                                   esp_hw_support esp_timer driver

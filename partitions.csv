@@ -3,8 +3,22 @@
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, ,        8M,
-storage,  data, spiffs,  ,        7M,
-fontfs,   data, spiffs,  ,        2M,
+
+# OTA 双槽与 otadata：必须全部位于 16 MiB（0x1000000）以下。
+# ESP32-P4 默认用 24 位 flash cache 地址访问 app；分区放在 16 MiB 以上时
+# esp_ota_write 能写入，但 esp_ota_end 的 cache mmap 校验会读到错误数据
+# （Checksum failed），bootloader 也无法从该地址映射启动。原 storage 7M
+# 分区没有任何代码引用，正好容纳 otadata 和两个 3.4375 MiB 的 OTA 槽；
+# factory 保持 8M/原地址，NVS、fontfs、锁屏动画、壁纸地址均不变。
+# otadata 必须是 data/ota 子类型，0x2000 为 IDF 规定的双扇区大小。
+otadata, data, ota,     0x810000, 0x2000,
+ota_0,   app,  ota_0,   0x820000, 0x370000,
+ota_1,   app,  ota_1,   0xB90000, 0x370000,
+# fontfs 显式保持原地址 0xF10000（不能留空，否则会随 otadata 前移），
+# 这样 lockanim/wallpaper 的固定地址也完全不变。0xF00000..0xF10000 是
+# ota_1 结束到 fontfs 之间的 64 KiB 对齐间隔。
+fontfs,   data, spiffs,  0xF10000, 2M,
+
 # Runtime animation store: two slots, each 4MiB payload + 4KiB header.
 # Appended after fontfs; all existing partition addresses remain unchanged.
 lockanim, data, 0x40, 0x1110000, 0x802000,

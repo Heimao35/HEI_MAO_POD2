@@ -45,6 +45,7 @@
 #include "usb_audio.h"
 #include "ui_fonts.h"
 #include "ui_boot.h"
+#include "firmware_update.h"
 
 /* LCD size */
 #define EXAMPLE_LCD_H_RES   (460)
@@ -513,6 +514,22 @@ void app_main(void)
     /* 音量键与触摸滑条共享设备音量和回调；UI 和熄屏状态机就绪后再接入。 */
     esp_err_t keys_ret = volume_keys_init();
     if (keys_ret != ESP_OK) ESP_LOGE(TAG, "Volume keys init failed: %s", esp_err_to_name(keys_ret));
+
+    /* 新 OTA 镜像第一次启动时，显示/PMIC/SD/音频/电源等关键路径都已
+     * 初始化完成，此时才确认镜像有效并取消 bootloader 回滚。必须在
+     * 固件检查之前完成，否则 esp_ota_begin() 会因 PENDING_VERIFY 拒绝
+     * 启动新的更新。factory 启动或已 VALID 时该函数直接返回 true。 */
+    app_boot_progress(99,"Checking firmware...");
+    if (firmware_update_mark_valid_if_pending()) {
+        /* 只在本轮开机的这个时机扫描一次 /sdcard/HEI_MAO_POD_SYS/BIN。发现更高版本时
+         * 弹出与关机弹窗同风格的“确认/取消”框；确认后由独立内部栈
+         * 任务写 OTA 槽，取消则本次开机不再检查。启动条仍显示在弹窗
+         * 下方，用户选择后继续走正常的 100% 收尾。 */
+        lvgl_port_lock(0);
+        lv_indev_enable(lvgl_touch_indev,true);
+        lvgl_port_unlock();
+        firmware_update_boot_check();
+    }
 
     /* 所有同步启动阶段已处理完（可选外设失败仍沿用既有降级/重试），
      * 不等待后台曲库扫描。只移除临时提示层，不清空任何正常页面。

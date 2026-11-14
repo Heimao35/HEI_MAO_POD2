@@ -6,6 +6,7 @@
 #include "music_player_adapter.h"
 #include "sd_card.h"
 #include "ui/ui_power_dialog.h"
+#include "firmware_update.h"
 #include "ui/ui_lockscreen.h"
 #include "ui/ui_video_player.h"
 #include "video_player.h"
@@ -99,6 +100,9 @@ void system_power_key_short(void)
      * 长按后即使同时收到短按事件也不能改变页面/关闭弹窗。 */
     if (!atomic_load(&s_input_ready) || atomic_load(&s_low_active) ||
         !atomic_exchange(&s_short_ready,false)) return;
+    /* 开机固件更新确认/进度期间，短按不得熄屏或进入锁屏，否则更新
+     * 任务可能被 Light-sleep 打断。硬件 10 秒强制关机路径不受影响。 */
+    if (firmware_update_is_active()) return;
     if (atomic_exchange(&s_woke_on_press,false) || atomic_load(&s_latched) ||
         atomic_load(&s_dialog) || atomic_load(&s_finalizing)) return;
     screen_power_key_short_press();
@@ -271,6 +275,13 @@ static bool low_battery_step(void)
 static void system_power_step(void)
 {
     if(!atomic_load(&s_input_ready)) return;
+    /* 更新对话框已占用顶层并持续重置熄屏计时。这里暂停 6 秒长按弹窗
+     * 和低电倒计时，避免它们覆盖更新进度或与 OTA 写 Flash 竞争。
+     * AXP2101 的 10 秒硬件强制关机仍由 PMIC 独立执行。 */
+    if (firmware_update_is_active()) {
+        atomic_store(&s_popup_requested,false);
+        return;
+    }
     if(low_battery_step()) return;
     TickType_t now=xTaskGetTickCount();
     if (atomic_load(&s_held) &&

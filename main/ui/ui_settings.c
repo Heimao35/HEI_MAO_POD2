@@ -9,6 +9,8 @@
 #include "ui_settings.h"
 #include "ui_statusbar.h"
 #include "ui_fonts.h"
+#include "esp_app_desc.h"
+#include <stdio.h>
 #include "ui_clock_settings.h"
 #include "ui_motion_settings.h"
 #include "ui_bluetooth_settings.h"
@@ -174,6 +176,23 @@ void ui_settings_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(title, UI_COLOR_TEXT, 0);
     lv_obj_set_style_text_font(title, ui_font_22(), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+    /* 固件版本：读取 app descriptor 的 version（由工程根目录 version.txt
+     * 生成，OTA 后随新固件变化）。只在 UI 创建时读取一次；版本不会在
+     * 运行中改变，OTA 完成会整机重启并重新创建 UI。
+     *
+     * 标题仍保持原来的水平居中/垂直位置，版本标签对齐到标题右侧，
+     * 不移动标题、网格、状态栏隐藏逻辑或任何手势；只新增一个不可点击
+     * 的 16px 次要文字标签。 */
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    char version_text[40];
+    snprintf(version_text, sizeof(version_text), "V%s",
+             (app_desc && app_desc->version[0]) ? app_desc->version : "?");
+    lv_obj_t *version = lv_label_create(s_page);
+    lv_label_set_text(version, version_text);
+    lv_obj_set_style_text_color(version, UI_COLOR_TEXT_CAPTION, 0);
+    lv_obj_set_style_text_font(version, ui_font_16(), 0);
+    lv_obj_align_to(version, title, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
 
     /* 可上下滚动的按钮网格容器 */
     lv_obj_t *grid = lv_obj_create(s_page);
