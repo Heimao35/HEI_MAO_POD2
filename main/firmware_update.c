@@ -174,7 +174,7 @@ static bool read_candidate(const char *path, const esp_app_desc_t *running,
         return false;
     }
     /* 两个字段都由同一工程构建产生，32 字节定长比较；避免把 U4 的
-     * a2dp_source.bin 或其它工程镜像写进 P4 的应用槽。 */
+     * Hei_Mao_Pod-Copr 或其它工程镜像写进 P4 的应用槽。 */
     if (memcmp(desc.project_name, running->project_name, sizeof(desc.project_name)) != 0) {
         ESP_LOGD(TAG, "Skip %s: project name mismatch", path);
         return false;
@@ -220,7 +220,7 @@ static bool read_candidate(const char *path, const esp_app_desc_t *running,
 }
 
 /**
- * @brief 读取 U4 app bin 的头部，确认它是 a2dp_source 的 ESP32 镜像。
+ * @brief 读取 U4 app bin 的头部，确认它是 Hei_Mao_Pod-Copr 的 ESP32 镜像。
  *
  * U4 的 app 分区是 1.75 MiB；只读 descriptor，真正的镜像校验由 U4 自己
  * 的 esp_ota_end() 完成。cached_version 是 P4 上次 FW_INFO/缓存版本，
@@ -251,7 +251,13 @@ static bool read_u4_candidate(const char *path, const char *cached_version,
     if (hdr.magic != ESP_IMAGE_HEADER_MAGIC || hdr.chip_id != ESP_CHIP_ID_ESP32)
         return false;
     if (desc.magic_word != ESP_APP_DESC_MAGIC_WORD) return false;
-    if (memcmp(desc.project_name, "a2dp_source", 12) != 0) return false;
+    /* 新名称 Hei_Mao_Pod-Copr；同时接受旧 a2dp_source，方便从旧 U4 固件
+     * 平滑升级。descriptor 字段是 NUL 填充的定长数组，按含 NUL 的长度比较。 */
+    if (memcmp(desc.project_name, "Hei_Mao_Pod-Copr",
+               sizeof("Hei_Mao_Pod-Copr")) != 0 &&
+        memcmp(desc.project_name, "a2dp_source",
+               sizeof("a2dp_source")) != 0)
+        return false;
 
     char candidate_version[33];
     uint32_t candidate_ver[4];
@@ -286,7 +292,8 @@ static bool read_u4_candidate(const char *path, const char *cached_version,
 /**
  * @brief 扫描 /sdcard/HEI_MAO_POD_SYS/BIN 下的 .bin 文件。
  *
- * 同时识别 P4（chip_id 0x0012）和 U4（chip_id 0x0000，a2dp_source）。
+ * 同时识别 P4（chip_id 0x0012）和 U4（chip_id 0x0000，Hei_Mao_Pod-Copr；
+ * 兼容旧 a2dp_source）。
  * P4 选择高于当前运行版本的最高版本；U4 与最近一次 FW_INFO 缓存比较，
  * 缓存未知时仍列为候选，最终由 U4 在线查询版本决定是否传输。
  * 只读 descriptor；整个扫描持有 SD 锁，时间在毫秒级。

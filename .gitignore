@@ -1,5 +1,5 @@
 # =============================================================================
-# esp32p4-idf5_co5300-mipi_esp-lvgl-port_lvgl9  --  .gitignore
+# Hei_Mao_Pod-Host / Hei_Mao_Pod-Copr  --  .gitignore
 #
 # Rule of thumb: only build outputs and auto-regenerated files are ignored.
 # sdkconfig / sdkconfig.defaults / dependencies.lock stay versioned so that a
@@ -48,3 +48,8 @@ desktop.ini
 # on the author's disk but must not be published. Keep local copies.
 /AGENTS.md
 /docs/
+
+# --- 7. Local Claude Code settings -----------------------------------------
+# Local permissions and machine-specific entries; keep out of the repository.
+.claude/settings.json
+.claude/settings.local.json
