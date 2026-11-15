@@ -48,6 +48,12 @@ void bt_link_set_enabled(bool enabled);
 /** 链路是否已完成 ESSL 初始化并收到 U4 的 READY 事件。 */
 bool bt_link_is_ready(void);
 
+/**
+ * @brief U4 OTA host 接管 CHIP_PU/SDIO 时置位，避免 bt_link worker 启动
+ *        时的初始 CHIP_PU 复位与更新流程冲突。仅允许在蓝牙关闭时使用。
+ */
+void bt_link_u4_ota_set_active(bool active);
+
 /** 请求开始/停止搜索（链路未就绪时暂存，READY 后补发）。 */
 void bt_link_scan_start(void);
 void bt_link_scan_stop(void);

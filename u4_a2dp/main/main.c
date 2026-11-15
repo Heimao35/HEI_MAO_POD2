@@ -25,6 +25,7 @@
 #include "esp_a2dp_api.h"
 #include "esp_avrc_api.h"
 #include "link_protocol.h"
+#include "u4_ota.h"
 #include "sdio_link.h"
 
 /* log tags */
@@ -407,6 +408,9 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
                                  pdTRUE, (void *) &tmr_id, bt_app_a2d_heart_beat);
             xTimerStart(s_tmr, portMAX_DELAY);
         } while (0);
+        /* 蓝牙栈/AVRCP/A2DP 已完成初始化，这里才是新 OTA 镜像的转正点；
+         * 在 app_main 末尾确认会早于异步 stack-up 事件，保护不足。 */
+        u4_ota_mark_valid_if_pending();
         break;
     }
     /* other */
@@ -850,11 +854,15 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
 
 static void link_cmd_dispatch(const uint8_t *payload, size_t len)
 {
-    if (!payload || len == 0 || len - 1 > sizeof(((app_link_cmd_t *)0)->data)) return;
+    if (!payload || len == 0) return;
     if (!s_bt_ready) {
         link_send_error(1);
         return;
     }
+    /* OTA data packets are up to 1024 bytes and must be written directly from
+     * the SDIO receive buffer, before the fixed-size BT command queue copy. */
+    if (u4_ota_handle_cmd(payload, len)) return;
+    if (len - 1 > sizeof(((app_link_cmd_t *)0)->data)) return;
     app_link_cmd_t cmd = {0};
     cmd.opcode = payload[0];
     cmd.len = (uint8_t)(len - 1);

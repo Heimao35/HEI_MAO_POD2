@@ -24,7 +24,9 @@ static const char *TAG = "u4_link";
 #define LINK_EVENT_SLOTS     8U
 #define LINK_EVENT_MAX       128U
 #define LINK_EVENT_QUEUE     16U
-#define LINK_TASK_STACK      4096U
+/* The receive task calls esp_ota_write() for SDIO OTA packets; 6 KiB covers
+ * the FatFs-free but still non-trivial flash driver call chain. */
+#define LINK_TASK_STACK      6144U
 #define LINK_RECV_PRIO       5U
 #define LINK_EVENT_PRIO      4U
 
@@ -199,6 +201,32 @@ void link_send_ready(void)
 {
     uint8_t ver = LINK_PROTO_VERSION;
     send_event(LINK_EVT_READY, &ver, sizeof(ver));
+}
+
+void link_send_fw_info(uint8_t running_slot, uint8_t flags, const char *version)
+{
+    uint8_t payload[2 + 32];
+    payload[0] = running_slot;
+    payload[1] = flags;
+    memset(payload + 2, 0, 32);
+    if (version) {
+        size_t n = strlen(version);
+        if (n > 32) n = 32;
+        memcpy(payload + 2, version, n);
+    }
+    send_event(LINK_EVT_FW_INFO, payload, sizeof(payload));
+}
+
+void link_send_fw_ack(uint8_t opcode, uint8_t status, uint32_t next_offset)
+{
+    uint8_t payload[6] = {
+        opcode, status,
+        (uint8_t)(next_offset & 0xFF),
+        (uint8_t)((next_offset >> 8) & 0xFF),
+        (uint8_t)((next_offset >> 16) & 0xFF),
+        (uint8_t)((next_offset >> 24) & 0xFF),
+    };
+    send_event(LINK_EVT_FW_ACK, payload, sizeof(payload));
 }
 
 void link_update_bt_state(int bt_state, int media_state)

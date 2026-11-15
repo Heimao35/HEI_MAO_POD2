@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "bt_audio.h"
+#include "u4_ota_host.h"
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
 #include "esp_heap_caps.h"
@@ -48,6 +50,7 @@ static const char *TAG = "fw_update";
 
 static EventGroupHandle_t s_events;
 static atomic_int s_state = FW_UPDATE_STATE_IDLE;
+static atomic_int s_phase = FW_UPDATE_PHASE_NONE;
 static atomic_uint s_progress;
 static atomic_int s_error = FW_UPDATE_ERR_NONE;
 static bool s_user_confirmed;
@@ -217,11 +220,76 @@ static bool read_candidate(const char *path, const esp_app_desc_t *running,
 }
 
 /**
- * @brief 扫描 /sdcard/HEI_MAO_POD_SYS/BIN 下的 .bin 文件，选出高于当前运行
- *        版本的最高版本。
+ * @brief 读取 U4 app bin 的头部，确认它是 a2dp_source 的 ESP32 镜像。
  *
- * 只读每个文件的 app descriptor；整个扫描持有 SD 锁，时间在毫秒级。
- * 开机阶段音频尚未播放，短时持锁不会造成 PCM 欠载。
+ * U4 的 app 分区是 1.75 MiB；只读 descriptor，真正的镜像校验由 U4 自己
+ * 的 esp_ota_end() 完成。cached_version 是 P4 上次 FW_INFO/缓存版本，
+ * 为空/非数字时无法比较，交给 U4 在线查询后决定是否真的需要传输。
+ */
+static bool read_u4_candidate(const char *path, const char *cached_version,
+                              fw_update_info_t *out)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < (off_t)(FW_APP_DESC_OFFSET + sizeof(esp_app_desc_t)) ||
+        st.st_size > 0x1C0000) {
+        return false;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    uint8_t buf[FW_APP_DESC_OFFSET + sizeof(esp_app_desc_t)];
+    bool ok = read_full(fd, buf, sizeof(buf));
+    close(fd);
+    if (!ok) return false;
+
+    esp_image_header_t hdr;
+    esp_app_desc_t desc;
+    memcpy(&hdr, buf, sizeof(hdr));
+    memcpy(&desc, buf + FW_APP_DESC_OFFSET, sizeof(desc));
+
+    if (hdr.magic != ESP_IMAGE_HEADER_MAGIC || hdr.chip_id != ESP_CHIP_ID_ESP32)
+        return false;
+    if (desc.magic_word != ESP_APP_DESC_MAGIC_WORD) return false;
+    if (memcmp(desc.project_name, "a2dp_source", 12) != 0) return false;
+
+    char candidate_version[33];
+    uint32_t candidate_ver[4];
+    copy_field(candidate_version, sizeof(candidate_version),
+               desc.version, sizeof(desc.version));
+    if (!version_parse(candidate_version, candidate_ver)) {
+        ESP_LOGW(TAG, "Skip U4 %s: version '%s' is not numeric",
+                 path, candidate_version);
+        return false;
+    }
+
+    uint32_t cached_ver[4];
+    if (cached_version && version_parse(cached_version, cached_ver) &&
+        version_cmp(candidate_ver, cached_ver) <= 0) {
+        ESP_LOGI(TAG, "Skip U4 %s: version %s not newer than cached %s",
+                 path, candidate_version, cached_version);
+        return false;
+    }
+
+    copy_field(out->u4_version, sizeof(out->u4_version),
+               desc.version, sizeof(desc.version));
+    copy_field(out->u4_date, sizeof(out->u4_date),
+               desc.date, sizeof(desc.date));
+    snprintf(out->u4_path, sizeof(out->u4_path), "%s", path);
+    out->u4_size = (uint32_t)st.st_size;
+    out->has_u4 = true;
+    ESP_LOGI(TAG, "U4 candidate: %s (%s, %s), %u bytes",
+             path, out->u4_version, out->u4_date, (unsigned)out->u4_size);
+    return true;
+}
+
+/**
+ * @brief 扫描 /sdcard/HEI_MAO_POD_SYS/BIN 下的 .bin 文件。
+ *
+ * 同时识别 P4（chip_id 0x0012）和 U4（chip_id 0x0000，a2dp_source）。
+ * P4 选择高于当前运行版本的最高版本；U4 与最近一次 FW_INFO 缓存比较，
+ * 缓存未知时仍列为候选，最终由 U4 在线查询版本决定是否传输。
+ * 只读 descriptor；整个扫描持有 SD 锁，时间在毫秒级。
  */
 static bool scan_for_update(fw_update_info_t *out)
 {
@@ -230,12 +298,10 @@ static bool scan_for_update(fw_update_info_t *out)
         return false;
     }
     const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
-    if (!target) {
-        ESP_LOGW(TAG, "No OTA update partition; skip firmware check");
-        return false;
-    }
     const esp_app_desc_t *running = esp_app_get_description();
-    if (!running) return false;
+    char cached_u4[BT_AUDIO_U4_VERSION_MAX];
+    bool have_cached_u4 = bt_audio_get_u4_version(cached_u4, sizeof(cached_u4)) &&
+                          cached_u4[0];
 
     if (!sd_card_io_lock(pdMS_TO_TICKS(FW_SCAN_LOCK_MS))) {
         ESP_LOGW(TAG, "SD lock timeout while scanning firmware");
@@ -249,40 +315,80 @@ static bool scan_for_update(fw_update_info_t *out)
         return false;
     }
 
-    bool found = false;
-    fw_update_info_t best;
-    uint32_t best_ver[4] = {0};
+    bool found_p4 = false, found_u4 = false;
+    fw_update_info_t best_p4 = {0}, best_u4 = {0};
+    uint32_t best_p4_ver[4] = {0}, best_u4_ver[4] = {0};
     struct dirent *entry;
     while (sd_card_is_present() && (entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
         if (!has_bin_suffix(entry->d_name)) continue;
 
-        char path[sizeof(best.path)];
+        char path[sizeof(best_p4.path)];
         int n = snprintf(path, sizeof(path), "%s/%s", FW_BIN_DIR, entry->d_name);
         if (n <= 0 || (size_t)n >= sizeof(path)) continue;
 
         fw_update_info_t candidate;
-        if (!read_candidate(path, running, target, &candidate)) continue;
+        if (target && running &&
+            read_candidate(path, running, target, &candidate)) {
+            uint32_t ver[4];
+            if (version_parse(candidate.version, ver) &&
+                (!found_p4 || version_cmp(ver, best_p4_ver) > 0)) {
+                best_p4 = candidate;
+                memcpy(best_p4_ver, ver, sizeof(best_p4_ver));
+                found_p4 = true;
+            }
+        }
 
-        uint32_t candidate_ver[4];
-        if (!version_parse(candidate.version, candidate_ver)) continue;
-        if (!found || version_cmp(candidate_ver, best_ver) > 0) {
-            best = candidate;
-            memcpy(best_ver, candidate_ver, sizeof(best_ver));
-            found = true;
+        candidate = (fw_update_info_t){0};
+        if (read_u4_candidate(path, have_cached_u4 ? cached_u4 : NULL,
+                              &candidate)) {
+            uint32_t ver[4];
+            if (version_parse(candidate.u4_version, ver) &&
+                (!found_u4 || version_cmp(ver, best_u4_ver) > 0)) {
+                best_u4 = candidate;
+                memcpy(best_u4_ver, ver, sizeof(best_u4_ver));
+                found_u4 = true;
+            }
         }
     }
     closedir(dir);
     sd_card_io_unlock();
 
-    if (found) {
-        copy_field(best.current_version, sizeof(best.current_version),
-                   running->version, sizeof(running->version));
-        *out = best;
-        ESP_LOGI(TAG, "Selected %s (%s -> %s)",
-                 best.path, best.current_version, best.version);
+    if (!found_p4 && !found_u4) return false;
+    memset(out, 0, sizeof(*out));
+    if (found_p4) {
+        out->has_p4 = true;
+        out->version[0] = 0;
+        copy_field(out->version, sizeof(out->version), best_p4.version,
+                   sizeof(best_p4.version));
+        copy_field(out->date, sizeof(out->date), best_p4.date,
+                   sizeof(best_p4.date));
+        snprintf(out->path, sizeof(out->path), "%s", best_p4.path);
+        out->size = best_p4.size;
+        if (running)
+            copy_field(out->current_version, sizeof(out->current_version),
+                       running->version, sizeof(running->version));
+        ESP_LOGI(TAG, "Selected P4 %s (%s -> %s)",
+                 out->path, out->current_version, out->version);
     }
-    return found;
+    if (found_u4) {
+        out->has_u4 = true;
+        if (have_cached_u4)
+            snprintf(out->u4_current_version, sizeof(out->u4_current_version),
+                     "%s", cached_u4);
+        else
+            snprintf(out->u4_current_version, sizeof(out->u4_current_version),
+                     "?");
+        copy_field(out->u4_version, sizeof(out->u4_version), best_u4.u4_version,
+                   sizeof(best_u4.u4_version));
+        copy_field(out->u4_date, sizeof(out->u4_date), best_u4.u4_date,
+                   sizeof(best_u4.u4_date));
+        snprintf(out->u4_path, sizeof(out->u4_path), "%s", best_u4.u4_path);
+        out->u4_size = best_u4.u4_size;
+        ESP_LOGI(TAG, "Selected U4 %s (%s -> %s)",
+                 out->u4_path, out->u4_current_version, out->u4_version);
+    }
+    return true;
 }
 
 /* ============================== 状态/错误 ============================== */
@@ -290,6 +396,11 @@ static bool scan_for_update(fw_update_info_t *out)
 fw_update_state_t firmware_update_get_state(void)
 {
     return (fw_update_state_t)atomic_load(&s_state);
+}
+
+fw_update_phase_t firmware_update_get_phase(void)
+{
+    return (fw_update_phase_t)atomic_load(&s_phase);
 }
 
 uint8_t firmware_update_get_progress(void)
@@ -322,6 +433,8 @@ const char *firmware_update_error_text(void)
         [FW_UPDATE_ERR_OTA_END] = "固件校验失败",
         [FW_UPDATE_ERR_SET_BOOT] = "无法切换启动分区",
         [FW_UPDATE_ERR_TASK] = "无法创建更新任务",
+        [FW_UPDATE_ERR_U4] = "协处理器更新失败",
+        [FW_UPDATE_ERR_U4_UNSUPPORTED] = "U4 固件不支持 SDIO 更新，请先用 UART 烧录",
     };
     int err = atomic_load(&s_error);
     if (err < 0 || err >= (int)(sizeof(messages) / sizeof(messages[0]))) err = 0;
@@ -354,18 +467,54 @@ void firmware_update_dismiss(void)
  * CONFIG_SPIRAM_XIP_FROM_PSRAM（SPI1 写 Flash 时外部 memory cache 可以
  * 保持工作），但 esp_ota_end()/esp_ota_set_boot_partition() 的校验路径会
  * 调用 esp_image_verify() -> bootloader_mmap()，后者需要操作 MMU/外部
- * memory cache；项目规则也明确禁止 PSRAM 栈任务调用 esp_ota_*/flash API。
+ * memory cache；项目规则也明确禁止 PSRAM 栈任务调用 esp_ota_* 与 flash API。
  * 数据源则必须是内部 RAM：esp_flash_write() 对非 DRAM 缓冲会退化成每次
  * 32 字节拷贝，1.5 MB 会非常慢。
  *
- * 本任务不调用 LVGL/NVS，只更新原子状态和事件组；UI 由 100 ms 定时器
- * 轮询快照。SD 锁在整个文件传输期间持有：开机阶段没有音频播放，且
- * 该锁能阻止卸载路径在文件句柄仍存活时卸载 VFS。
+ * 本任务不调用 LVGL，只更新原子状态和事件组；UI 由 100 ms 定时器轮询
+ * 快照。唯一的 Flash 写入例外是 U4 版本的小缓存 player/u4ver（在 U4
+ * 查询/更新后立即落盘，避免随后的 PMIC 重启丢失显示值）。SD 锁在整个
+ * 文件传输期间持有：开机阶段没有音频播放，且该锁能阻止卸载路径在文件
+ * 句柄仍存活时卸载 VFS。
  */
+static void u4_ota_progress_cb(uint8_t pct, void *ctx)
+{
+    (void)ctx;
+    atomic_store(&s_progress, pct);
+}
+
 static void update_task(void *arg)
 {
     (void)arg;
 
+    if (s_info.has_u4) {
+        atomic_store(&s_phase, FW_UPDATE_PHASE_U4);
+        atomic_store(&s_progress, 0);
+        u4_ota_result_t u4res = {0};
+        esp_err_t u4err = u4_ota_host_update(s_info.u4_path, s_info.u4_size,
+                                             s_info.u4_version,
+                                             u4_ota_progress_cb, NULL, &u4res);
+        if (u4err != ESP_OK) {
+            ESP_LOGE(TAG, "U4 update failed: %s", esp_err_to_name(u4err));
+            atomic_store(&s_error, u4err == ESP_ERR_NOT_SUPPORTED
+                                       ? FW_UPDATE_ERR_U4_UNSUPPORTED
+                                       : FW_UPDATE_ERR_U4);
+            goto fail;
+        }
+        ESP_LOGI(TAG, "U4 phase done: updated=%d version=%s",
+                 u4res.updated ? 1 : 0, u4res.version);
+        if (!s_info.has_p4) {
+            /* U4-only update: no P4 slot commit and no PMIC restart. */
+            atomic_store(&s_progress, 100);
+            atomic_store(&s_state, FW_UPDATE_STATE_SUCCESS);
+            if (s_events) xEventGroupSetBits(s_events, FW_EVT_DONE);
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    atomic_store(&s_phase, FW_UPDATE_PHASE_P4);
+    atomic_store(&s_progress, 0);
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
         atomic_store(&s_error, FW_UPDATE_ERR_NO_PARTITION);
@@ -526,6 +675,7 @@ void firmware_update_boot_check(void)
 
     s_info = info;
     atomic_store(&s_error, FW_UPDATE_ERR_NONE);
+    atomic_store(&s_phase, FW_UPDATE_PHASE_NONE);
     atomic_store(&s_progress, 0);
     atomic_store(&s_state, FW_UPDATE_STATE_PROMPT);
 
@@ -567,6 +717,19 @@ void firmware_update_boot_check(void)
     xEventGroupWaitBits(s_events, FW_EVT_DONE, pdTRUE, pdFALSE, portMAX_DELAY);
 
     if (firmware_update_get_state() == FW_UPDATE_STATE_SUCCESS) {
+        if (!s_info.has_p4) {
+            /* U4-only update: no P4 slot was committed, so do not reboot.
+             * Show the completion for a moment and continue normal boot. */
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            lvgl_port_lock(0);
+            ui_fw_update_dialog_hide();
+            lvgl_port_unlock();
+            atomic_store(&s_state, FW_UPDATE_STATE_IDLE);
+            atomic_store(&s_phase, FW_UPDATE_PHASE_NONE);
+            vEventGroupDelete(s_events);
+            s_events = NULL;
+            return;
+        }
         /* 让 UI 至少显示一帧“更新完成，正在重启”，再交给 PMIC owner
          * 执行整机重启。这里不能用 esp_restart()：项目规定重启必须走
          * AXP2101 reg0x10 bit1，保留电源路径和十秒硬件兜底。 */
@@ -589,6 +752,7 @@ void firmware_update_boot_check(void)
     ui_fw_update_dialog_hide();
     lvgl_port_unlock();
     atomic_store(&s_state, FW_UPDATE_STATE_IDLE);
+    atomic_store(&s_phase, FW_UPDATE_PHASE_NONE);
     vEventGroupDelete(s_events);
     s_events = NULL;
 

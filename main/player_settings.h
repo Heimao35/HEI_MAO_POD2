@@ -6,6 +6,8 @@
 
 /* U4 扫描事件最多携带 32 字节设备名；多留一个 NUL。 */
 #define PLAYER_SETTINGS_BT_NAME_MAX 33
+/* U4 app descriptor 的 version 字段为 32 字节；缓存一个 NUL。 */
+#define PLAYER_SETTINGS_U4_VERSION_MAX 32
 
 /* 阅读进度采用固定 16 条 LRU 表：key 由书名/TXT 大小/修改时间/排版版本
  * 组成，页码只对同一文件同一排版有效。16×20B 仍使整个设置 blob 保持在
@@ -38,6 +40,9 @@ typedef struct {
     bool bt_paired;
     uint8_t bt_paired_bda[6];
     char bt_paired_name[PLAYER_SETTINGS_BT_NAME_MAX];
+    /* 最后一次由 U4 FW_INFO 报告的运行版本；只用于设置页显示和
+     * U4 更新前的版本比较。空字符串表示尚未成功查询过。 */
+    char u4_version[PLAYER_SETTINGS_U4_VERSION_MAX];
     char song_folder[MUSIC_NAME_MAX];
     char song_audio[MUSIC_NAME_MAX];
     /* 最近阅读的电子书进度（LRU）。UI 在 LVGL 锁内只更新这份 RAM 表；
@@ -62,6 +67,12 @@ void player_settings_get_anti_touch(bool *anti_touch);
  * 把结果交给 bt_audio_set_paired，供“打开蓝牙自动重连”使用。 */
 void player_settings_get_bluetooth(bool *valid, uint8_t bda[6],
                                    char *name, size_t name_size);
+/* 最近一次 U4 FW_INFO 的版本；仅读 RAM。空字符串表示未知。 */
+void player_settings_get_u4_version(char *version, size_t version_size);
+/* U4 更新任务在主固件重启前立即落盘的小缓存（NVS player/u4ver）。
+ * 不经过电源 worker 的 3 秒合并快照，避免 PMIC 重启丢失显示值；
+ * 正常链路 FW_INFO 仍由 player_settings 快照持久化。 */
+esp_err_t player_settings_save_u4_version(const char *version);
 void player_settings_capture(player_settings_t *out);
 void player_settings_get_song(char *folder, char *audio);
 void player_settings_set_song(const music_item_t *item);

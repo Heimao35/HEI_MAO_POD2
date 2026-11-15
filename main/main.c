@@ -385,6 +385,11 @@ void app_main(void)
     player_settings_get_bluetooth(&bt_paired,bt_paired_bda,bt_paired_name,
                                   sizeof(bt_paired_name));
     if (bt_paired) bt_audio_set_paired(bt_paired_bda,bt_paired_name);
+    /* 恢复最近一次 U4 FW_INFO 的运行版本，供设置页 Vx.x.x(x.x.x) 在
+     * 蓝牙默认关闭、链路尚未建立时也能显示上次已知版本。 */
+    char u4_version[BT_AUDIO_U4_VERSION_MAX];
+    player_settings_get_u4_version(u4_version, sizeof(u4_version));
+    bt_audio_set_u4_version(u4_version);
 
     /* Show LVGL objects */
     lvgl_port_lock(0);

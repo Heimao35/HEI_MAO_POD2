@@ -45,6 +45,9 @@ void link_send_scan_result(const uint8_t bda[6], const char *name,
 void link_send_connected(const uint8_t bda[6]);
 void link_send_disconnected(void);
 void link_send_error(uint8_t code);
+/* v2 OTA events. version is copied into a NUL-padded 32-byte field. */
+void link_send_fw_info(uint8_t running_slot, uint8_t flags, const char *version);
+void link_send_fw_ack(uint8_t opcode, uint8_t status, uint32_t next_offset);
 
 /* Update the negotiated SBC sample rate; resets the test-tone phase. */
 void link_set_audio_rate(uint32_t rate);

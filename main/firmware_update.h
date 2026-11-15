@@ -14,7 +14,7 @@
  * - 更新写入“另一个”OTA 槽，esp_ota_end() 校验成功后才切换启动分区；
  * - 更新任务使用内部 RAM 栈和内部 8 KiB 缓冲：OTA 校验会走
  *   bootloader_mmap()/MMU 映射，项目规则禁止 PSRAM 栈任务调用
- *   esp_ota_*/flash API；数据源在 DRAM 才能直接写 Flash；
+ *   esp_ota_* 与 flash API；数据源在 DRAM 才能直接写 Flash；
  * - 读 SD 时短时间持有 sd_card_io_lock；此时处于开机阶段，音频尚未播放；
  * - 确认框和进度框都挂在 LVGL top layer，不改变正常页面布局/手势。
  *
@@ -44,14 +44,31 @@ typedef enum {
     FW_UPDATE_ERR_OTA_END,
     FW_UPDATE_ERR_SET_BOOT,
     FW_UPDATE_ERR_TASK,
+    FW_UPDATE_ERR_U4,
+    FW_UPDATE_ERR_U4_UNSUPPORTED,
 } fw_update_error_t;
 
+/* 更新任务当前阶段；UI 用它切换“主固件/协处理器”进度文案。 */
+typedef enum {
+    FW_UPDATE_PHASE_NONE = 0,
+    FW_UPDATE_PHASE_U4,
+    FW_UPDATE_PHASE_P4,
+} fw_update_phase_t;
+
 typedef struct {
-    char current_version[32];  /* 当前运行 app 的版本 */
-    char version[32];          /* SD 卡候选固件的版本 */
-    char date[16];             /* 候选固件的编译日期（app descriptor） */
-    uint32_t size;             /* 候选固件的文件大小 */
+    bool has_p4;                /* 找到可用的 P4 app bin */
+    char current_version[32];  /* 当前运行 P4 app 的版本 */
+    char version[32];          /* SD 卡候选 P4 固件的版本 */
+    char date[16];             /* 候选 P4 固件的编译日期 */
+    uint32_t size;             /* 候选 P4 固件的文件大小 */
     char path[320];            /* /sdcard/HEI_MAO_POD_SYS/BIN/xxx.bin，VFS 路径 */
+
+    bool has_u4;                /* 找到可用的 U4 app bin */
+    char u4_current_version[32];/* 最近一次 FW_INFO/缓存版本；未知为 "?" */
+    char u4_version[32];        /* SD 卡候选 U4 固件的版本 */
+    char u4_date[16];
+    uint32_t u4_size;
+    char u4_path[320];
 } fw_update_info_t;
 
 /**
@@ -83,6 +100,7 @@ void firmware_update_dismiss(void);
 
 /* 供 LVGL 定时器读取的原子快照；不要在其他任务里直接改 s_info。 */
 fw_update_state_t firmware_update_get_state(void);
+fw_update_phase_t firmware_update_get_phase(void);
 uint8_t firmware_update_get_progress(void);
 const fw_update_info_t *firmware_update_get_info(void);
 const char *firmware_update_error_text(void);

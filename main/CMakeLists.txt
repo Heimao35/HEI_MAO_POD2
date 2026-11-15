@@ -1,4 +1,4 @@
-idf_component_register(SRCS "usb_audio.c" "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c" "jpeg_codec.c" "firmware_update.c" "main.c"
+idf_component_register(SRCS "usb_audio.c" "wallpaper.c" "sd_bulk_read.c" "ebook.c" "bt_audio.c" "jpeg_codec.c" "firmware_update.c" "u4_ota_host.c" "main.c"
                               "sd_card.c"
                               "lock_animation.c"
                               "video_mjpeg.c"

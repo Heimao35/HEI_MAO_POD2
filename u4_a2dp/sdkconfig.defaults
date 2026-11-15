@@ -8,7 +8,9 @@ CONFIG_BT_BLUEDROID_ENABLED=y
 CONFIG_BT_CLASSIC_ENABLED=y
 CONFIG_BT_A2DP_ENABLE=y
 
-# ESP32-U4WDH has 4 MB in-package flash; the A2DP + SDIO application needs the
-# larger single-app partition (1.5 MB).
+# ESP32-U4WDH has 4 MB in-package flash. Use two 1.75 MB OTA slots so the
+# P4 can update the coprocessor over SDIO. NVS/phy offsets stay unchanged.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

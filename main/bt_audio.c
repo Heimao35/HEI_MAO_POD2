@@ -58,6 +58,8 @@ static uint8_t s_connected_bda[6];
 static bool s_paired_valid;
 static uint8_t s_paired_bda[6];
 static char s_paired_name[BT_AUDIO_NAME_MAX];
+/* 最近一次 U4 FW_INFO 的运行版本；空字符串表示未知。 */
+static char s_u4_version[BT_AUDIO_U4_VERSION_MAX];
 
 /* ------------------------- 临界区辅助 ------------------------- */
 
@@ -166,6 +168,7 @@ esp_err_t bt_audio_init(void)
     s_paired_valid = false;
     memset(s_paired_bda, 0, sizeof(s_paired_bda));
     s_paired_name[0] = '\0';
+    s_u4_version[0] = '\0';
 
     ESP_LOGI(TAG, "Bluetooth facade initialized (off by default)");
     return ESP_OK;
@@ -301,6 +304,33 @@ size_t bt_audio_get_connected_name(char *out, size_t size)
     snprintf(out, size, "%s", s_connected_name);
     unlock_data();
     return strlen(out);
+}
+
+void bt_audio_set_u4_version(const char *version)
+{
+    if (!lock_data()) return;
+    if (version && version[0]) {
+        size_t n = strnlen(version, sizeof(s_u4_version) - 1);
+        memcpy(s_u4_version, version, n);
+        s_u4_version[n] = '\0';
+    } else {
+        s_u4_version[0] = '\0';
+    }
+    unlock_data();
+}
+
+bool bt_audio_get_u4_version(char *out, size_t size)
+{
+    if (!out || size == 0) return false;
+    out[0] = '\0';
+    if (!lock_data()) return false;
+    bool valid = s_u4_version[0] != '\0';
+    size_t n = strnlen(s_u4_version, sizeof(s_u4_version));
+    if (n >= size) n = size - 1;
+    if (valid) memcpy(out, s_u4_version, n);
+    out[n] = '\0';
+    unlock_data();
+    return valid;
 }
 
 void bt_audio_set_paired(const uint8_t bda[6], const char *name)

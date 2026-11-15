@@ -36,7 +36,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LINK_PROTO_VERSION     1
+/* v2 adds the FW_INFO/OTA command/event set. All v1 commands keep their
+ * original encoding; an old P4 simply never sends the new opcodes. */
+#define LINK_PROTO_VERSION     2
 #define LINK_MAGIC             0xA5
 #define LINK_HEADER_BYTES      8
 #define LINK_MAX_PAYLOAD       1024
@@ -60,6 +62,14 @@ enum {
     LINK_CMD_MEDIA_START    = 7, /* no args */
     LINK_CMD_MEDIA_STOP     = 8, /* no args */
     LINK_CMD_FORGET         = 9, /* 6-byte Bluetooth address: remove bond */
+    /* v2 coprocessor OTA. Data is stop-and-wait: the host sends one
+     * FW_DATA packet and waits for LINK_EVT_FW_ACK before the next. */
+    LINK_CMD_FW_INFO        = 10, /* no args -> LINK_EVT_FW_INFO */
+    LINK_CMD_FW_BEGIN       = 11, /* u32 image_size (LE) */
+    LINK_CMD_FW_DATA        = 12, /* u32 offset (LE) + up to 1019 bytes */
+    LINK_CMD_FW_END         = 13, /* no args: esp_ota_end() */
+    LINK_CMD_FW_COMMIT      = 14, /* no args: esp_ota_set_boot_partition() */
+    LINK_CMD_FW_ABORT       = 15, /* no args: esp_ota_abort() */
 };
 
 /* Events (U4 -> P4). */
@@ -73,7 +83,24 @@ enum {
     LINK_EVT_MEDIA          = 6, /* u8 media_state */
     LINK_EVT_ERROR          = 7, /* u8 error code */
     LINK_EVT_AUDIO_RATE     = 8, /* u16 sample rate (LE) */
+    LINK_EVT_FW_INFO        = 9, /* u8 running_slot, u8 flags,
+                                    char version[32] (NUL padded) */
+    LINK_EVT_FW_ACK         = 10, /* u8 opcode, u8 status,
+                                     u32 next_offset (LE) */
 };
+
+/* LINK_EVT_FW_ACK.status */
+#define LINK_FW_STATUS_OK          0
+#define LINK_FW_STATUS_ERROR       1
+#define LINK_FW_STATUS_BAD_OFFSET  2
+
+/* LINK_EVT_FW_INFO.flags */
+#define LINK_FW_FLAG_OTA_CAPABLE   0x01
+
+/* FW_DATA payload layout: [opcode][u32 offset][data].
+ * Keep the chunk size in sync with the P4 host. */
+#define LINK_FW_DATA_HEADER        5U
+#define LINK_FW_MAX_CHUNK          (LINK_MAX_PAYLOAD - LINK_FW_DATA_HEADER)
 
 #define LINK_REG_VERSION        0
 #define LINK_REG_BT_STATE       1

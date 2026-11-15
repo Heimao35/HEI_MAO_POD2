@@ -16,6 +16,7 @@
 #include "ui_bluetooth_settings.h"
 #include "ui_lock_wallpaper_settings.h"
 #include "bt_audio.h"
+#include <string.h>
 
 static lv_obj_t *s_page = NULL; /**< 设置页面容器 */
 static bool s_visible = false;
@@ -27,6 +28,8 @@ static lv_obj_t *s_bt_button = NULL;
 static lv_obj_t *s_bt_icon = NULL;
 static lv_obj_t *s_bt_caption = NULL;
 static bool s_bt_visual_on = false;
+/* 标题右侧的 Vx.x.x(x.x.x) 标签；只显示，不接触摸/手势。 */
+static lv_obj_t *s_version_label = NULL;
 
 /* 蓝牙入口的长按消费标志。
  *
@@ -148,6 +151,24 @@ static void item_click_cb(lv_event_t *e)
     /* 其余设置项保留原入口，后续按各自功能接入。 */
 }
 
+void ui_settings_refresh_version(void)
+{
+    if (!s_version_label) return;
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const char *p4 = (app_desc && app_desc->version[0]) ? app_desc->version : "?";
+    char u4[BT_AUDIO_U4_VERSION_MAX];
+    if (!bt_audio_get_u4_version(u4, sizeof(u4)) || !u4[0])
+        snprintf(u4, sizeof(u4), "--");
+
+    char text[96];
+    snprintf(text, sizeof(text), "V%s(%s)", p4, u4);
+    /* 每秒状态刷新可能重复调用；只有文本变化才触碰 LVGL，减少重绘。
+     * 新建 label 尚未设置文本时 lv_label_get_text() 可能为 NULL。 */
+    const char *old = lv_label_get_text(s_version_label);
+    if (!old || strcmp(old, text) != 0)
+        lv_label_set_text(s_version_label, text);
+}
+
 /**
  * @brief 创建设置页面
  *
@@ -177,22 +198,18 @@ void ui_settings_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(title, ui_font_22(), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
 
-    /* 固件版本：读取 app descriptor 的 version（由工程根目录 version.txt
-     * 生成，OTA 后随新固件变化）。只在 UI 创建时读取一次；版本不会在
-     * 运行中改变，OTA 完成会整机重启并重新创建 UI。
+    /* 固件版本：V<P4>(<U4>)。P4 版本读取 app descriptor 的 version（由
+     * 工程根目录 version.txt 生成，OTA 后整机重启并重新创建 UI）；U4
+     * 版本来自 bt_audio 缓存的最近一次 FW_INFO，未知时显示 "--"。
      *
      * 标题仍保持原来的水平居中/垂直位置，版本标签对齐到标题右侧，
      * 不移动标题、网格、状态栏隐藏逻辑或任何手势；只新增一个不可点击
      * 的 16px 次要文字标签。 */
-    const esp_app_desc_t *app_desc = esp_app_get_description();
-    char version_text[40];
-    snprintf(version_text, sizeof(version_text), "V%s",
-             (app_desc && app_desc->version[0]) ? app_desc->version : "?");
-    lv_obj_t *version = lv_label_create(s_page);
-    lv_label_set_text(version, version_text);
-    lv_obj_set_style_text_color(version, UI_COLOR_TEXT_CAPTION, 0);
-    lv_obj_set_style_text_font(version, ui_font_16(), 0);
-    lv_obj_align_to(version, title, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+    s_version_label = lv_label_create(s_page);
+    lv_obj_set_style_text_color(s_version_label, UI_COLOR_TEXT_CAPTION, 0);
+    lv_obj_set_style_text_font(s_version_label, ui_font_16(), 0);
+    lv_obj_align_to(s_version_label, title, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+    ui_settings_refresh_version();
 
     /* 可上下滚动的按钮网格容器 */
     lv_obj_t *grid = lv_obj_create(s_page);
@@ -340,6 +357,8 @@ void ui_settings_show(void)
     /* 蓝牙子页的开关可能在设置主页被覆盖期间改变电源意图；展开设置
      * 主页时先同步入口按钮颜色。只比较 RAM 状态，不访问后端硬件。 */
     ui_settings_refresh_bluetooth();
+    /* U4 版本可能在本页隐藏期间由链路 worker 更新；展开时同步一次。 */
+    ui_settings_refresh_version();
 
     lv_obj_remove_flag(s_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_page);

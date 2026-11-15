@@ -95,6 +95,7 @@ static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
 static atomic_bool s_ready;      /**< 已收到 U4 的 READY 事件 */
 static atomic_bool s_enabled;    /**< 用户开关意图（由 bt_audio 设置） */
+static atomic_bool s_u4_ota_active;
 
 static sdmmc_card_t *s_card;
 static sdmmc_host_t s_host;
@@ -117,6 +118,8 @@ static int64_t s_last_reg_us;
 static int64_t s_last_open_log_us;
 static int64_t s_u4_reset_us;
 static uint16_t s_tx_seq;
+static int s_proto_version;
+static bool s_fw_info_requested;
 static unsigned s_send_failures;
 static unsigned s_reg_failures;
 static uint16_t s_audio_rate;
@@ -198,9 +201,11 @@ static void handle_event(const uint8_t *payload, size_t len)
     switch (payload[0]) {
     case LINK_EVT_READY: {
         uint8_t version = len >= 2 ? payload[1] : 0;
-        if (version != LINK_PROTO_VERSION) {
-            ESP_LOGW(TAG, "protocol version %u != %u", (unsigned)version,
-                     (unsigned)LINK_PROTO_VERSION);
+        /* Accept v1 for backward compatibility: an old U4 does not know
+         * FW_INFO/OTA, but normal A2DP must keep working. */
+        if (version < 1 || version > LINK_PROTO_VERSION) {
+            ESP_LOGW(TAG, "protocol version %u unsupported (host v%u)",
+                     (unsigned)version, (unsigned)LINK_PROTO_VERSION);
             break;
         }
         if (!s_hello_confirmed) {
@@ -208,9 +213,17 @@ static void handle_event(const uint8_t *payload, size_t len)
             ESP_LOGI(TAG, "U4 link ready (protocol v%u)", (unsigned)version);
         }
         atomic_store(&s_ready, true);
+        s_proto_version = version;
         /* 由 bt_audio 在 ready 回调里决定“自动连接已配对设备”或“补发
          * 扫描”：若这里直接开始搜索，会与紧接着的 CONNECT 命令冲突。 */
         bt_audio_link_set_ready(true);
+        /* v2 query; never send it to a v1 U4 (it would answer error 4 and
+         * be mistaken for a Bluetooth error). The cached version is only
+         * for display/U4-update checks. */
+        if (version >= 2 && !s_fw_info_requested) {
+            s_fw_info_requested = true;
+            send_cmd(LINK_CMD_FW_INFO, NULL, 0);
+        }
         break;
     }
     case LINK_EVT_STATE:
@@ -315,6 +328,23 @@ static void handle_event(const uint8_t *payload, size_t len)
             ESP_LOGI(TAG, "A2DP rate %u Hz", (unsigned)s_audio_rate);
         }
         break;
+    case LINK_EVT_FW_INFO:
+        /* payload[0]=event, [1]=slot, [2]=flags, [3..34]=version. */
+        if (len >= 3 + BT_AUDIO_U4_VERSION_MAX) {
+            char version[BT_AUDIO_U4_VERSION_MAX];
+            size_t n = strnlen((const char *)payload + 3,
+                               BT_AUDIO_U4_VERSION_MAX);
+            if (n >= sizeof(version)) n = sizeof(version) - 1;
+            memcpy(version, payload + 3, n);
+            version[n] = '\0';
+            if (version[0]) {
+                bt_audio_set_u4_version(version);
+                ESP_LOGI(TAG, "U4 firmware %s (slot %u, flags 0x%02x)",
+                         version, (unsigned)payload[1],
+                         (unsigned)payload[2]);
+            }
+        }
+        break;
     default:
         ESP_LOGW(TAG, "unknown event %u", (unsigned)payload[0]);
         break;
@@ -415,6 +445,8 @@ static void link_close(void)
     s_media_state = LINK_MEDIA_IDLE;
     bt_stream_reset();
     s_rx_len = 0;
+    s_proto_version = 0;
+    s_fw_info_requested = false;
     s_send_failures = 0;
     s_reg_failures = 0;
 
@@ -517,6 +549,8 @@ static esp_err_t link_open(void)
     bt_stream_reset();
     s_last_hello_us = 0;
     s_last_reg_us = 0;
+    s_proto_version = 0;
+    s_fw_info_requested = false;
 
     /* 先读协议版本；U4 的 link_init 在 BT 初始化之前完成，正常情况下
      * 此时应为 1。版本不对不立即关闭链路，交给后续 HELLO/周期检查。 */
@@ -749,7 +783,8 @@ static void link_task(void *arg)
     s_u4_powered = false;
     s_link_open_after_us = 0;
     s_power_off_at_us = 0;
-    if (!atomic_load(&s_enabled)) u4_power_hold_reset();
+    if (!atomic_load(&s_enabled) && !atomic_load(&s_u4_ota_active))
+        u4_power_hold_reset();
 
     for (;;) {
         bool enabled = atomic_load(&s_enabled);
@@ -912,6 +947,11 @@ void bt_link_set_enabled(bool enabled)
 bool bt_link_is_ready(void)
 {
     return atomic_load(&s_ready);
+}
+
+void bt_link_u4_ota_set_active(bool active)
+{
+    atomic_store(&s_u4_ota_active, active);
 }
 
 static bool push_msg(uint8_t cmd, const uint8_t *bda)

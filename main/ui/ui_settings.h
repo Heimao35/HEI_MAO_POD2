@@ -41,6 +41,15 @@ bool ui_settings_is_visible(void);
  */
 void ui_settings_refresh_bluetooth(void);
 
+/**
+ * @brief 刷新标题右侧的 P4/U4 版本标签：V<p4>(<u4>)。
+ *
+ * P4 版本来自 app descriptor；U4 版本来自 bt_audio 的最近一次 FW_INFO
+ * 缓存，未知时显示 "--"。只在文本变化时改写标签，不改变标题位置、网格
+ * 或手势。调用方需持有 LVGL 锁；设置页可见时由 1 秒状态刷新周期调用。
+ */
+void ui_settings_refresh_version(void);
+
 #ifdef __cplusplus
 }
 #endif

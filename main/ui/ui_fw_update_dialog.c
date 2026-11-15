@@ -34,6 +34,7 @@ static lv_obj_t *s_btn_cancel;
 static lv_obj_t *s_btn_back;
 static lv_timer_t *s_timer;
 static fw_dialog_mode_t s_mode;
+static fw_update_phase_t s_shown_phase;
 
 static void update_timer_cb(lv_timer_t *timer);
 
@@ -212,7 +213,11 @@ static void update_timer_cb(lv_timer_t *timer)
 
     fw_update_state_t state = firmware_update_get_state();
     if (state == FW_UPDATE_STATE_RUNNING) {
-        if (s_mode != FW_DIALOG_PROGRESS) ui_fw_update_dialog_show_progress();
+        fw_update_phase_t phase = firmware_update_get_phase();
+        if (s_mode != FW_DIALOG_PROGRESS || s_shown_phase != phase) {
+            s_shown_phase = phase;
+            ui_fw_update_dialog_show_progress();
+        }
         uint8_t pct = firmware_update_get_progress();
         lv_bar_set_value(s_bar, pct, LV_ANIM_OFF);
         lv_label_set_text_fmt(s_pct, "%u%%", (unsigned)pct);
@@ -240,15 +245,30 @@ void ui_fw_update_dialog_show_prompt(const fw_update_info_t *info)
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_overlay);
 
-    lv_label_set_text(s_title, "发现新固件");
-    lv_label_set_text_fmt(s_body,
-        "当前版本：%s\n新版本：%s\n大小：%u KB",
-        info->current_version, info->version,
-        (unsigned)((info->size + 1023U) / 1024U));
+    lv_label_set_text(s_title, info->has_p4 ? "发现新固件" : "发现协处理器固件");
+    if (info->has_p4 && info->has_u4) {
+        lv_label_set_text_fmt(s_body,
+            "P4：%s -> %s\nU4：%s -> %s\n大小：%u / %u KB",
+            info->current_version, info->version,
+            info->u4_current_version, info->u4_version,
+            (unsigned)((info->size + 1023U) / 1024U),
+            (unsigned)((info->u4_size + 1023U) / 1024U));
+    } else if (info->has_p4) {
+        lv_label_set_text_fmt(s_body,
+            "当前版本：%s\n新版本：%s\n大小：%u KB",
+            info->current_version, info->version,
+            (unsigned)((info->size + 1023U) / 1024U));
+    } else {
+        lv_label_set_text_fmt(s_body,
+            "U4 当前：%s\nU4 新版本：%s\n大小：%u KB",
+            info->u4_current_version, info->u4_version,
+            (unsigned)((info->u4_size + 1023U) / 1024U));
+    }
     lv_label_set_text(s_hint, "更新期间请勿断电");
     lv_obj_remove_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
     set_progress_visible(false);
     set_buttons_visible(true, true, false);
+    s_shown_phase = FW_UPDATE_PHASE_NONE;
     ensure_timer();
 
     /* 主任务随后会阻塞在事件组上；先强制提交一帧，保证确认框在
@@ -263,8 +283,17 @@ void ui_fw_update_dialog_show_progress(void)
 
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_overlay);
-    lv_label_set_text(s_title, "正在更新固件");
-    lv_label_set_text(s_body, "正在写入 Flash，请勿断电");
+    fw_update_phase_t phase = firmware_update_get_phase();
+    if (phase == FW_UPDATE_PHASE_U4) {
+        lv_label_set_text(s_title, "正在更新协处理器");
+        lv_label_set_text(s_body, "正在写入协处理器 Flash，请勿断电");
+    } else if (phase == FW_UPDATE_PHASE_P4) {
+        lv_label_set_text(s_title, "正在更新主固件");
+        lv_label_set_text(s_body, "正在写入 Flash，请勿断电");
+    } else {
+        lv_label_set_text(s_title, "正在更新固件");
+        lv_label_set_text(s_body, "请勿断电");
+    }
     lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
     set_progress_visible(true);
     set_buttons_visible(false, false, false);
@@ -294,7 +323,9 @@ void ui_fw_update_dialog_show_success(void)
     lv_obj_remove_flag(s_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_overlay);
     lv_label_set_text(s_title, "更新完成");
-    lv_label_set_text(s_body, "正在重启...");
+    const fw_update_info_t *info = firmware_update_get_info();
+    lv_label_set_text(s_body, (info && info->has_p4) ? "正在重启..."
+                                                     : "协处理器已更新");
     lv_obj_add_flag(s_hint, LV_OBJ_FLAG_HIDDEN);
     set_progress_visible(true);
     set_buttons_visible(false, false, false);
@@ -330,4 +361,5 @@ void ui_fw_update_dialog_hide(void)
         lv_refr_now(NULL);
     }
     s_mode = FW_DIALOG_HIDDEN;
+    s_shown_phase = FW_UPDATE_PHASE_NONE;
 }

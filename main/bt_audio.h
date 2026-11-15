@@ -40,6 +40,8 @@ extern "C" {
 /** 设备名最大字节数（含结尾 '\0'）；U4 扫描事件只携带 32 字节名称，
  * 这里留一倍余量，后续若扩展协议不需要同步修改 UI。 */
 #define BT_AUDIO_NAME_MAX 64
+/** U4 app descriptor version 的显示缓存长度（NUL 结尾）。 */
+#define BT_AUDIO_U4_VERSION_MAX 32
 
 /**
  * @brief 蓝牙应用层状态。
@@ -206,6 +208,12 @@ void bt_audio_link_disconnected(void);
 
 /** U4 返回错误码（link_protocol.h LINK_EVT_ERROR）。 */
 void bt_audio_link_error(uint8_t code);
+
+/** 记录 U4 通过 LINK_EVT_FW_INFO 报告的运行版本；空字符串表示未知。
+ *  由链路 worker 在收到 FW_INFO 时调用，也可在开机时用 NVS 缓存恢复。 */
+void bt_audio_set_u4_version(const char *version);
+/** 复制最近一次 U4 版本；返回 false 表示从未成功查询过，输出为 "--"。 */
+bool bt_audio_get_u4_version(char *out, size_t size);
 
 #ifdef __cplusplus
 }

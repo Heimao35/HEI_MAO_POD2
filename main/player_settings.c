@@ -74,6 +74,10 @@ static size_t encode(const player_settings_t *v, uint8_t *b)
         memcpy(pair+pair_len,v->bt_paired_name,name_len); pair_len+=name_len;
         n=add_field(b,n,9,pair,(uint16_t)pair_len);
     }
+    /* 12 为最近一次 U4 FW_INFO 的版本字符串（不含 NUL）。只用于设置页
+     * 显示和 U4 更新比较；旧固件按未知 ID 跳过，版本号不变。 */
+    size_t u4_len = strnlen(v->u4_version, sizeof(v->u4_version));
+    if (u4_len) n=add_field(b,n,12,v->u4_version,(uint16_t)u4_len);
     /* 10 为可选阅读进度表：[count 1][key 8][page 4][pages 4][stamp 4]...。
      * 只保存最近 16 本；旧固件按未知 ID 跳过，版本号不变。 */
     uint8_t ebook_count = v->ebook_count > PLAYER_SETTINGS_EBOOK_MAX
@@ -105,7 +109,7 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
         if (n-off<3) return ESP_ERR_INVALID_SIZE;
         uint8_t id=b[off++]; uint16_t len=get16(b+off); off+=2;
         if (len>n-off) return ESP_ERR_INVALID_SIZE;
-        if (id>=1 && id<=11) {
+        if (id>=1 && id<=12) {
             if (seen & (1U<<id)) return ESP_ERR_INVALID_RESPONSE;
             seen |= 1U<<id;
         }
@@ -132,6 +136,12 @@ static esp_err_t decode(const uint8_t *b, size_t n, player_settings_t *v)
             if (len!=1) return ESP_ERR_INVALID_SIZE;
             if (b[off]>1) return ESP_ERR_INVALID_ARG;
             tmp.anti_touch=b[off];
+        } else if (id==12) {
+            /* U4 版本：只接受长度合法且无内嵌 NUL 的 ASCII 字符串。 */
+            if (len >= sizeof(tmp.u4_version) || memchr(b+off,0,len))
+                return ESP_ERR_INVALID_SIZE;
+            memcpy(tmp.u4_version,b+off,len);
+            tmp.u4_version[len]=0;
         } else if (id==9) {
             /* 配对记录：valid + 6 字节 BDA + 至多 32 字节名称。名称必须
              * 以 TLV 长度结束，不接受内嵌 NUL；全 0 BDA 视为损坏。 */
@@ -197,8 +207,39 @@ esp_err_t player_settings_init(void)
             if (ret==ESP_OK) { s_saved=s_ram; s_have_saved=true; s_ready=true; }
         }
     }
+    /* U4 更新路径会在 PMIC 重启前单独写 player/u4ver，避免丢失显示值。
+     * 它优先于设置 blob 中的同名字段；损坏/超长值忽略。 */
+    char u4ver[PLAYER_SETTINGS_U4_VERSION_MAX];
+    size_t u4len = sizeof(u4ver);
+    if (nvs_get_str(handle, "u4ver", u4ver, &u4len) == ESP_OK && u4ver[0]) {
+        size_t n = strnlen(u4ver, sizeof(u4ver) - 1);
+        memcpy(s_ram.u4_version, u4ver, n);
+        s_ram.u4_version[n] = 0;
+        if (s_have_saved) {
+            memcpy(s_saved.u4_version, s_ram.u4_version, sizeof(s_saved.u4_version));
+        }
+    }
     nvs_close(handle);
     /* 损坏/新版数据保持原样，本次启动使用默认值且禁写，留给后续迁移。 */
+    return ret;
+}
+
+esp_err_t player_settings_save_u4_version(const char *version)
+{
+    if (!s_ready || !version) return ESP_ERR_INVALID_STATE;
+    /* 只写独立的小 key，不触碰 s_ram/s_saved：本函数可能在固件更新任务
+     * 中调用，而电源 worker 可能正在做自己的快照。当前开机内的显示值由
+     * bt_audio 缓存提供；下次开机由 player_settings_init 读回本 key。 */
+    char bounded[PLAYER_SETTINGS_U4_VERSION_MAX];
+    size_t n = strnlen(version, sizeof(bounded) - 1);
+    memcpy(bounded, version, n);
+    bounded[n] = '\0';
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open("player", NVS_READWRITE, &handle);
+    if (ret != ESP_OK) return ret;
+    ret = nvs_set_str(handle, "u4ver", bounded);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
     return ret;
 }
 void player_settings_restore_ui(void)
@@ -231,6 +272,13 @@ void player_settings_get_bluetooth(bool *valid, uint8_t bda[6],
         memcpy(name,s_ram.bt_paired_name,len); name[len]=0;
     }
 }
+void player_settings_get_u4_version(char *version, size_t version_size)
+{
+    if (!version || !version_size) return;
+    size_t len=strnlen(s_ram.u4_version,sizeof(s_ram.u4_version));
+    if (len>=version_size) len=version_size-1;
+    memcpy(version,s_ram.u4_version,len); version[len]=0;
+}
 void player_settings_capture(player_settings_t *out)
 {
     ui_device_state_t *st=ui_get_device_state();
@@ -253,6 +301,9 @@ void player_settings_capture(player_settings_t *out)
     s_ram.bt_paired=bt_audio_get_paired(s_ram.bt_paired_bda,
                                         s_ram.bt_paired_name,
                                         sizeof(s_ram.bt_paired_name));
+    /* U4 运行版本由链路 worker 在 FW_INFO 事件中更新；这里只取 RAM 快照。 */
+    if (!bt_audio_get_u4_version(s_ram.u4_version, sizeof(s_ram.u4_version)))
+        s_ram.u4_version[0]=0;
     *out=s_ram;
 }
 void player_settings_get_song(char *folder, char *audio)
@@ -321,6 +372,7 @@ bool player_settings_equal(const player_settings_t *a, const player_settings_t *
           a->bt_paired==b->bt_paired &&
           !memcmp(a->bt_paired_bda,b->bt_paired_bda,6) &&
           !strcmp(a->bt_paired_name,b->bt_paired_name) &&
+          !strcmp(a->u4_version,b->u4_version) &&
           !strcmp(a->song_folder,b->song_folder) &&
           !strcmp(a->song_audio,b->song_audio) &&
           a->ebook_count==b->ebook_count))
@@ -342,6 +394,7 @@ esp_err_t player_settings_save(const player_settings_t *v)
     if (v->brightness<5 || v->brightness>100 || v->volume>100 ||
         !memchr(v->song_folder,0,MUSIC_NAME_MAX) || !memchr(v->song_audio,0,MUSIC_NAME_MAX) ||
         !memchr(v->bt_paired_name,0,sizeof(v->bt_paired_name)) ||
+        !memchr(v->u4_version,0,sizeof(v->u4_version)) ||
         v->ebook_count > PLAYER_SETTINGS_EBOOK_MAX)
         return ESP_ERR_INVALID_ARG;
     for (unsigned i=0;i<v->ebook_count;++i) {
@@ -357,6 +410,13 @@ esp_err_t player_settings_save(const player_settings_t *v)
     if (ret!=ESP_OK) return ret;
     size_t len=encode(v,s_encoded);
     ret=nvs_set_blob(handle,"settings",s_encoded,len);
+    /* 同步 U4 版本的独立小 key：U4 OTA 任务会在 PMIC 重启前单独写它，
+     * 正常 3 秒快照也更新它，避免下次开机 key 比 blob 旧。缓存写入
+     * 失败不阻断用户设置保存。 */
+    if (ret==ESP_OK) {
+        if (v->u4_version[0]) (void)nvs_set_str(handle,"u4ver",v->u4_version);
+        else (void)nvs_erase_key(handle,"u4ver");
+    }
     if (ret==ESP_OK) ret=nvs_commit(handle);
     /* 关机前读回整份快照，不能只凭 set_blob 返回就宣称保存成功。 */
     if (ret==ESP_OK) {

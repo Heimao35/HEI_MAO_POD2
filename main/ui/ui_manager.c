@@ -289,6 +289,9 @@ static void periodic_timer_cb(lv_timer_t *timer)
      * 隐藏。读取是原子快照，不访问 SDIO/协议栈。 */
     ui_get_device_state()->bt_connected = bt_audio_is_connected();
     ui_statusbar_update();
+    /* U4 的 FW_INFO 可能在本页打开期间到达；只在设置页可见时刷新
+     * Vx.x.x(x.x.x)，文本未变化时函数内部不触碰标签。 */
+    if (ui_settings_is_visible()) ui_settings_refresh_version();
     ui_lockscreen_update();
 }
 
