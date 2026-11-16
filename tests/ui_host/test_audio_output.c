@@ -29,8 +29,8 @@ void bt_audio_set_volume(uint8_t volume,bool muted)
 static bool sd_locked,ui_locked,mounted=true,tx_enabled,hp_present;
 static bool decoder_fail,quiesce_in_poll,switch_in_decode,decoder_header_seen,oversize_output;
 static TickType_t ticks;
-static uint32_t generation=1,rate=192000;
-static unsigned bits=32,channels=2,opens,closes,polls,configures;
+static uint32_t generation=1,rate=96000;
+static unsigned bits=24,channels=2,opens,closes,polls,configures;
 static unsigned played_configs,channels_created,channels_deleted,clock_reconfigs;
 static unsigned direct_reads,preload_cursor,sd_lock_failures,init_nomem_attempts;
 static bool fresh_request_in_prepare,enable_fail_once,ui_lock_unavailable;
@@ -40,7 +40,7 @@ static i2s_event_callbacks_t dma_callbacks;
 static uint8_t dma[AUDIO_DMA_COUNT][AUDIO_DMA_FRAMES*8];
 static void(*detach_callback)(void);
 static const char *fixture="audio-worker-fixture.bin";
-static uint64_t fixture_size=42+4+5*1024*1024+(192000*8/8192*8192);
+static uint64_t fixture_size=42+4+5*1024*1024+(96000*6/8192*8192);
 static bool fixture_flac=true,fixture_wav,mock_mp3,mock_flac_burst;
 static unsigned burst_calls;
 static unsigned decode_cost_ms;
@@ -227,7 +227,7 @@ int main(void)
     assert(fwrite(header,1,sizeof(header),fp)==sizeof(header));
     uint8_t picture[4]={0x86,0x50,0,0}; /*5MiB embedded PICTURE, skipped by offset */
     assert(fwrite(picture,1,4,fp)==4);assert(fseeko(fp,42+4+5*1024*1024,SEEK_SET)==0);
-    for(unsigned i=0;i<192000*8/sizeof(chunk);++i)assert(fwrite(chunk,1,sizeof(chunk),fp)==sizeof(chunk));
+    for(unsigned i=0;i<96000*6/sizeof(chunk);++i)assert(fwrite(chunk,1,sizeof(chunk),fp)==sizeof(chunk));
     /* file size is a multiple of8192 for complete mock PCM frames */
     fclose(fp);
     assert(audio_output_init()==ESP_OK);
@@ -244,12 +244,12 @@ int main(void)
     sd_lock_failures=3;audio_output_toggle();steps(2);
     assert(audio_output_is_play_requested() && !audio_output_is_playing());
     steps(40);
-    assert(audio_output_is_playing() && tx_enabled && last_rate==192000 && audio_output_time_ms()>0);
+    assert(audio_output_is_playing() && tx_enabled && last_rate==96000 && audio_output_time_ms()>0);
     assert(opens==1 && s_decoder);
     audio_output_toggle();steps(3);uint32_t paused=audio_output_time_ms();
     assert(!tx_enabled && !audio_output_is_active());steps(20);assert(audio_output_time_ms()==paused);
     audio_output_toggle();steps(24);assert(audio_output_is_playing() && audio_output_time_ms()>=paused);
-    puts("PASS real worker boot restore,96k32bit pause/resume and bounded5MiB FLAC PICTURE skip");
+    puts("PASS real worker boot restore,96k24bit pause/resume and bounded5MiB FLAC PICTURE skip");
     /* A real headphone transition must pause the worker even if LVGL cannot
      * publish its icon yet. Keep decoder/PCM state for explicit play later. */
     esp_audio_simple_dec_handle_t held_decoder=s_decoder;
@@ -302,7 +302,16 @@ int main(void)
     steps(3);assert(!s_file && !s_decoder && !tx_enabled && !audio_output_is_active());
     mounted=true;rate=22050;audio_output_select(0,generation,true);steps(8);
     assert(!tx_enabled && !audio_output_take_finished());
-    rate=44100;audio_output_select(0,generation,true);steps(24);assert(tx_enabled && last_rate==44100);
+    /* FLAC 解码策略：最高 24bit/96kHz；WAV 直通允许 32bit/192kHz。 */
+    rate=192000;bits=24;channels=2;fixture_flac=true;fixture_wav=false;
+    audio_output_select(0,generation,true);steps(8);
+    assert(!tx_enabled && !s_decoder && !audio_output_take_finished());
+    rate=96000;bits=32;channels=2;
+    audio_output_select(0,generation,true);steps(8);
+    assert(!tx_enabled && !s_decoder && !audio_output_take_finished());
+    puts("PASS FLAC 192k/24bit and 96k/32bit rejected before decoder open");
+    rate=44100;bits=24;channels=2;audio_output_select(0,generation,true);steps(24);
+    assert(tx_enabled && last_rate==44100);
     puts("PASS unmount closes stream before VFS teardown; unsupported rate pauses without false EOS");
     for(unsigned i=0;i<3000 && !atomic_load(&s_finished);++i)steps(1);
     steps(2); /* decoder is now idle; unconsumed EOS must still prevent sleep */
@@ -314,7 +323,7 @@ int main(void)
     assert(!audio_output_take_finished() && !audio_output_is_active());
     atomic_store(&s_finished,true);audio_output_toggle();
     assert(!audio_output_take_finished());audio_output_set_playing(false);
-    assert(audio_output_time_ms()==(uint64_t)(192000*8/8192*8192/8)*1000/rate);
+    assert(audio_output_time_ms()==(uint64_t)(96000*6/8192*8192/6)*1000/rate);
     assert(opens>=closes);
     assert(close_session());remove(fixture);
     /* Real input reader: large ID3v2 and ID3v1 never enter decoder input. */
@@ -358,11 +367,11 @@ int main(void)
     assert(next==begin+length && direct_reads-reads_before<=(length+READ_BYTES-1)/READ_BYTES+1);
     assert(close_session());remove(fixture);
     puts("PASS aligned16KiB direct reads, patterned bytes, unaligned ends,17-byte parser remainder, timeout and reopen");
-    /* Three reported formats plus192k32bit were exercised with actual worker
+    /* Three reported formats plus88.2k24bit were exercised with actual worker
      * and sample-paced DMA. Decoder arithmetic is a hardware double. */
     for(unsigned scenario=0;scenario<4;++scenario) {
-        rate=(uint32_t[]){44100,96000,48000,192000}[scenario];
-        bits=(unsigned[]){16,24,16,32}[scenario];channels=2;
+        rate=(uint32_t[]){44100,96000,48000,88200}[scenario];
+        bits=(unsigned[]){16,24,16,24}[scenario];channels=2;
         mock_mp3=scenario==2;fixture_flac=!mock_mp3;
         decode_cost_ms=mock_mp3?4:1;
         fixture="audio-paced-fixture.bin";

@@ -397,6 +397,15 @@ static esp_err_t open_session(command_t c)
         ret=music_library_get_item(c.index,&item);
         if(ret==ESP_OK)ret=music_library_make_path(&item,item.audio,path,sizeof(path));
         if(ret==ESP_OK)ret=audio_player_probe(path,&info);
+        /* 解码开销策略：FLAC 最高 24bit/96kHz；WAV 是 PCM 直通，允许到
+         * 32bit/192kHz。限制在打开解码器/文件前生效，避免高码率 FLAC
+         * 先占用解码器再失败。 */
+        if(ret==ESP_OK && info.is_flac &&
+           (info.sample_rate>96000U || info.bits_per_sample>24U)) {
+            ESP_LOGW(TAG,"FLAC %luHz/%ubit exceeds limit 96kHz/24bit",
+                     (unsigned long)info.sample_rate,info.bits_per_sample);
+            ret=ESP_ERR_NOT_SUPPORTED;
+        }
         if(ret==ESP_OK && info.is_flac && (info.channels>2 ||
            (info.bits_per_sample!=16 && info.bits_per_sample!=24 && info.bits_per_sample!=32)))
             ret=ESP_ERR_NOT_SUPPORTED;
@@ -407,6 +416,12 @@ static esp_err_t open_session(command_t c)
             ESP_LOGW(TAG,"WAV format unsupported: ch=%u bits=%u bytes=%llu",
                      info.channels,info.bits_per_sample,
                      (unsigned long long)info.data_bytes);
+            ret=ESP_ERR_NOT_SUPPORTED;
+        }
+        if(ret==ESP_OK && info.is_wav &&
+           (info.sample_rate>192000U || info.bits_per_sample>32U)) {
+            ESP_LOGW(TAG,"WAV %luHz/%ubit exceeds limit 192kHz/32bit",
+                     (unsigned long)info.sample_rate,info.bits_per_sample);
             ret=ESP_ERR_NOT_SUPPORTED;
         }
         if(ret==ESP_OK && !i2s_rate_supported(info.sample_rate)) {

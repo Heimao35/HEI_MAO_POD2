@@ -6,6 +6,7 @@
 > 与 CS43131 本地 24.576/22.5792 MHz 不同源；尚未实板验证，可能存在长期
 > 漂移、ASP overflow/underflow 或爆音。正式同步方案需要把 24.576 MHz
 > 时钟引入 P4 MCLK；不要把本分支当作已验收的 192 kHz 实现。
+> 格式策略：**FLAC 最高 24bit/96kHz；WAV 最高 32bit/192kHz**。
 
 本项目的 ESP32-P4 多媒体播放器支持播放 460×460 的裸 MJPEG 视频，并可选择
 播放同名 WAV 音轨。本文说明文件组织方式、导出命令、可选的帧位置索引、播放器
@@ -26,6 +27,9 @@
 - **音乐播放器 WAV**：`HEI_MAO_POD_SYS/MUSIC/<歌曲文件夹>/` 下也支持普通
   和 `WAVE_FORMAT_EXTENSIBLE` 的 PCM WAV，16/24/32bit、单/双声道；实验分支
   时钟配置开放到 192 kHz，但同样受实验时钟方案限制，尚未实板验收。
+- **音乐格式上限**：FLAC 最高 24bit/96kHz；WAV 最高 32bit/192kHz。
+  超过上限的 FLAC 会在打开解码器前拒绝并打印
+  `FLAC ... exceeds limit 96kHz/24bit`。
 - **文件上限**：FAT32 单文件最大 4 GiB−1。SD 卡建议格式化为 FAT32 并使用
   32/64 KiB 簇，以保证视频顺序读取吞吐。
 
