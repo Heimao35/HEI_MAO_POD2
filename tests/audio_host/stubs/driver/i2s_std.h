@@ -11,6 +11,7 @@ typedef struct {uint32_t sample_rate_hz;} i2s_std_clk_config_t;
 typedef struct {struct {uint32_t sample_rate_hz;} clk_cfg;struct {int unused;} slot_cfg;struct {int mclk,bclk,ws,dout,din;} gpio_cfg;} i2s_std_config_t;
 #define I2S_NUM_AUTO -1
 #define I2S_ROLE_SLAVE 0
+#define I2S_ROLE_MASTER 1
 #define I2S_GPIO_UNUSED -1
 #define I2S_DATA_BIT_WIDTH_32BIT 32
 #define I2S_SLOT_MODE_STEREO 2

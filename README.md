@@ -1,5 +1,12 @@
 # 视频播放使用指南
 
+> **实验分支 `experiment/p4-master-cs43131-slave`**
+> 本分支把音频时钟从 DAC master/P4 slave 改为 **P4 I2S master /
+> CS43131 slave**，并开放 176.4/192 kHz。当前默认 P4 使用内部 PLL_160M，
+> 与 CS43131 本地 24.576/22.5792 MHz 不同源；尚未实板验证，可能存在长期
+> 漂移、ASP overflow/underflow 或爆音。正式同步方案需要把 24.576 MHz
+> 时钟引入 P4 MCLK；不要把本分支当作已验收的 192 kHz 实现。
+
 本项目的 ESP32-P4 多媒体播放器支持播放 460×460 的裸 MJPEG 视频，并可选择
 播放同名 WAV 音轨。本文说明文件组织方式、导出命令、可选的帧位置索引、播放器
 操作以及常见问题。
@@ -11,13 +18,14 @@
 - **帧率**：24 / 30 / 60fps。由视频（文件夹）名称中的 `24fps`、`30fps`、
   `60fps` 标记决定；没有标记时按 60fps 处理。
 - **音频（可选）**：与视频同名的 WAV。只支持普通 RIFF/WAVE PCM（format 1）
-  16/24/32bit、单/双声道，采样率 32k/44.1k/48k/88.2k/96k；推荐 48kHz/16bit
-  立体声。**当前 P4 是 I2S slave、32-bit slot，实际输出上限为 96 kHz；
-  176.4/192 kHz 会被拒绝，不能作为视频音轨。** 不做音频解码，
-  `WAVE_FORMAT_EXTENSIBLE`、MP3/AAC、浮点 WAV 等不支持，没有音轨时静音播放。
+  16/24/32bit、单/双声道，采样率 32k/44.1k/48k/88.2k/96k/176.4k/192k；
+  推荐 48kHz/16bit 立体声。实验分支已切换为 P4 I2S master + CS43131
+  slave，176.4/192 kHz 在时钟配置上开放，但尚未实板验证（见上方警告）。
+  不做音频解码，`WAVE_FORMAT_EXTENSIBLE`、MP3/AAC、浮点 WAV 等不支持，
+  没有音轨时静音播放。
 - **音乐播放器 WAV**：`HEI_MAO_POD_SYS/MUSIC/<歌曲文件夹>/` 下也支持普通
-  和 `WAVE_FORMAT_EXTENSIBLE` 的 PCM WAV，16/24/32bit、单/双声道；同样受
-  P4 I2S 输出上限限制，最高 96 kHz。
+  和 `WAVE_FORMAT_EXTENSIBLE` 的 PCM WAV，16/24/32bit、单/双声道；实验分支
+  时钟配置开放到 192 kHz，但同样受实验时钟方案限制，尚未实板验收。
 - **文件上限**：FAT32 单文件最大 4 GiB−1。SD 卡建议格式化为 FAT32 并使用
   32/64 KiB 簇，以保证视频顺序读取吞吐。
 

@@ -29,7 +29,7 @@ void bt_audio_set_volume(uint8_t volume,bool muted)
 static bool sd_locked,ui_locked,mounted=true,tx_enabled,hp_present;
 static bool decoder_fail,quiesce_in_poll,switch_in_decode,decoder_header_seen,oversize_output;
 static TickType_t ticks;
-static uint32_t generation=1,rate=96000;
+static uint32_t generation=1,rate=192000;
 static unsigned bits=32,channels=2,opens,closes,polls,configures;
 static unsigned played_configs,channels_created,channels_deleted,clock_reconfigs;
 static unsigned direct_reads,preload_cursor,sd_lock_failures,init_nomem_attempts;
@@ -40,7 +40,7 @@ static i2s_event_callbacks_t dma_callbacks;
 static uint8_t dma[AUDIO_DMA_COUNT][AUDIO_DMA_FRAMES*8];
 static void(*detach_callback)(void);
 static const char *fixture="audio-worker-fixture.bin";
-static uint64_t fixture_size=42+4+5*1024*1024+(96000*8/8192*8192);
+static uint64_t fixture_size=42+4+5*1024*1024+(192000*8/8192*8192);
 static bool fixture_flac=true,fixture_wav,mock_mp3,mock_flac_burst;
 static unsigned burst_calls;
 static unsigned decode_cost_ms;
@@ -151,7 +151,7 @@ esp_err_t cs43131_poll(bool *hp)
     return ESP_OK;
 }
 esp_err_t i2s_new_channel(const i2s_chan_config_t *c,i2s_chan_handle_t *tx,i2s_chan_handle_t *rx)
-{assert(!rx && c->role==I2S_ROLE_SLAVE && !c->auto_clear_before_cb && !c->auto_clear_after_cb);*tx=(void*)1;memset(dma,0,sizeof(dma));++channels_created;return ESP_OK;}
+{assert(!rx && c->role==I2S_ROLE_MASTER && !c->auto_clear_before_cb && !c->auto_clear_after_cb);*tx=(void*)1;memset(dma,0,sizeof(dma));++channels_created;return ESP_OK;}
 esp_err_t i2s_channel_init_std_mode(i2s_chan_handle_t tx,const i2s_std_config_t *c)
 {assert(tx && c->gpio_cfg.bclk==51 && c->gpio_cfg.ws==50 && c->gpio_cfg.dout==49 && c->gpio_cfg.mclk==-1);
  if(init_nomem_attempts) {--init_nomem_attempts;return ESP_ERR_NO_MEM;}
@@ -227,7 +227,7 @@ int main(void)
     assert(fwrite(header,1,sizeof(header),fp)==sizeof(header));
     uint8_t picture[4]={0x86,0x50,0,0}; /*5MiB embedded PICTURE, skipped by offset */
     assert(fwrite(picture,1,4,fp)==4);assert(fseeko(fp,42+4+5*1024*1024,SEEK_SET)==0);
-    for(unsigned i=0;i<96000*8/sizeof(chunk);++i)assert(fwrite(chunk,1,sizeof(chunk),fp)==sizeof(chunk));
+    for(unsigned i=0;i<192000*8/sizeof(chunk);++i)assert(fwrite(chunk,1,sizeof(chunk),fp)==sizeof(chunk));
     /* file size is a multiple of8192 for complete mock PCM frames */
     fclose(fp);
     assert(audio_output_init()==ESP_OK);
@@ -244,7 +244,7 @@ int main(void)
     sd_lock_failures=3;audio_output_toggle();steps(2);
     assert(audio_output_is_play_requested() && !audio_output_is_playing());
     steps(40);
-    assert(audio_output_is_playing() && tx_enabled && last_rate==96000 && audio_output_time_ms()>0);
+    assert(audio_output_is_playing() && tx_enabled && last_rate==192000 && audio_output_time_ms()>0);
     assert(opens==1 && s_decoder);
     audio_output_toggle();steps(3);uint32_t paused=audio_output_time_ms();
     assert(!tx_enabled && !audio_output_is_active());steps(20);assert(audio_output_time_ms()==paused);
@@ -314,7 +314,7 @@ int main(void)
     assert(!audio_output_take_finished() && !audio_output_is_active());
     atomic_store(&s_finished,true);audio_output_toggle();
     assert(!audio_output_take_finished());audio_output_set_playing(false);
-    assert(audio_output_time_ms()==(uint64_t)(96000*8/8192*8192/8)*1000/rate);
+    assert(audio_output_time_ms()==(uint64_t)(192000*8/8192*8192/8)*1000/rate);
     assert(opens>=closes);
     assert(close_session());remove(fixture);
     /* Real input reader: large ID3v2 and ID3v1 never enter decoder input. */
@@ -358,10 +358,10 @@ int main(void)
     assert(next==begin+length && direct_reads-reads_before<=(length+READ_BYTES-1)/READ_BYTES+1);
     assert(close_session());remove(fixture);
     puts("PASS aligned16KiB direct reads, patterned bytes, unaligned ends,17-byte parser remainder, timeout and reopen");
-    /* Three reported formats plus88.2k32bit were exercised with actual worker
+    /* Three reported formats plus192k32bit were exercised with actual worker
      * and sample-paced DMA. Decoder arithmetic is a hardware double. */
     for(unsigned scenario=0;scenario<4;++scenario) {
-        rate=(uint32_t[]){44100,96000,48000,88200}[scenario];
+        rate=(uint32_t[]){44100,96000,48000,192000}[scenario];
         bits=(unsigned[]){16,24,16,32}[scenario];channels=2;
         mock_mp3=scenario==2;fixture_flac=!mock_mp3;
         decode_cost_ms=mock_mp3?4:1;
@@ -442,7 +442,7 @@ int main(void)
     /* PCM WAV 直通：没有解码器，raw data 从文件 0 开始；播放/EOF/时长
      * 必须与解码器路径一致，且不能调用 esp_audio_simple_dec_open。 */
     fixture_wav=true;fixture_flac=false;mock_mp3=false;mock_flac_burst=false;
-    rate=96000;bits=24;channels=2;
+    rate=192000;bits=32;channels=2;
     fixture="audio-wav-fixture.bin";
     FILE *wav_file=fopen(fixture,"wb");
     assert(wav_file);
@@ -464,7 +464,7 @@ int main(void)
     assert(s_wav && close_session());
     assert(!s_wav && !s_decoder);
     remove(fixture);fixture_wav=false;
-    puts("PASS PCM24 stereo WAV direct path: no decoder, DMA-paced 1000ms and clean close");
+    puts("PASS PCM32 stereo 192k WAV direct path: no decoder, DMA-paced 1000ms and clean close");
     assert(channels_created==1 && channels_deleted==0 && clock_reconfigs>0 && direct_reads>0);
     assert(i2s_del_channel(s_tx)==ESP_OK);
     puts("PASS one reserved I2S channel, clock changes while stopped, clean DMA reuse and request version during failure");

@@ -120,11 +120,15 @@ esp_err_t cs43131_prepare(uint32_t rate)
     TRY(wr(0x40012,denom));TRY(wr(0x40013,0));
     TRY(wr(0x40014,31));TRY(wr(0x40015,0));
     TRY(wr(0x40016,63));TRY(wr(0x40017,0));
-    TRY(wr(0x40018,0x1C)); /* DAC master; P4 slave, no competing BCLK driver */
+    /* 实验分支：P4 作为 I2S master，DAC 的 ASP 改为 slave。
+     * DS1155F2 Example 5-14：0x40018=0x0C 清除 bit4(ASP_M/SB)，保留
+     * SCLK/LRCK 输入极性和默认字段；SCLK1/LRCK1 由 P4 GPIO51/50 输出。
+     * 本分支默认 P4 使用内部 PLL_160M，尚未接入 24.576 MHz 同源时钟。 */
+    TRY(wr(0x40018,0x0C));
     TRY(wr(0x40019,0x0A)); /* Philips:50/50,1bit delay */
     TRY(wr(0x50000,0));TRY(wr(0x50001,0));
     TRY(wr(0x5000A,0x07));TRY(wr(0x5000B,0x0F));
-    TRY(wr(0x1000D,0x02)); /* enable ASP clock outputs, XSP Hi-Z */
+    TRY(wr(0x1000D,0x02)); /* ASP_3ST=0; slave 时 SCLK/LRCK 为输入，XSP Hi-Z */
     TRY(wr(0x90000,0x02));TRY(wr(0x90004,0));
     TRY(wr(0xB0000,0x1E));TRY(wr(0x80000,0x30));
     TRY(wr(REG_MASK1,0x98)); /* HP,PLL errors/ready,PDN_DONE */

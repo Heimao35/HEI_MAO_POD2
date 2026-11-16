@@ -410,16 +410,10 @@ static esp_err_t open_session(command_t c)
             ret=ESP_ERR_NOT_SUPPORTED;
         }
         if(ret==ESP_OK && !i2s_rate_supported(info.sample_rate)) {
-            /* P4 是 I2S slave，32-bit slot 时驱动按
-             * mclk = rate * 64 * 8 计算；PLL_160M 在 176.4/192kHz
-             * 需要 >1.99 分频，硬件无法满足，必须留到主从/降采样方案。
-             * 该限制对 WAV/FLAC/MP3 共用同一 I2S 输出。 */
-            if(!supported_rate(info.sample_rate))
-                ESP_LOGW(TAG,"%s %luHz unsupported sample rate",
-                         info.is_wav?"WAV":"audio",(unsigned long)info.sample_rate);
-            else
-                ESP_LOGW(TAG,"%s %luHz rejected: I2S slave 32-bit slot limit is 96kHz",
-                         info.is_wav?"WAV":"audio",(unsigned long)info.sample_rate);
+            /* 实验分支：P4 已是 I2S master，所有 supported_rate() 都可配置；
+             * 这里只拒绝真正未列出的采样率。 */
+            ESP_LOGW(TAG,"%s %luHz unsupported sample rate",
+                     info.is_wav?"WAV":"audio",(unsigned long)info.sample_rate);
             ret=ESP_ERR_NOT_SUPPORTED;
         }
         if(ret==ESP_OK) {
@@ -558,25 +552,27 @@ static bool supported_rate(uint32_t rate)
     return rate==32000 || rate==44100 || rate==48000 || rate==88200 ||
            rate==96000 || rate==176400 || rate==192000;
 }
-/* P4 为 I2S slave 且固定 32-bit slot。驱动按
- * mclk = rate * 2 slots * 32 bit * bclk_div(8) = rate * 512 计算；
- * I2S 默认 PLL_160M 要求源时钟 > 1.99*mclk，因此 176.4/192kHz 超过
- * 硬件能力，96kHz 是当前从机/32-bit slot 的上限。 */
+/* 实验分支：P4 作为 I2S master，使用内部 PLL_160M，32-bit slot。
+ * master 的 mclk=rate*mclk_multiple(256)，160MHz 可覆盖
+ * 32/44.1/48/88.2/96/176.4/192kHz；不再有 slave 的 rate*512 上限。
+ * 注意：该时钟与 CS43131 本地 24.576/22.5792MHz 不同源，仅为实验实现，
+ * 正式同步方案需把 24.576MHz 引入 P4 MCLK 并使用 I2S_CLK_SRC_EXTERNAL。 */
 static bool i2s_rate_supported(uint32_t rate)
 {
-    return supported_rate(rate) && rate<=96000U;
+    return supported_rate(rate);
 }
 /* Create I2S/GDMA only when PCM is first prepared, so boot SD scanning does not
  * overlap the driver allocation. The created channel remains shared by later songs. */
 static esp_err_t create_tx(uint32_t sample_rate)
 {
     if(!i2s_rate_supported(sample_rate)) {
-        ESP_LOGW(TAG,"I2S slave 32-bit slot max 96kHz; %luHz unsupported",
-                 (unsigned long)sample_rate);
+        ESP_LOGW(TAG,"Unsupported I2S sample rate %luHz",(unsigned long)sample_rate);
         return ESP_ERR_NOT_SUPPORTED;
     }
     if(s_tx)return ESP_OK;
-    i2s_chan_config_t channel=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO,I2S_ROLE_SLAVE);
+    /* 实验分支：P4 输出 BCLK/WS，CS43131 ASP 为 slave。
+     * GPIO51/50 从 DAC 时钟输入改为 P4 输出；DAC 必须先写 0x40018=0x0C。 */
+    i2s_chan_config_t channel=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO,I2S_ROLE_MASTER);
     channel.dma_desc_num=AUDIO_DMA_COUNT;channel.dma_frame_num=AUDIO_DMA_FRAMES;
     channel.auto_clear_before_cb=false;channel.auto_clear_after_cb=false;
     esp_err_t ret=i2s_new_channel(&channel,&s_tx,NULL);
@@ -613,7 +609,7 @@ static esp_err_t configure_tx(void)
        (s_format.bits_per_sample!=16 && s_format.bits_per_sample!=24 && s_format.bits_per_sample!=32) ||
        (s_format.channel!=1 && s_format.channel!=2)) {
         if(!i2s_rate_supported(s_format.sample_rate))
-            ESP_LOGW(TAG,"I2S slave 32-bit slot max 96kHz; %luHz unsupported",
+            ESP_LOGW(TAG,"Unsupported I2S sample rate %luHz",
                      (unsigned long)s_format.sample_rate);
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -625,7 +621,7 @@ static esp_err_t configure_tx(void)
         if(ret!=ESP_OK)return ret;
         s_tx_rate=s_format.sample_rate;
     }
-    ESP_LOGI(TAG,"PCM %luHz %ubit %uch ->32bit stereo, DAC master/P4 slave",
+    ESP_LOGI(TAG,"PCM %luHz %ubit %uch ->32bit stereo, P4 I2S master/CS43131 slave",
         (unsigned long)s_format.sample_rate,s_format.bits_per_sample,s_format.channel);
     return ESP_OK;
 }
