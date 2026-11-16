@@ -48,7 +48,8 @@ static bool is_type(const char *parent, const struct dirent *entry, bool directo
 static bool audio_ext(const char *name)
 {
     const char *dot = strrchr(name, '.');
-    return dot && (!strcasecmp(dot, ".flac") || !strcasecmp(dot, ".mp3"));
+    return dot && (!strcasecmp(dot, ".flac") || !strcasecmp(dot, ".mp3") ||
+                   !strcasecmp(dot, ".wav"));
 }
 
 static bool matching_stem(const char *audio, const char *sidecar)

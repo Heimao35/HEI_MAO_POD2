@@ -263,6 +263,16 @@ foreach(name audio_pcm cs43131)
   add_test(NAME ${name} COMMAND ${name}_tests)
 endforeach()
 
+# Real RIFF/WAVE music probe: PCM 16/24/32, mono/stereo, odd chunks,
+# zero/oversized data lengths and unsupported formats.
+add_executable(audio_wav_tests test_audio_wav.c)
+target_include_directories(audio_wav_tests PRIVATE ../audio_host/stubs ../media_host/stubs "${REPO}/main")
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(audio_wav_tests PRIVATE -O1 -Wall -Wextra)
+  target_link_options(audio_wav_tests PRIVATE -static-libgcc)
+endif()
+add_test(NAME audio_wav COMMAND audio_wav_tests)
+
 add_executable(audio_output_tests test_audio_output.c "${REPO}/main/audio_pcm.c")
 target_include_directories(audio_output_tests PRIVATE ../audio_host/stubs stubs ../media_host/stubs
   "${REPO}/main" "${REPO}/managed_components/espressif__esp_audio_codec/include"

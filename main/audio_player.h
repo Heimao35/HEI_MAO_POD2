@@ -11,6 +11,10 @@ typedef struct {
     uint8_t bits_per_sample;
     uint8_t channels;
     bool is_flac;
+    /* PCM WAV: data chunk location/size; 0 for MP3/FLAC. */
+    bool is_wav;
+    uint64_t data_offset;
+    uint64_t data_bytes;
     bool metadata_known;
 } audio_file_info_t;
 

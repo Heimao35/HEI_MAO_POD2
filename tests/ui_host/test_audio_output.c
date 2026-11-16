@@ -29,7 +29,7 @@ void bt_audio_set_volume(uint8_t volume,bool muted)
 static bool sd_locked,ui_locked,mounted=true,tx_enabled,hp_present;
 static bool decoder_fail,quiesce_in_poll,switch_in_decode,decoder_header_seen,oversize_output;
 static TickType_t ticks;
-static uint32_t generation=1,rate=192000;
+static uint32_t generation=1,rate=96000;
 static unsigned bits=32,channels=2,opens,closes,polls,configures;
 static unsigned played_configs,channels_created,channels_deleted,clock_reconfigs;
 static unsigned direct_reads,preload_cursor,sd_lock_failures,init_nomem_attempts;
@@ -40,8 +40,8 @@ static i2s_event_callbacks_t dma_callbacks;
 static uint8_t dma[AUDIO_DMA_COUNT][AUDIO_DMA_FRAMES*8];
 static void(*detach_callback)(void);
 static const char *fixture="audio-worker-fixture.bin";
-static uint64_t fixture_size=42+4+5*1024*1024+(192000*8/8192*8192);
-static bool fixture_flac=true,mock_mp3,mock_flac_burst;
+static uint64_t fixture_size=42+4+5*1024*1024+(96000*8/8192*8192);
+static bool fixture_flac=true,fixture_wav,mock_mp3,mock_flac_burst;
 static unsigned burst_calls;
 static unsigned decode_cost_ms;
 /* Simulate actual sample-clock cadence, not eight descriptors per C call.
@@ -119,7 +119,21 @@ esp_err_t music_library_get_item(uint32_t index,music_item_t *item)
 esp_err_t music_library_make_path(const music_item_t *item,const char *f,char *out,size_t cap)
 {(void)item;assert(sd_locked && strlen(f)<cap);strcpy(out,f);return ESP_OK;}
 esp_err_t audio_player_probe(const char *path,audio_file_info_t *info)
-{assert(sd_locked && !strcmp(path,fixture));memset(info,0,sizeof(*info));info->file_size=fixture_size;info->is_flac=fixture_flac;info->channels=channels;info->bits_per_sample=bits;info->duration_ms=1000;return ESP_OK;}
+{
+    assert(sd_locked && !strcmp(path,fixture));
+    memset(info,0,sizeof(*info));
+    info->file_size=fixture_size;
+    info->is_flac=fixture_flac && !fixture_wav;
+    info->is_wav=fixture_wav;
+    info->data_offset=0;
+    info->data_bytes=fixture_wav?fixture_size:0;
+    info->sample_rate=rate;
+    info->channels=(uint8_t)channels;
+    info->bits_per_sample=(uint8_t)bits;
+    info->metadata_known=true;
+    info->duration_ms=1000;
+    return ESP_OK;
+}
 esp_err_t cs43131_init(void) {assert(!ui_locked && !sd_locked);return ESP_OK;}
 esp_err_t cs43131_prepare(uint32_t hz) {
     assert(!ui_locked && !sd_locked);last_rate=hz;++played_configs;
@@ -213,7 +227,7 @@ int main(void)
     assert(fwrite(header,1,sizeof(header),fp)==sizeof(header));
     uint8_t picture[4]={0x86,0x50,0,0}; /*5MiB embedded PICTURE, skipped by offset */
     assert(fwrite(picture,1,4,fp)==4);assert(fseeko(fp,42+4+5*1024*1024,SEEK_SET)==0);
-    for(unsigned i=0;i<192000*8/sizeof(chunk);++i)assert(fwrite(chunk,1,sizeof(chunk),fp)==sizeof(chunk));
+    for(unsigned i=0;i<96000*8/sizeof(chunk);++i)assert(fwrite(chunk,1,sizeof(chunk),fp)==sizeof(chunk));
     /* file size is a multiple of8192 for complete mock PCM frames */
     fclose(fp);
     assert(audio_output_init()==ESP_OK);
@@ -230,12 +244,12 @@ int main(void)
     sd_lock_failures=3;audio_output_toggle();steps(2);
     assert(audio_output_is_play_requested() && !audio_output_is_playing());
     steps(40);
-    assert(audio_output_is_playing() && tx_enabled && last_rate==192000 && audio_output_time_ms()>0);
+    assert(audio_output_is_playing() && tx_enabled && last_rate==96000 && audio_output_time_ms()>0);
     assert(opens==1 && s_decoder);
     audio_output_toggle();steps(3);uint32_t paused=audio_output_time_ms();
     assert(!tx_enabled && !audio_output_is_active());steps(20);assert(audio_output_time_ms()==paused);
     audio_output_toggle();steps(24);assert(audio_output_is_playing() && audio_output_time_ms()>=paused);
-    puts("PASS real worker boot restore,192k32bit pause/resume and bounded5MiB FLAC PICTURE skip");
+    puts("PASS real worker boot restore,96k32bit pause/resume and bounded5MiB FLAC PICTURE skip");
     /* A real headphone transition must pause the worker even if LVGL cannot
      * publish its icon yet. Keep decoder/PCM state for explicit play later. */
     esp_audio_simple_dec_handle_t held_decoder=s_decoder;
@@ -300,7 +314,7 @@ int main(void)
     assert(!audio_output_take_finished() && !audio_output_is_active());
     atomic_store(&s_finished,true);audio_output_toggle();
     assert(!audio_output_take_finished());audio_output_set_playing(false);
-    assert(audio_output_time_ms()==(uint64_t)(192000*8/8192*8192/8)*1000/rate);
+    assert(audio_output_time_ms()==(uint64_t)(96000*8/8192*8192/8)*1000/rate);
     assert(opens>=closes);
     assert(close_session());remove(fixture);
     /* Real input reader: large ID3v2 and ID3v1 never enter decoder input. */
@@ -344,10 +358,10 @@ int main(void)
     assert(next==begin+length && direct_reads-reads_before<=(length+READ_BYTES-1)/READ_BYTES+1);
     assert(close_session());remove(fixture);
     puts("PASS aligned16KiB direct reads, patterned bytes, unaligned ends,17-byte parser remainder, timeout and reopen");
-    /* Three reported formats plus192k32bit were exercised with actual worker
+    /* Three reported formats plus88.2k32bit were exercised with actual worker
      * and sample-paced DMA. Decoder arithmetic is a hardware double. */
     for(unsigned scenario=0;scenario<4;++scenario) {
-        rate=(uint32_t[]){44100,96000,48000,192000}[scenario];
+        rate=(uint32_t[]){44100,96000,48000,88200}[scenario];
         bits=(unsigned[]){16,24,16,32}[scenario];channels=2;
         mock_mp3=scenario==2;fixture_flac=!mock_mp3;
         decode_cost_ms=mock_mp3?4:1;
@@ -425,6 +439,32 @@ int main(void)
     assert(audio_output_take_finished() && audio_output_time_ms()==100*1000/rate);
     assert(close_session());remove(fixture);
     puts("PASS short EOF starts below prebuffer threshold and completes");
+    /* PCM WAV 直通：没有解码器，raw data 从文件 0 开始；播放/EOF/时长
+     * 必须与解码器路径一致，且不能调用 esp_audio_simple_dec_open。 */
+    fixture_wav=true;fixture_flac=false;mock_mp3=false;mock_flac_burst=false;
+    rate=96000;bits=24;channels=2;
+    fixture="audio-wav-fixture.bin";
+    FILE *wav_file=fopen(fixture,"wb");
+    assert(wav_file);
+    unsigned wav_bytes=rate*channels*(bits/8); /* 1 second */
+    for(unsigned i=0;i<wav_bytes;++i)assert(fputc((i*7U)&0xFF,wav_file)!=EOF);
+    fclose(wav_file);
+    fixture_size=wav_bytes;
+    unsigned opens_before=opens;
+    audio_output_select(0,generation,true);
+    bool wav_started=false;
+    for(unsigned i=0;i<1000 && !atomic_load(&s_finished);++i) {
+        output_iteration();advance_ms(1);
+        if(tx_enabled)wav_started=true;
+    }
+    assert(wav_started && atomic_load(&s_finished));
+    assert(audio_output_take_finished());
+    assert(audio_output_time_ms()==1000);
+    assert(opens==opens_before); /* no esp_audio_simple_dec_open for WAV */
+    assert(s_wav && close_session());
+    assert(!s_wav && !s_decoder);
+    remove(fixture);fixture_wav=false;
+    puts("PASS PCM24 stereo WAV direct path: no decoder, DMA-paced 1000ms and clean close");
     assert(channels_created==1 && channels_deleted==0 && clock_reconfigs>0 && direct_reads>0);
     assert(i2s_del_channel(s_tx)==ESP_OK);
     puts("PASS one reserved I2S channel, clock changes while stopped, clean DMA reuse and request version during failure");

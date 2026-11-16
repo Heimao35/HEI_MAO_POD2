@@ -81,7 +81,7 @@ static size_t s_output_capacity;
 static FILE *s_file; /* 仅在SD锁内访问，包括卸载回调；不将指针交给UI。 */
 static uint64_t s_file_size,s_file_offset,s_sent_total;
 static uint8_t s_flac_header[42];
-static bool s_flac_prefix,s_mp3_session;
+static bool s_flac_prefix,s_mp3_session,s_wav;
 static uint32_t s_last_sent;
 /* 解码器驻留标记：只由音频 worker 更新，其他任务只读。
  * 音乐解码器打开后内部堆只剩十几 KiB、最大连续块约 9 KiB（实机日志），
@@ -92,6 +92,8 @@ static esp_audio_simple_dec_raw_t s_raw;
 static esp_audio_simple_dec_info_t s_format;
 static size_t s_pcm_bytes,s_pcm_offset;
 static bool s_input_eof,s_decode_eof,s_dac_ready,s_tx_on,s_format_ready;
+static bool session_open_now(void)
+{return s_decoder!=NULL || s_wav;}
 static i2s_chan_handle_t s_tx;
 static TickType_t s_poll_at,s_retry_at;
 static bool s_have_retry,s_hp_dirty,s_hp;
@@ -324,8 +326,9 @@ static bool close_session(void)
     if(!close_file())return false;
     if(s_decoder) {
         esp_audio_simple_dec_close(s_decoder);s_decoder=NULL;
-        atomic_store(&s_decoder_open,false);
     }
+    s_wav=false;
+    atomic_store(&s_decoder_open,false);
     memset(&s_raw,0,sizeof(s_raw));memset(&s_format,0,sizeof(s_format));
     s_pcm_bytes=s_pcm_offset=0;s_file_offset=0;s_sent_total=0;s_last_sent=0;
     s_read_size=0;
@@ -381,7 +384,9 @@ static esp_err_t skip_mp3_metadata(void)
 /* open_session 需要在打开 FLAC/MP3 解码器之前预留 I2S 通道；这两个
  * 辅助函数定义在文件后面，先声明。 */
 static bool supported_rate(uint32_t rate);
+static bool i2s_rate_supported(uint32_t rate);
 static esp_err_t create_tx(uint32_t sample_rate);
+static esp_err_t configure_tx(void);
 
 static esp_err_t open_session(command_t c)
 {
@@ -395,6 +400,28 @@ static esp_err_t open_session(command_t c)
         if(ret==ESP_OK && info.is_flac && (info.channels>2 ||
            (info.bits_per_sample!=16 && info.bits_per_sample!=24 && info.bits_per_sample!=32)))
             ret=ESP_ERR_NOT_SUPPORTED;
+        if(ret==ESP_OK && info.is_wav &&
+           ((info.channels!=1 && info.channels!=2) ||
+            (info.bits_per_sample!=16 && info.bits_per_sample!=24 &&
+             info.bits_per_sample!=32) || info.data_bytes==0)) {
+            ESP_LOGW(TAG,"WAV format unsupported: ch=%u bits=%u bytes=%llu",
+                     info.channels,info.bits_per_sample,
+                     (unsigned long long)info.data_bytes);
+            ret=ESP_ERR_NOT_SUPPORTED;
+        }
+        if(ret==ESP_OK && !i2s_rate_supported(info.sample_rate)) {
+            /* P4 是 I2S slave，32-bit slot 时驱动按
+             * mclk = rate * 64 * 8 计算；PLL_160M 在 176.4/192kHz
+             * 需要 >1.99 分频，硬件无法满足，必须留到主从/降采样方案。
+             * 该限制对 WAV/FLAC/MP3 共用同一 I2S 输出。 */
+            if(!supported_rate(info.sample_rate))
+                ESP_LOGW(TAG,"%s %luHz unsupported sample rate",
+                         info.is_wav?"WAV":"audio",(unsigned long)info.sample_rate);
+            else
+                ESP_LOGW(TAG,"%s %luHz rejected: I2S slave 32-bit slot limit is 96kHz",
+                         info.is_wav?"WAV":"audio",(unsigned long)info.sample_rate);
+            ret=ESP_ERR_NOT_SUPPORTED;
+        }
         if(ret==ESP_OK) {
             s_file=fopen(path,"rb");
             if(!s_file)ret=ESP_FAIL;
@@ -402,8 +429,17 @@ static esp_err_t open_session(command_t c)
                 /* 先禁用stdio预读，后续read(fileno)与定位共享同一物理位置。
                  * 热路径按扇区边界读入独立DMA staging，不让parser余量影响对齐。 */
                 setvbuf(s_file,NULL,_IONBF,0);
-                s_file_size=info.file_size;s_file_offset=0;
-                ret=info.is_flac?skip_flac_metadata():skip_mp3_metadata();
+                s_file_size=info.file_size;s_file_offset=0;s_read_size=0;
+                s_raw.len=0;s_input_eof=false;s_decode_eof=false;
+                s_format_ready=false;s_flac_prefix=false;s_wav=false;
+                if(info.is_wav) {
+                    /* data chunk 起点；读取到 data 末尾，不把尾块/padding 当 PCM。 */
+                    s_file_offset=info.data_offset;
+                    s_file_size=info.data_offset+info.data_bytes;
+                    if(s_file_size>info.file_size)s_file_size=info.file_size;
+                } else {
+                    ret=info.is_flac?skip_flac_metadata():skip_mp3_metadata();
+                }
                 if(!c.play || ret!=ESP_OK) {fclose(s_file);s_file=NULL;}
             }
         }
@@ -412,7 +448,7 @@ static esp_err_t open_session(command_t c)
     if(ret!=ESP_OK)return ret;
     s_current=c;
     atomic_store(&s_detached,false);
-    s_mp3_session=!info.is_flac;
+    s_mp3_session=!info.is_flac && !info.is_wav;
     /* 时长/位置来自 probe，选中但未播放时也要先发布给界面。 */
     portENTER_CRITICAL(&s_cmd_mux);
     if(s_cmd.serial==c.serial) {
@@ -429,9 +465,25 @@ static esp_err_t open_session(command_t c)
      * 若仍分配失败会直接走 fail_current，便于串口定位。
      * 暂停/恢复不受影响：已播放的会话暂停时不会重新进入本函数。 */
     if(!c.play) return ESP_OK;
+    /* WAV 是 PCM 直通：没有解码器状态，直接用 probe 的格式配置 I2S，
+     * 之后由 wav_decode_step 从 s_input 推原始帧。 */
+    if(info.is_wav) {
+        memset(&s_format,0,sizeof(s_format));
+        s_format.sample_rate=info.sample_rate;
+        s_format.channel=info.channels;
+        s_format.bits_per_sample=info.bits_per_sample;
+        s_format_ready=true;
+        esp_err_t tx_ret=configure_tx();
+        if(tx_ret!=ESP_OK)return tx_ret;
+        s_wav=true;
+        s_pcm_bytes=s_pcm_offset=0;
+        s_decoded_frames=0;
+        atomic_store(&s_decoder_open,true);
+        return ESP_OK;
+    }
     /* 真正的播放请求：在打开解码器之前先预留 I2S 通道和 DMA 缓冲。
      * probe 已得到采样率；后续 configure_tx() 只按解码器实际格式重配时钟。 */
-    uint32_t preroll=supported_rate(info.sample_rate)?info.sample_rate:48000U;
+    uint32_t preroll=i2s_rate_supported(info.sample_rate)?info.sample_rate:48000U;
     esp_err_t tx_ret=create_tx(preroll);
     if(tx_ret!=ESP_OK)return tx_ret;
     esp_audio_simple_dec_cfg_t cfg={.dec_type=info.is_flac?ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC:ESP_AUDIO_SIMPLE_DEC_TYPE_MP3};
@@ -506,10 +558,23 @@ static bool supported_rate(uint32_t rate)
     return rate==32000 || rate==44100 || rate==48000 || rate==88200 ||
            rate==96000 || rate==176400 || rate==192000;
 }
+/* P4 为 I2S slave 且固定 32-bit slot。驱动按
+ * mclk = rate * 2 slots * 32 bit * bclk_div(8) = rate * 512 计算；
+ * I2S 默认 PLL_160M 要求源时钟 > 1.99*mclk，因此 176.4/192kHz 超过
+ * 硬件能力，96kHz 是当前从机/32-bit slot 的上限。 */
+static bool i2s_rate_supported(uint32_t rate)
+{
+    return supported_rate(rate) && rate<=96000U;
+}
 /* Create I2S/GDMA only when PCM is first prepared, so boot SD scanning does not
  * overlap the driver allocation. The created channel remains shared by later songs. */
 static esp_err_t create_tx(uint32_t sample_rate)
 {
+    if(!i2s_rate_supported(sample_rate)) {
+        ESP_LOGW(TAG,"I2S slave 32-bit slot max 96kHz; %luHz unsupported",
+                 (unsigned long)sample_rate);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if(s_tx)return ESP_OK;
     i2s_chan_config_t channel=I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO,I2S_ROLE_SLAVE);
     channel.dma_desc_num=AUDIO_DMA_COUNT;channel.dma_frame_num=AUDIO_DMA_FRAMES;
@@ -544,9 +609,14 @@ static esp_err_t create_tx(uint32_t sample_rate)
 }
 static esp_err_t configure_tx(void)
 {
-    if(!supported_rate(s_format.sample_rate) ||
+    if(!i2s_rate_supported(s_format.sample_rate) ||
        (s_format.bits_per_sample!=16 && s_format.bits_per_sample!=24 && s_format.bits_per_sample!=32) ||
-       (s_format.channel!=1 && s_format.channel!=2))return ESP_ERR_NOT_SUPPORTED;
+       (s_format.channel!=1 && s_format.channel!=2)) {
+        if(!i2s_rate_supported(s_format.sample_rate))
+            ESP_LOGW(TAG,"I2S slave 32-bit slot max 96kHz; %luHz unsupported",
+                     (unsigned long)s_format.sample_rate);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     esp_err_t ret=create_tx(s_format.sample_rate);
     if(ret!=ESP_OK)return ret;
     if(s_tx_rate!=s_format.sample_rate) {
@@ -627,9 +697,62 @@ static size_t push_decoded(void)
     s_pcm_offset+=pushed*frame_bytes;
     return pushed;
 }
+/* WAV 直通：s_input 中是 data chunk 的原始 PCM。保留不足一帧的尾部，
+ * ring 满时返回 progress=false 让主循环等待 DMA，不丢样本。 */
+static esp_err_t wav_decode_step(bool *progress)
+{
+    *progress=false;
+    if(!s_format_ready)return ESP_ERR_INVALID_RESPONSE;
+    size_t frame_bytes=s_format.channel*(s_format.bits_per_sample/8);
+    if(s_decode_eof) {
+        if(audio_pcm_drained(&s_pcm)) {
+            stop_tx();update_position();
+            portENTER_CRITICAL(&s_cmd_mux);
+            if(s_cmd.serial==s_current.serial && s_cmd.play) {
+                s_cmd.play=false;atomic_store(&s_finished,true);
+                atomic_store(&s_duration,(uint32_t)(s_sent_total/s_format.sample_rate));
+            }
+            portEXIT_CRITICAL(&s_cmd_mux);
+            *progress=true;
+        }
+        return ESP_OK;
+    }
+    /* 24-bit 立体声一帧 6 字节，32 KiB 读取边界可能只剩 2 字节；
+     * 必须继续 read_input 补齐整帧，不能把残余当成 EOF/错误。 */
+    if(s_raw.len<frame_bytes && !s_input_eof) {
+        TickType_t before=xTaskGetTickCount();
+        esp_err_t r=read_input();s_read_ticks+=record_max(&s_read_max,before);
+        if(r!=ESP_OK)return r;
+    }
+    size_t frames=s_raw.len/frame_bytes;
+    if(frames) {
+        size_t pushed=audio_pcm_push(&s_pcm,s_raw.buffer,frames,
+                                     s_format.bits_per_sample,s_format.channel);
+        if(pushed) {
+            if(bt_audio_is_connected())
+                bt_stream_write(s_raw.buffer,pushed,s_format.bits_per_sample,
+                                s_format.channel,s_format.sample_rate);
+            s_decoded_frames+=pushed;
+            size_t bytes=pushed*frame_bytes;
+            s_raw.buffer+=bytes;s_raw.len-=bytes;
+            *progress=true;
+        }
+    }
+    if(s_input_eof && s_raw.len<frame_bytes) {
+        s_decode_eof=true;*progress=true;return ESP_OK;
+    }
+    if(!*progress) {
+        /* ring 满且仍有完整帧：保留 s_raw，等 DMA 后再推，不能提前 EOF。 */
+        if(frames) return ESP_OK;
+        if(s_input_eof) {s_decode_eof=true;return ESP_OK;}
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
 static esp_err_t decode_step(bool *progress)
 {
     *progress=false;
+    if(s_wav)return wav_decode_step(progress);
     if(s_pcm_offset<s_pcm_bytes) {
         *progress=push_decoded()!=0;
         return ESP_OK;
@@ -797,7 +920,7 @@ static void video_step(const video_command_t *v)
         s_video_serial=v->serial;
         s_video_worker_active=true;
         if(s_tx_on)stop_tx();
-        if(s_decoder||s_file)close_session();
+        if(session_open_now()||s_file)close_session();
         else {audio_pcm_reset(&s_pcm,s_ring);s_sent_total=0;s_last_sent=0;}
         atomic_store(&s_video_started,false);
         atomic_store(&s_video_eof_req,false);
@@ -895,7 +1018,7 @@ esp_err_t audio_output_video_open(const audio_output_pcm_cfg_t *cfg)
 {
     bt_stream_reset();
     if(!s_task || !cfg) return ESP_ERR_INVALID_STATE;
-    if(!supported_rate(cfg->sample_rate) ||
+    if(!i2s_rate_supported(cfg->sample_rate) ||
        (cfg->channels!=1 && cfg->channels!=2) ||
        (cfg->bits!=16 && cfg->bits!=24 && cfg->bits!=32))
         return ESP_ERR_NOT_SUPPORTED;
@@ -1057,8 +1180,8 @@ static void output_step(void)
             }
         }
     }
-    if(s_decoder && !card_current()) {fail_current(ESP_ERR_INVALID_STATE,c);close_session();return;}
-    if(c.play && !s_decoder && c.index!=UINT32_MAX) {
+    if(session_open_now() && !card_current()) {fail_current(ESP_ERR_INVALID_STATE,c);close_session();return;}
+    if(c.play && !session_open_now() && c.index!=UINT32_MAX) {
         esp_err_t ret=open_session(c);
         if(ret==ESP_ERR_TIMEOUT)return;
         if(ret!=ESP_OK) {
@@ -1067,7 +1190,7 @@ static void output_step(void)
     }
     command_t latest=command();
     if(latest.serial!=c.serial || latest.play!=c.play)return;
-    if(!c.play || !s_decoder) {
+    if(!c.play || !session_open_now()) {
         if(s_tx_on)stop_tx();
         if(s_file)close_file();
         ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(50));return;
