@@ -96,24 +96,14 @@ esp_err_t cs43131_prepare(uint32_t rate)
         default:return ESP_ERR_NOT_SUPPORTED;
     }
     TRY(wr(REG_PCM_CTRL,0xEF));
-    TRY(wr(REG_CLOCK,0x02)); /* switch to live RCO before changing PLL */
-    TRY(wr(REG_POWER,0xFE)); /* ports/HP/XTAL/PLL off, RCO remains available */
-    TRY(wr(0x30001,0));
-    if(family44) {
-        /* DS1155F2 Table4-5:24.576MHz ->22.5792MHz. Internal XTAL stays off.
-         * PLL_REF_PREDIV=8,INT=0x49,FRAC=0x800000,OUT_DIV=10,
-         * MODE=1,CAL_RATIO=118. Preserve reserved bits in PLL_MODE. */
-        TRY(modify(REG_POWER,0x04,0));
-        TRY(modify(0x40002,0x03,0x03));
-        TRY(wr(0x30008,0x0A));
-        TRY(wr(0x30002,0));TRY(wr(0x30003,0));TRY(wr(0x30004,0x80));
-        TRY(wr(0x30005,0x49));TRY(modify(0x3001B,0x02,0x02));
-        TRY(wr(0x3000A,118));
-        uint8_t discard;TRY(rd(REG_IRQ1,&discard));
-        TRY(wr(REG_MASK1,0x99)); /* HP + PLL ready/error unmasked */
-        TRY(wr(0x30001,1));TRY(wait_irq(0x04,0x02,100));
-        TRY(wr(REG_CLOCK,0x05));
-    } else TRY(wr(REG_CLOCK,0x00)); /* direct active external24.576MHz */
+    TRY(wr(REG_CLOCK,0x02)); /* 先切到仍然工作的 RCO */
+    TRY(wr(REG_POWER,0xFE)); /* 外部 MCLK；XTAL/PLL 均关闭 */
+    /* 实验分支：DAC 有源晶振已移除，P4 在 GPIO46 输出外部 MCLK。
+     * DS1155F2 0x10006：MCLK_SRC_SEL=00 直接使用 XTI/MCLK；
+     * MCLK_INT=0 →24.576MHz（0x00），MCLK_INT=1 →22.5792MHz（0x04）。
+     * P4 对44.1/88.2/176.4输出22.5792，对32/48/96/192输出24.576，
+     * 因此不再启动 DAC 内部 PLL；PLL 在 REG_POWER 中保持 PDN。 */
+    TRY(wr(REG_CLOCK,family44?0x04:0x00));
     TRY(wr(0x1000B,code));
     TRY(wr(0x1000C,0x04)); /* ASP32bit, XSP irrelevant */
     TRY(wr(0x40010,1));TRY(wr(0x40011,0));
@@ -122,8 +112,8 @@ esp_err_t cs43131_prepare(uint32_t rate)
     TRY(wr(0x40016,63));TRY(wr(0x40017,0));
     /* 实验分支：P4 作为 I2S master，DAC 的 ASP 改为 slave。
      * DS1155F2 Example 5-14：0x40018=0x0C 清除 bit4(ASP_M/SB)，保留
-     * SCLK/LRCK 输入极性和默认字段；SCLK1/LRCK1 由 P4 GPIO51/50 输出。
-     * 本分支默认 P4 使用内部 PLL_160M，尚未接入 24.576 MHz 同源时钟。 */
+     * SCLK/LRCK 输入极性和默认字段；SCLK1/LRCK1 由 P4 GPIO51/50 输出，
+     * XTI/MCLK 由 P4 GPIO46 输出（DAC 侧有源晶振已移除）。 */
     TRY(wr(0x40018,0x0C));
     TRY(wr(0x40019,0x0A)); /* Philips:50/50,1bit delay */
     TRY(wr(0x50000,0));TRY(wr(0x50001,0));

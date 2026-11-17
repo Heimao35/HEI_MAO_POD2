@@ -153,7 +153,7 @@ esp_err_t cs43131_poll(bool *hp)
 esp_err_t i2s_new_channel(const i2s_chan_config_t *c,i2s_chan_handle_t *tx,i2s_chan_handle_t *rx)
 {assert(!rx && c->role==I2S_ROLE_MASTER && !c->auto_clear_before_cb && !c->auto_clear_after_cb);*tx=(void*)1;memset(dma,0,sizeof(dma));++channels_created;return ESP_OK;}
 esp_err_t i2s_channel_init_std_mode(i2s_chan_handle_t tx,const i2s_std_config_t *c)
-{assert(tx && c->gpio_cfg.bclk==51 && c->gpio_cfg.ws==50 && c->gpio_cfg.dout==49 && c->gpio_cfg.mclk==-1);
+{assert(tx && c->gpio_cfg.bclk==51 && c->gpio_cfg.ws==50 && c->gpio_cfg.dout==49 && c->gpio_cfg.mclk==46);
  if(init_nomem_attempts) {--init_nomem_attempts;return ESP_ERR_NO_MEM;}
  ++configures;return ESP_OK;}
 esp_err_t i2s_channel_reconfig_std_clock(i2s_chan_handle_t tx,const i2s_std_clk_config_t *c)

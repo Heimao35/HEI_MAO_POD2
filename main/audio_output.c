@@ -77,6 +77,10 @@ static uint32_t s_tx_rate;
 static bool s_dma_primed;
 static uint64_t s_read_base;
 static size_t s_read_size;
+/* 实验分支：P4 I2S master 同时输出 MCLK 给 CS43131 XTI。
+ * GPIO46 在板上飞线经电平转换接 DAC XTI；DAC 侧有源晶振已移除。
+ * 该 MCLK 必须按采样率输出 22.5792/24.576MHz，不能输出 P4 BCLK 的任意值。 */
+#define AUDIO_I2S_MCLK_GPIO 46
 static size_t s_output_capacity;
 static FILE *s_file; /* 仅在SD锁内访问，包括卸载回调；不将指针交给UI。 */
 static uint64_t s_file_size,s_file_offset,s_sent_total;
@@ -567,11 +571,27 @@ static bool supported_rate(uint32_t rate)
     return rate==32000 || rate==44100 || rate==48000 || rate==88200 ||
            rate==96000 || rate==176400 || rate==192000;
 }
+/* CS43131 XTI 只接受 22.5792 或 24.576MHz 外部 MCLK。P4 I2S master 的
+ * MCLK = rate * mclk_multiple，因此按采样率选择倍数，使 44.1/88.2/176.4
+ * 输出 22.5792MHz，32/48/96/192 输出 24.576MHz。 */
+static i2s_mclk_multiple_t i2s_mclk_multiple_for_rate(uint32_t rate)
+{
+    switch(rate) {
+        case 32000: return I2S_MCLK_MULTIPLE_768; /* 24.576MHz */
+        case 44100: return I2S_MCLK_MULTIPLE_512; /* 22.5792MHz */
+        case 48000: return I2S_MCLK_MULTIPLE_512; /* 24.576MHz */
+        case 88200: return I2S_MCLK_MULTIPLE_256; /* 22.5792MHz */
+        case 96000: return I2S_MCLK_MULTIPLE_256; /* 24.576MHz */
+        case 176400: return I2S_MCLK_MULTIPLE_128; /* 22.5792MHz */
+        case 192000: return I2S_MCLK_MULTIPLE_128; /* 24.576MHz */
+        default: return I2S_MCLK_MULTIPLE_256;
+    }
+}
 /* 实验分支：P4 作为 I2S master，使用内部 PLL_160M，32-bit slot。
- * master 的 mclk=rate*mclk_multiple(256)，160MHz 可覆盖
- * 32/44.1/48/88.2/96/176.4/192kHz；不再有 slave 的 rate*512 上限。
- * 注意：该时钟与 CS43131 本地 24.576/22.5792MHz 不同源，仅为实验实现，
- * 正式同步方案需把 24.576MHz 引入 P4 MCLK 并使用 I2S_CLK_SRC_EXTERNAL。 */
+ * master 的 mclk=rate*mclk_multiple（按采样率选择 128/256/512/768），
+ * 160MHz 可覆盖32/44.1/48/88.2/96/176.4/192kHz；不再有 slave 的
+ * rate*512 上限。MCLK 同时从 GPIO46 输出给 CS43131 XTI，DAC 使用
+ * 直接外部 MCLK；P4 MCLK/BCLK/WS 同源。 */
 static bool i2s_rate_supported(uint32_t rate)
 {
     return supported_rate(rate);
@@ -595,8 +615,9 @@ static esp_err_t create_tx(uint32_t sample_rate)
     i2s_std_config_t std={
         .clk_cfg=I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
         .slot_cfg=I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,I2S_SLOT_MODE_STEREO),
-        .gpio_cfg={.mclk=I2S_GPIO_UNUSED,.bclk=51,.ws=50,.dout=49,.din=I2S_GPIO_UNUSED},
+        .gpio_cfg={.mclk=AUDIO_I2S_MCLK_GPIO,.bclk=51,.ws=50,.dout=49,.din=I2S_GPIO_UNUSED},
     };
+    std.clk_cfg.mclk_multiple=i2s_mclk_multiple_for_rate(sample_rate);
     ret=i2s_channel_init_std_mode(s_tx,&std);
     if(ret!=ESP_OK) {
         /* init_std_mode may have allocated partial DMA/mode resources. Delete the
@@ -632,12 +653,14 @@ static esp_err_t configure_tx(void)
     if(ret!=ESP_OK)return ret;
     if(s_tx_rate!=s_format.sample_rate) {
         i2s_std_clk_config_t clock=I2S_STD_CLK_DEFAULT_CONFIG(s_format.sample_rate);
+        clock.mclk_multiple=i2s_mclk_multiple_for_rate(s_format.sample_rate);
         ret=i2s_channel_reconfig_std_clock(s_tx,&clock);
         if(ret!=ESP_OK)return ret;
         s_tx_rate=s_format.sample_rate;
     }
-    ESP_LOGI(TAG,"PCM %luHz %ubit %uch ->32bit stereo, P4 I2S master/CS43131 slave",
-        (unsigned long)s_format.sample_rate,s_format.bits_per_sample,s_format.channel);
+    ESP_LOGI(TAG,"PCM %luHz %ubit %uch ->32bit stereo, P4 I2S master/CS43131 slave, MCLK GPIO%d",
+        (unsigned long)s_format.sample_rate,s_format.bits_per_sample,s_format.channel,
+        AUDIO_I2S_MCLK_GPIO);
     return ESP_OK;
 }
 /* 保留通道也保留了DMA存储。每次启动先用静音覆盖全部8块，避免上一首
@@ -663,14 +686,17 @@ static esp_err_t start_tx(void)
     command_t latest=command();
     if(latest.serial!=s_current.serial || !latest.play)return ESP_OK;
     atomic_store(&s_active,true);
-    esp_err_t ret=cs43131_prepare(s_format.sample_rate);
-    if(ret==ESP_OK)ret=clear_dma();
+    /* 实验分支：DAC 的有源晶振已移除，P4 MCLK 是 DAC 唯一 MCLK。
+     * 必须先启动 I2S（MCLK/BCLK/WS 有效）并预载静音，再让 DAC 从 RCO
+     * 切到外部 MCLK；不能先 cs43131_prepare()，否则 DAC 会短暂失去 MCLK。 */
+    esp_err_t ret=clear_dma();
     if(ret==ESP_OK)ret=i2s_channel_enable(s_tx);
     if(ret==ESP_OK) {
         s_dma_primed=false; /* enable之后，disable会重置SDK的preload游标。 */
         s_tx_on=true;
-        ret=cs43131_start_hp();
+        ret=cs43131_prepare(s_format.sample_rate);
     }
+    if(ret==ESP_OK)ret=cs43131_start_hp();
     latest=command();
     if(ret==ESP_OK && (latest.serial!=s_current.serial || !latest.play)) {stop_tx();return ESP_OK;}
     if(ret==ESP_OK) {

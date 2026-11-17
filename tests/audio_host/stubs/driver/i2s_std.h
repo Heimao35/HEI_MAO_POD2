@@ -6,15 +6,20 @@
 typedef void *i2s_chan_handle_t;
 typedef struct {void *dma_buf;size_t size;} i2s_event_data_t;
 typedef struct {bool(*on_sent)(i2s_chan_handle_t,i2s_event_data_t*,void*);} i2s_event_callbacks_t;
+typedef int i2s_mclk_multiple_t;
 typedef struct {int role;unsigned dma_desc_num,dma_frame_num;bool auto_clear_before_cb,auto_clear_after_cb;} i2s_chan_config_t;
-typedef struct {uint32_t sample_rate_hz;} i2s_std_clk_config_t;
-typedef struct {struct {uint32_t sample_rate_hz;} clk_cfg;struct {int unused;} slot_cfg;struct {int mclk,bclk,ws,dout,din;} gpio_cfg;} i2s_std_config_t;
+typedef struct {uint32_t sample_rate_hz;int mclk_multiple;} i2s_std_clk_config_t;
+typedef struct {i2s_std_clk_config_t clk_cfg;struct {int unused;} slot_cfg;struct {int mclk,bclk,ws,dout,din;} gpio_cfg;} i2s_std_config_t;
 #define I2S_NUM_AUTO -1
 #define I2S_ROLE_SLAVE 0
 #define I2S_ROLE_MASTER 1
 #define I2S_GPIO_UNUSED -1
 #define I2S_DATA_BIT_WIDTH_32BIT 32
 #define I2S_SLOT_MODE_STEREO 2
+#define I2S_MCLK_MULTIPLE_128 128
+#define I2S_MCLK_MULTIPLE_256 256
+#define I2S_MCLK_MULTIPLE_512 512
+#define I2S_MCLK_MULTIPLE_768 768
 #define I2S_CHANNEL_DEFAULT_CONFIG(id,role_) {.role=role_}
 #define I2S_STD_CLK_DEFAULT_CONFIG(rate) {.sample_rate_hz=rate}
 #define I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(bits,mode) {.unused=0}

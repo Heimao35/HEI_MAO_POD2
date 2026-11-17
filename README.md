@@ -2,10 +2,13 @@
 
 > **实验分支 `experiment/p4-master-cs43131-slave`**
 > 本分支把音频时钟从 DAC master/P4 slave 改为 **P4 I2S master /
-> CS43131 slave**，并开放 176.4/192 kHz。当前默认 P4 使用内部 PLL_160M，
-> 与 CS43131 本地 24.576/22.5792 MHz 不同源；尚未实板验证，可能存在长期
-> 漂移、ASP overflow/underflow 或爆音。正式同步方案需要把 24.576 MHz
-> 时钟引入 P4 MCLK；不要把本分支当作已验收的 192 kHz 实现。
+> CS43131 slave**，并开放 176.4/192 kHz。板级已移除 DAC 侧有源晶振，
+> P4 在 GPIO46 输出 MCLK（经电平转换接 DAC XTI）；P4 MCLK、BCLK、WS
+> 都来自 P4 PLL_160M，DAC 直接使用 22.5792/24.576 MHz 外部 MCLK，
+> 因此串行时钟与 DAC MCLK 同源。2026-11-17 实板已验证 44.1/96/192k
+> WAV/FLAC、重启、Light-sleep 锁屏、蓝牙/本地/USB 声卡/视频音频切换，
+> 未发现新问题；尚未完成长时间播放、P4 MCLK 相噪/抖动测量和生产级飞线
+> 布局验证。不要把本分支当作已认证的 192 kHz 产品实现。
 > 格式策略：**FLAC 最高 24bit/96kHz；WAV 最高 32bit/192kHz**。
 
 本项目的 ESP32-P4 多媒体播放器支持播放 460×460 的裸 MJPEG 视频，并可选择
@@ -21,9 +24,9 @@
 - **音频（可选）**：与视频同名的 WAV。只支持普通 RIFF/WAVE PCM（format 1）
   16/24/32bit、单/双声道，采样率 32k/44.1k/48k/88.2k/96k/176.4k/192k；
   推荐 48kHz/16bit 立体声。实验分支已切换为 P4 I2S master + CS43131
-  slave，176.4/192 kHz 在时钟配置上开放，但尚未实板验证（见上方警告）。
-  不做音频解码，`WAVE_FORMAT_EXTENSIBLE`、MP3/AAC、浮点 WAV 等不支持，
-  没有音轨时静音播放。
+  slave；192 kHz 已通过短/中期实板播放，176.4 kHz 尚未单独测试（见上方
+  警告）。不做音频解码，`WAVE_FORMAT_EXTENSIBLE`、MP3/AAC、浮点 WAV
+  等不支持，没有音轨时静音播放。
 - **音乐播放器 WAV**：`HEI_MAO_POD_SYS/MUSIC/<歌曲文件夹>/` 下也支持普通
   和 `WAVE_FORMAT_EXTENSIBLE` 的 PCM WAV，16/24/32bit、单/双声道；实验分支
   时钟配置开放到 192 kHz，但同样受实验时钟方案限制，尚未实板验收。

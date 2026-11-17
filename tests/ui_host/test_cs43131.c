@@ -44,24 +44,24 @@ int main(void)
     assert((registers[REG_PCM_CTRL]&3)==3);
     assert(cs43131_prepare(192000)==ESP_OK);
     assert(registers[REG_CLOCK]==0 && registers[0x40012]==2 && registers[0x1000B]==6);
-    assert(registers[0x40018]==0x1C && registers[0x5000A]==7 && registers[0x5000B]==15);
+    assert(registers[0x40018]==0x0C && registers[0x5000A]==7 && registers[0x5000B]==15);
     assert(registers[REG_POWER]&8); /* active MCLK: XTAL driver stays down */
     assert(cs43131_start_hp()==ESP_OK);
     assert(cs43131_volume(50,false)==ESP_OK && registers[0x90002]==60 && !(registers[REG_PCM_CTRL]&3));
     assert(cs43131_volume(0,false)==ESP_OK && registers[0x90002]==255 && (registers[REG_PCM_CTRL]&3)==3);
     assert(cs43131_stop()==ESP_OK);
     assert(cs43131_prepare(44100)==ESP_OK);
-    assert(registers[REG_CLOCK]==5 && registers[0x30005]==0x49 && registers[0x30004]==0x80);
-    assert(registers[0x30008]==10 && registers[0x3000A]==118 && registers[0x40012]==8);
-    assert(registers[0x3001B]==0x13 && registers[REG_POWER]&8);
+    /* P4 supplies 22.5792MHz directly; DAC internal PLL must stay off. */
+    assert(registers[REG_CLOCK]==4 && registers[0x40012]==8);
+    assert(registers[REG_POWER]&8 && registers[REG_POWER]&4);
     assert(cs43131_start_hp()==ESP_OK && cs43131_stop()==ESP_OK);
-    assert(cs43131_prepare(48000)==ESP_OK); /* safely leave PLL before powerdown */
+    assert(cs43131_prepare(48000)==ESP_OK); /* direct 24.576MHz, PLL stays off */
     assert(registers[REG_CLOCK]==0 && registers[REG_POWER]&4);
     assert(cs43131_prepare(22050)==ESP_ERR_NOT_SUPPORTED);
     bool hp;registers[REG_HP_STATUS]=0x40;assert(cs43131_poll(&hp)==ESP_OK && hp);
     registers[REG_HP_STATUS]=0x20;assert(cs43131_poll(&hp)==ESP_OK && !hp);
     cs43131_abort();assert(!reset_high && !s_dev);
-    puts("PASS3byte MAP/control-byte, address+identity verification, active24.576MHz and44.1k PLL");
-    puts("PASS192k32bit I2S master format, volume/mute, HP status, pop-free sequencing and safe clock change");
+    puts("PASS3byte MAP/control-byte, address+identity verification, P4-supplied direct24.576/22.5792MHz");
+    puts("PASS192k32bit I2S master format, DAC PLL off, volume/mute, HP status, pop-free sequencing and safe clock change");
     return 0;
 }
